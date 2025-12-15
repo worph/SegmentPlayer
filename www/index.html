@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HLS Stream - Media Browser</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 1.5rem;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+        h1 {
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            background: #4dabf7;
+            color: #000;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: bold;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 1.5rem;
+        }
+        @media (max-width: 900px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* File Browser */
+        .file-browser {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .file-browser-header {
+            padding: 1rem;
+            background: rgba(0,0,0,0.2);
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            font-weight: 600;
+        }
+        .file-list {
+            max-height: 70vh;
+            overflow-y: auto;
+        }
+        .file-item {
+            padding: 0.75rem 1rem;
+            cursor: pointer;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            transition: background 0.2s;
+        }
+        .file-item:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        .file-item.active {
+            background: rgba(77, 171, 247, 0.2);
+            border-left: 3px solid #4dabf7;
+        }
+        .file-item.folder {
+            color: #ffd43b;
+        }
+        .file-icon {
+            font-size: 1.2rem;
+        }
+        .file-name {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-size: 0.9rem;
+        }
+        .file-size {
+            color: #888;
+            font-size: 0.8rem;
+        }
+        .breadcrumb {
+            padding: 0.5rem 1rem;
+            background: rgba(0,0,0,0.1);
+            font-size: 0.85rem;
+            color: #888;
+        }
+        .breadcrumb span {
+            cursor: pointer;
+            color: #4dabf7;
+        }
+        .breadcrumb span:hover {
+            text-decoration: underline;
+        }
+
+        /* Player Section */
+        .player-section {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        .video-container {
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+        }
+        video {
+            width: 100%;
+            display: block;
+            max-height: 60vh;
+        }
+        .controls {
+            padding: 1rem;
+            background: #111;
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .controls label {
+            color: #888;
+            font-size: 0.85rem;
+        }
+        .controls select {
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            border: 1px solid #333;
+            background: #222;
+            color: #fff;
+            font-size: 0.85rem;
+            cursor: pointer;
+            min-width: 120px;
+        }
+        .controls select:hover {
+            border-color: #555;
+        }
+        .controls input[type="checkbox"] {
+            margin-right: 0.4rem;
+            cursor: pointer;
+        }
+        .status {
+            margin-left: auto;
+            padding: 0.4rem 0.8rem;
+            background: #222;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            color: #4dabf7;
+        }
+
+        /* Now Playing */
+        .now-playing {
+            padding: 1rem;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+        }
+        .now-playing-title {
+            font-size: 0.8rem;
+            color: #888;
+            margin-bottom: 0.25rem;
+        }
+        .now-playing-name {
+            font-size: 1.1rem;
+            font-weight: 500;
+            word-break: break-word;
+        }
+
+        /* Info Panel */
+        .info-panel {
+            padding: 1rem;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            font-size: 0.85rem;
+        }
+        .info-panel h3 {
+            color: #4dabf7;
+            margin-bottom: 0.75rem;
+            font-size: 0.9rem;
+        }
+        .info-panel p {
+            color: #aaa;
+            line-height: 1.5;
+            margin-bottom: 0.5rem;
+        }
+        .info-panel code {
+            background: #222;
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.8rem;
+        }
+
+        /* Empty State */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 3rem;
+            color: #666;
+            text-align: center;
+        }
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        /* Loading */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+            color: #888;
+        }
+        .spinner {
+            width: 24px;
+            height: 24px;
+            border: 3px solid #333;
+            border-top-color: #4dabf7;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 0.75rem;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>
+                HLS Stream <span class="badge">LIVE</span>
+            </h1>
+        </header>
+
+        <div class="layout">
+            <!-- File Browser -->
+            <div class="file-browser">
+                <div class="file-browser-header">Media Files</div>
+                <div class="breadcrumb" id="breadcrumb"></div>
+                <div class="file-list" id="fileList">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        Loading files...
+                    </div>
+                </div>
+            </div>
+
+            <!-- Player Section -->
+            <div class="player-section">
+                <div class="video-container">
+                    <video id="video" controls crossorigin="anonymous"></video>
+                    <div class="controls">
+                        <div class="control-group">
+                            <label>Audio:</label>
+                            <select id="audioSelect" disabled>
+                                <option value="">Default</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>Subtitles:</label>
+                            <select id="subtitleSelect" disabled>
+                                <option value="">Off</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>
+                                <input type="checkbox" id="forceTranscode"> Force Transcode
+                            </label>
+                        </div>
+                        <span class="status" id="status">Select a file</span>
+                    </div>
+                </div>
+
+                <div class="now-playing" id="nowPlaying" style="display: none;">
+                    <div class="now-playing-title">Now Playing</div>
+                    <div class="now-playing-name" id="nowPlayingName"></div>
+                </div>
+
+                <div class="info-panel">
+                    <h3>How It Works</h3>
+                    <p>
+                        This player uses <strong>nginx-vod-module</strong> for on-the-fly HLS packaging.
+                        Videos are streamed directly from your Downloads folder - no transcoding delay!
+                    </p>
+                    <p>
+                        <strong>Supported formats:</strong> MP4, MKV, MOV, AVI (with compatible codecs)
+                    </p>
+                    <p>
+                        <strong>API:</strong> <code>/hls/{file}/master.m3u8</code>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById("video");
+        const audioSelect = document.getElementById("audioSelect");
+        const subtitleSelect = document.getElementById("subtitleSelect");
+        const status = document.getElementById("status");
+        const fileList = document.getElementById("fileList");
+        const breadcrumb = document.getElementById("breadcrumb");
+        const nowPlaying = document.getElementById("nowPlaying");
+        const nowPlayingName = document.getElementById("nowPlayingName");
+
+        let hls = null;
+        let currentPath = "";
+        let currentFile = null;
+
+        // Video file extensions
+        const videoExtensions = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".m2ts"];
+        const subtitleExtensions = [".vtt", ".srt", ".ass", ".ssa"];
+
+        // Format file size
+        function formatSize(bytes) {
+            if (bytes === 0) return "0 B";
+            const k = 1024;
+            const sizes = ["B", "KB", "MB", "GB"];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+        }
+
+        // Check if file is video
+        function isVideo(name) {
+            const lower = name.toLowerCase();
+            return videoExtensions.some(ext => lower.endsWith(ext));
+        }
+
+        // Check if file is subtitle
+        function isSubtitle(name) {
+            const lower = name.toLowerCase();
+            return subtitleExtensions.some(ext => lower.endsWith(ext));
+        }
+
+        // Get file icon
+        function getIcon(item) {
+            if (item.type === "directory") return "📁";
+            if (isVideo(item.name)) return "🎬";
+            if (isSubtitle(item.name)) return "📝";
+            return "📄";
+        }
+
+        // Load file list
+        async function loadFiles(path = "") {
+            fileList.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
+
+            try {
+                const response = await fetch("/api/files/" + (path ? path + "/" : ""));
+                if (!response.ok) throw new Error("Failed to load files");
+
+                const files = await response.json();
+
+                // Update breadcrumb
+                updateBreadcrumb(path);
+
+                // Sort: folders first, then by name
+                files.sort((a, b) => {
+                    if (a.type === "directory" && b.type !== "directory") return -1;
+                    if (a.type !== "directory" && b.type === "directory") return 1;
+                    return a.name.localeCompare(b.name);
+                });
+
+                // Filter to show only videos, subtitles, and folders
+                const filtered = files.filter(f =>
+                    f.type === "directory" || isVideo(f.name) || isSubtitle(f.name)
+                );
+
+                if (filtered.length === 0) {
+                    fileList.innerHTML = `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📂</div>
+                            <div>No media files found</div>
+                            <div style="font-size: 0.85rem; margin-top: 0.5rem;">
+                                Add video files to your Downloads folder
+                            </div>
+                        </div>
+                    `;
+                    return;
+                }
+
+                fileList.innerHTML = filtered.map(file => {
+                    const fullPath = path ? path + "/" + file.name : file.name;
+                    const isActive = currentFile === fullPath;
+                    const isFolder = file.type === "directory";
+
+                    return `
+                        <div class="file-item ${isFolder ? 'folder' : ''} ${isActive ? 'active' : ''}"
+                             data-path="${fullPath}"
+                             data-type="${file.type}"
+                             data-name="${file.name}">
+                            <span class="file-icon">${getIcon(file)}</span>
+                            <span class="file-name">${file.name}</span>
+                            ${file.size ? `<span class="file-size">${formatSize(file.size)}</span>` : ''}
+                        </div>
+                    `;
+                }).join("");
+
+                // Add click handlers
+                fileList.querySelectorAll(".file-item").forEach(item => {
+                    item.addEventListener("click", () => {
+                        const itemPath = item.dataset.path;
+                        const itemType = item.dataset.type;
+                        const itemName = item.dataset.name;
+
+                        if (itemType === "directory") {
+                            currentPath = itemPath;
+                            loadFiles(itemPath);
+                        } else if (isVideo(itemName)) {
+                            playFile(itemPath, itemName);
+                        }
+                    });
+                });
+
+            } catch (err) {
+                console.error("Error loading files:", err);
+                fileList.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">⚠️</div>
+                        <div>Error loading files</div>
+                        <div style="font-size: 0.85rem; margin-top: 0.5rem;">${err.message}</div>
+                    </div>
+                `;
+            }
+        }
+
+        // Update breadcrumb navigation
+        function updateBreadcrumb(path) {
+            const parts = path ? path.split("/") : [];
+            let html = '<span data-path="">Home</span>';
+            let accumulated = "";
+
+            parts.forEach((part, i) => {
+                accumulated += (accumulated ? "/" : "") + part;
+                html += ` / <span data-path="${accumulated}">${part}</span>`;
+            });
+
+            breadcrumb.innerHTML = html;
+
+            breadcrumb.querySelectorAll("span").forEach(span => {
+                span.addEventListener("click", () => {
+                    currentPath = span.dataset.path;
+                    loadFiles(currentPath);
+                });
+            });
+        }
+
+        // Find subtitle files for current video
+        async function findSubtitles(videoPath) {
+            const dir = videoPath.substring(0, videoPath.lastIndexOf("/")) || "";
+            const videoName = videoPath.substring(videoPath.lastIndexOf("/") + 1);
+            const baseName = videoName.substring(0, videoName.lastIndexOf("."));
+
+            try {
+                const response = await fetch("/api/files/" + (dir ? dir + "/" : ""));
+                if (!response.ok) return [];
+
+                const files = await response.json();
+                return files
+                    .filter(f => isSubtitle(f.name) && f.name.startsWith(baseName))
+                    .map(f => ({
+                        name: f.name,
+                        path: dir ? dir + "/" + f.name : f.name,
+                        lang: extractLang(f.name, baseName)
+                    }));
+            } catch {
+                return [];
+            }
+        }
+
+        // Extract language from subtitle filename
+        function extractLang(subName, baseName) {
+            const withoutBase = subName.substring(baseName.length);
+            const match = withoutBase.match(/[._]([a-z]{2,3})/i);
+            return match ? match[1].toUpperCase() : "Unknown";
+        }
+
+        // Play video file
+        async function playFile(filePath, fileName) {
+            currentFile = filePath;
+            const forceTranscode = document.getElementById("forceTranscode").checked;
+
+            // Update UI
+            document.querySelectorAll(".file-item").forEach(item => {
+                item.classList.toggle("active", item.dataset.path === filePath);
+            });
+
+            nowPlaying.style.display = "block";
+            nowPlayingName.textContent = fileName;
+            status.textContent = "Loading...";
+            status.style.color = "#4dabf7";
+
+            // Destroy previous HLS instance
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+
+            // Reset selects
+            audioSelect.innerHTML = '<option value="">Loading...</option>';
+            audioSelect.disabled = true;
+            subtitleSelect.innerHTML = '<option value="">Off</option>';
+            subtitleSelect.disabled = true;
+
+            // Remove existing tracks
+            video.querySelectorAll("track").forEach(t => t.remove());
+
+            // If force transcode is enabled, skip direct play
+            if (forceTranscode) {
+                tryTranscodedFallback(filePath, fileName);
+                return;
+            }
+
+            const videoSrc = "/hls/" + encodeURIComponent(filePath) + "/master.m3u8";
+
+            if (Hls.isSupported()) {
+                hls = new Hls({
+                    debug: false,
+                    enableWorker: true,
+                    lowLatencyMode: false,
+                    maxBufferLength: 30,
+                    maxMaxBufferLength: 60
+                });
+
+                hls.loadSource(videoSrc);
+                hls.attachMedia(video);
+
+                hls.on(Hls.Events.MANIFEST_PARSED, async function(event, data) {
+                    status.textContent = "Ready";
+                    status.style.color = "#51cf66";
+
+                    // Populate audio tracks
+                    if (hls.audioTracks && hls.audioTracks.length > 0) {
+                        audioSelect.innerHTML = hls.audioTracks.map((track, i) => {
+                            const label = track.name || track.lang || `Track ${i + 1}`;
+                            return `<option value="${i}">${label}</option>`;
+                        }).join("");
+                        audioSelect.disabled = false;
+                        audioSelect.value = hls.audioTrack;
+                    } else {
+                        audioSelect.innerHTML = '<option value="">Default</option>';
+                        audioSelect.disabled = true;
+                    }
+
+                    // Find and populate subtitle files
+                    const subs = await findSubtitles(filePath);
+                    if (subs.length > 0) {
+                        subtitleSelect.innerHTML = '<option value="">Off</option>' +
+                            subs.map(sub => `<option value="${sub.path}">${sub.lang}</option>`).join("");
+                        subtitleSelect.disabled = false;
+                    }
+
+                    video.play().catch(() => {});
+                });
+
+                hls.on(Hls.Events.ERROR, function(event, data) {
+                    if (data.fatal) {
+                        status.style.color = "#ff6b6b";
+
+                        switch (data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                // Try transcoded version as fallback
+                                tryTranscodedFallback(filePath, fileName);
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                hls.recoverMediaError();
+                                break;
+                            default:
+                                status.textContent = "Error: " + data.type;
+                        }
+                    }
+                });
+
+                hls.on(Hls.Events.FRAG_LOADED, function() {
+                    status.textContent = "Streaming";
+                    status.style.color = "#51cf66";
+                });
+
+            } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+                video.src = videoSrc;
+                video.addEventListener("loadedmetadata", function() {
+                    status.textContent = "Ready (Native)";
+                    status.style.color = "#51cf66";
+                    video.play().catch(() => {});
+                });
+            } else {
+                status.textContent = "HLS not supported";
+                status.style.color = "#ff6b6b";
+            }
+        }
+
+        // Audio track change handler
+        audioSelect.addEventListener("change", function() {
+            if (hls && this.value !== "") {
+                const idx = parseInt(this.value);
+                // For transcoded streams, switch to different stream URL
+                if (currentTranscodeBase && transcodedAudioTracks[idx]) {
+                    const currentTime = video.currentTime;
+                    const streamUrl = currentTranscodeBase + "/" + transcodedAudioTracks[idx].uri;
+                    hls.loadSource(streamUrl);
+                    hls.once(Hls.Events.MANIFEST_PARSED, () => {
+                        video.currentTime = currentTime;
+                        video.play().catch(() => {});
+                    });
+                } else {
+                    hls.audioTrack = idx;
+                }
+            }
+        });
+
+        // Subtitle change handler - works with HLS subtitles, transcoded subtitles, or external files
+        subtitleSelect.addEventListener("change", function() {
+            const val = parseInt(this.value);
+
+            // Remove existing tracks first
+            video.querySelectorAll("track").forEach(t => t.remove());
+
+            // Hide all text tracks
+            for (let i = 0; i < video.textTracks.length; i++) {
+                video.textTracks[i].mode = "hidden";
+            }
+
+            // If "Off" selected
+            if (val === -1 || this.value === "" || this.value === "-1") {
+                return;
+            }
+
+            // For HLS embedded subtitles
+            if (hls && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
+                hls.subtitleTrack = val;
+                return;
+            }
+
+            // For transcoded subtitles
+            if (currentTranscodeBase && transcodedSubtitleTracks[val]) {
+                const vttUrl = currentTranscodeBase + "/subs_" + val + ".vtt";
+                console.log("Loading subtitle from:", vttUrl);
+
+                const track = document.createElement("track");
+                track.kind = "subtitles";
+                track.src = vttUrl;
+                track.default = true;
+                track.label = transcodedSubtitleTracks[val].name;
+                video.appendChild(track);
+
+                track.addEventListener("load", function() {
+                    if (video.textTracks.length > 0) {
+                        video.textTracks[0].mode = "showing";
+                    }
+                });
+                return;
+            }
+
+            // For external subtitle files (fallback)
+            if (this.value) {
+                const track = document.createElement("track");
+                track.kind = "subtitles";
+                track.src = "/subs/" + this.value;
+                track.default = true;
+                video.appendChild(track);
+
+                track.addEventListener("load", function() {
+                    if (video.textTracks.length > 0) {
+                        video.textTracks[0].mode = "showing";
+                    }
+                });
+            }
+        });
+
+        // Encode path for URL while preserving directory slashes
+        function encodeFilePath(path) {
+            return path.split('/').map(part => encodeURIComponent(part)).join('/');
+        }
+
+        // Try live transcoded fallback when direct streaming fails
+        async function tryTranscodedFallback(filePath, fileName) {
+            status.textContent = "Switching to live transcode...";
+            status.style.color = "#ffd43b";
+
+            // Use live transcoding endpoint - encode the filepath for URL
+            const transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
+            console.log("Trying transcoded source:", transcodedSrc);
+
+            try {
+                const response = await fetch(transcodedSrc);
+                console.log("Transcode response:", response.status, response.statusText);
+                if (response.ok) {
+                    // Use live transcoded version
+                    playTranscoded(transcodedSrc, fileName, true);
+                    return;
+                } else {
+                    console.error("Transcode response not ok:", response.status);
+                    status.textContent = "Transcode error: " + response.status;
+                    status.style.color = "#ff6b6b";
+                    return;
+                }
+            } catch (err) {
+                console.error("Transcode fetch error:", err);
+                status.textContent = "Fetch error: " + err.message;
+                status.style.color = "#ff6b6b";
+                return;
+            }
+        }
+
+        // Store current transcode base URL for track switching
+        let currentTranscodeBase = "";
+        let transcodedAudioTracks = [];
+        let transcodedSubtitleTracks = [];
+
+        // Parse master playlist and populate dropdowns
+        function parseAndPopulateTracks(manifest) {
+            transcodedAudioTracks = [];
+            transcodedSubtitleTracks = [];
+
+            const lines = manifest.split('\n');
+            for (const line of lines) {
+                if (line.startsWith('#EXT-X-MEDIA:TYPE=AUDIO')) {
+                    const name = line.match(/NAME="([^"]+)"/)?.[1] || 'Audio';
+                    const uri = line.match(/URI="([^"]+)"/)?.[1] || '';
+                    transcodedAudioTracks.push({ name, uri });
+                } else if (line.startsWith('#EXT-X-MEDIA:TYPE=SUBTITLES')) {
+                    const name = line.match(/NAME="([^"]+)"/)?.[1] || 'Subtitle';
+                    const uri = line.match(/URI="([^"]+)"/)?.[1] || '';
+                    transcodedSubtitleTracks.push({ name, uri });
+                }
+            }
+
+            // Populate audio dropdown
+            if (transcodedAudioTracks.length > 0) {
+                audioSelect.innerHTML = transcodedAudioTracks.map((track, i) =>
+                    `<option value="${i}">${track.name}</option>`
+                ).join("");
+                audioSelect.disabled = false;
+                audioSelect.value = "0";
+            }
+
+            // Populate subtitle dropdown
+            if (transcodedSubtitleTracks.length > 0) {
+                subtitleSelect.innerHTML = '<option value="-1">Off</option>' +
+                    transcodedSubtitleTracks.map((track, i) =>
+                        `<option value="${i}">${track.name}</option>`
+                    ).join("");
+                subtitleSelect.disabled = false;
+            }
+
+            console.log("Parsed audio tracks:", transcodedAudioTracks);
+            console.log("Parsed subtitle tracks:", transcodedSubtitleTracks);
+        }
+
+        // Play transcoded version (live or cached)
+        async function playTranscoded(url, fileName, isLive = false) {
+            if (hls) {
+                hls.destroy();
+            }
+
+            status.textContent = isLive ? "Transcoding..." : "Playing transcoded";
+            status.style.color = "#ffd43b";
+
+            // Store base URL for audio track switching
+            currentTranscodeBase = url.replace("/master.m3u8", "");
+
+            // Fetch and parse master playlist to get tracks
+            try {
+                const response = await fetch(url);
+                const manifest = await response.text();
+                parseAndPopulateTracks(manifest);
+            } catch (e) {
+                console.error("Failed to parse manifest:", e);
+            }
+
+            hls = new Hls({
+                debug: false,
+                enableWorker: true,
+                maxBufferLength: 10,
+                maxMaxBufferLength: 30
+            });
+
+            // Start with first audio track (stream_0)
+            const streamUrl = currentTranscodeBase + "/stream_0.m3u8";
+            hls.loadSource(streamUrl);
+            hls.attachMedia(video);
+
+            hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
+                status.textContent = isLive ? "Live transcoding" : "Transcoded";
+                status.style.color = "#51cf66";
+                video.play().catch(() => {});
+            });
+
+            hls.on(Hls.Events.FRAG_LOADING, function() {
+                if (isLive) {
+                    status.textContent = "Transcoding segment...";
+                    status.style.color = "#ffd43b";
+                }
+            });
+
+            hls.on(Hls.Events.FRAG_LOADED, function() {
+                status.textContent = isLive ? "Streaming (live transcode)" : "Streaming (transcoded)";
+                status.style.color = "#51cf66";
+            });
+
+            hls.on(Hls.Events.ERROR, function(event, data) {
+                if (data.fatal) {
+                    status.textContent = "Playback error";
+                    status.style.color = "#ff6b6b";
+                }
+            });
+        }
+
+        // Initial load
+        loadFiles();
+    </script>
+</body>
+</html>
