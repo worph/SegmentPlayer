@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HLS Stream - Media Browser</title>
+    <title>SegmentPlayer - Media Browser</title>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
         * {
@@ -44,6 +44,71 @@
             border-radius: 4px;
             font-size: 0.7rem;
             font-weight: bold;
+        }
+
+        /* Metrics Panel */
+        .metrics-panel {
+            padding: 1rem;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            font-size: 0.85rem;
+            display: none;
+        }
+        .metrics-panel.active {
+            display: block;
+        }
+        .metrics-panel h3 {
+            color: #22d3ee;
+            margin-bottom: 0.75rem;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 0.75rem;
+        }
+        .metric-item {
+            background: rgba(0,0,0,0.2);
+            padding: 0.75rem;
+            border-radius: 6px;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #fff;
+        }
+        .metric-value.good { color: #51cf66; }
+        .metric-value.warning { color: #ffd43b; }
+        .metric-value.bad { color: #ff6b6b; }
+        .metric-label {
+            font-size: 0.7rem;
+            color: #888;
+            margin-top: 0.25rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .metrics-toggle {
+            background: none;
+            border: 1px solid #333;
+            color: #888;
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.2s;
+        }
+        .metrics-toggle:hover {
+            border-color: #22d3ee;
+            color: #22d3ee;
+        }
+        .metrics-toggle.active {
+            border-color: #22d3ee;
+            color: #22d3ee;
+            background: rgba(34, 211, 238, 0.1);
         }
         .layout {
             display: grid;
@@ -262,8 +327,9 @@
     <div class="container">
         <header>
             <h1>
-                HLS Stream <span class="badge">LIVE</span>
+                SegmentPlayer <span class="badge">LIVE</span>
             </h1>
+            <button class="metrics-toggle" id="metricsToggle">Transcode Metrics</button>
         </header>
 
         <div class="layout">
@@ -284,6 +350,16 @@
                 <div class="video-container">
                     <video id="video" controls crossorigin="anonymous"></video>
                     <div class="controls">
+                        <div class="control-group">
+                            <label>Quality:</label>
+                            <select id="resolutionSelect" disabled>
+                                <option value="original">Original</option>
+                                <option value="1080p">1080p</option>
+                                <option value="720p">720p</option>
+                                <option value="480p">480p</option>
+                                <option value="360p">360p</option>
+                            </select>
+                        </div>
                         <div class="control-group">
                             <label>Audio:</label>
                             <select id="audioSelect" disabled>
@@ -310,18 +386,46 @@
                     <div class="now-playing-name" id="nowPlayingName"></div>
                 </div>
 
-                <div class="info-panel">
-                    <h3>How It Works</h3>
-                    <p>
-                        This player uses <strong>nginx-vod-module</strong> for on-the-fly HLS packaging.
-                        Videos are streamed directly from your Downloads folder - no transcoding delay!
-                    </p>
-                    <p>
-                        <strong>Supported formats:</strong> MP4, MKV, MOV, AVI (with compatible codecs)
-                    </p>
-                    <p>
-                        <strong>API:</strong> <code>/hls/{file}/master.m3u8</code>
-                    </p>
+                <div class="metrics-panel" id="metricsPanel">
+                    <h3>Transcode Performance</h3>
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricAvgTime">-</div>
+                            <div class="metric-label">Avg Segment Time</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricLastTime">-</div>
+                            <div class="metric-label">Last Segment</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricMinTime">-</div>
+                            <div class="metric-label">Min Time</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricMaxTime">-</div>
+                            <div class="metric-label">Max Time</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricCacheHit">-</div>
+                            <div class="metric-label">Cache Hit Rate</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricSegments">-</div>
+                            <div class="metric-label">Total Segments</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricActive">-</div>
+                            <div class="metric-label">Active Jobs</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricThreads">-</div>
+                            <div class="metric-label">FFmpeg Threads</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricSegDuration">-</div>
+                            <div class="metric-label">Segment Duration</div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -331,6 +435,7 @@
         const video = document.getElementById("video");
         const audioSelect = document.getElementById("audioSelect");
         const subtitleSelect = document.getElementById("subtitleSelect");
+        const resolutionSelect = document.getElementById("resolutionSelect");
         const status = document.getElementById("status");
         const fileList = document.getElementById("fileList");
         const breadcrumb = document.getElementById("breadcrumb");
@@ -340,6 +445,11 @@
         let hls = null;
         let currentPath = "";
         let currentFile = null;
+        let currentResolution = "original";
+
+        // Configuration from environment (can be overridden via URL params)
+        const urlParams = new URLSearchParams(window.location.search);
+        const MAX_BUFFER_LENGTH = parseInt(urlParams.get('buffer') || '300'); // 5 minutes default
 
         // Video file extensions
         const videoExtensions = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".m2ts"];
@@ -512,6 +622,9 @@
         async function playFile(filePath, fileName) {
             currentFile = filePath;
             const forceTranscode = document.getElementById("forceTranscode").checked;
+
+            // Reset metrics when changing files
+            resetMetrics();
 
             // Update UI
             document.querySelectorAll(".file-item").forEach(item => {
@@ -780,6 +893,69 @@
             console.log("Parsed subtitle tracks:", transcodedSubtitleTracks);
         }
 
+        // Parse available resolutions from master playlist
+        let availableResolutions = [];
+        function parseAndPopulateResolutions(manifest) {
+            availableResolutions = [];
+            const lines = manifest.split('\n');
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (line.startsWith('#EXT-X-STREAM-INF')) {
+                    const resMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
+                    const nextLine = lines[i + 1];
+                    if (resMatch && nextLine) {
+                        const width = parseInt(resMatch[1]);
+                        const height = parseInt(resMatch[2]);
+                        const uriMatch = nextLine.match(/stream_a\d+_(\w+)\.m3u8/);
+                        if (uriMatch) {
+                            const resName = uriMatch[1];
+                            availableResolutions.push({
+                                name: resName === 'original' ? `Original (${width}x${height})` : `${height}p`,
+                                value: resName,
+                                width: width,
+                                height: height
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Populate resolution dropdown with available options
+            if (availableResolutions.length > 0) {
+                resolutionSelect.innerHTML = availableResolutions.map(res =>
+                    `<option value="${res.value}">${res.name}</option>`
+                ).join("");
+                resolutionSelect.value = currentResolution;
+            }
+
+            console.log("Available resolutions:", availableResolutions);
+        }
+
+        // Resolution change handler
+        resolutionSelect.addEventListener("change", function() {
+            if (!currentTranscodeBase || !hls) return;
+
+            const newResolution = this.value;
+            if (newResolution === currentResolution) return;
+
+            // Reset metrics when changing resolution
+            resetMetrics();
+
+            currentResolution = newResolution;
+            const currentTime = video.currentTime;
+            const audioIdx = audioSelect.value || "0";
+
+            const streamUrl = currentTranscodeBase + "/stream_a" + audioIdx + "_" + currentResolution + ".m3u8";
+            console.log("Switching resolution to:", streamUrl);
+
+            hls.loadSource(streamUrl);
+            hls.once(Hls.Events.MANIFEST_PARSED, () => {
+                video.currentTime = currentTime;
+                video.play().catch(() => {});
+            });
+        });
+
         // Play transcoded version (live or cached)
         async function playTranscoded(url, fileName, isLive = false) {
             if (hls) {
@@ -792,24 +968,29 @@
             // Store base URL for audio track switching
             currentTranscodeBase = url.replace("/master.m3u8", "");
 
-            // Fetch and parse master playlist to get tracks
+            // Fetch and parse master playlist to get tracks and resolutions
             try {
                 const response = await fetch(url);
                 const manifest = await response.text();
                 parseAndPopulateTracks(manifest);
+                parseAndPopulateResolutions(manifest);
             } catch (e) {
                 console.error("Failed to parse manifest:", e);
             }
 
+            // Enable resolution selector for transcoded streams
+            resolutionSelect.disabled = false;
+
             hls = new Hls({
                 debug: false,
                 enableWorker: true,
-                maxBufferLength: 10,
-                maxMaxBufferLength: 30
+                maxBufferLength: MAX_BUFFER_LENGTH,
+                maxMaxBufferLength: MAX_BUFFER_LENGTH * 2
             });
 
-            // Start with first audio track (stream_0)
-            const streamUrl = currentTranscodeBase + "/stream_0.m3u8";
+            // Start with selected resolution and first audio track
+            currentResolution = resolutionSelect.value || "original";
+            const streamUrl = currentTranscodeBase + "/stream_a0_" + currentResolution + ".m3u8";
             hls.loadSource(streamUrl);
             hls.attachMedia(video);
 
@@ -837,6 +1018,89 @@
                     status.style.color = "#ff6b6b";
                 }
             });
+        }
+
+        // Metrics toggle and fetching
+        const metricsToggle = document.getElementById("metricsToggle");
+        const metricsPanel = document.getElementById("metricsPanel");
+        let metricsInterval = null;
+
+        metricsToggle.addEventListener("click", function() {
+            this.classList.toggle("active");
+            metricsPanel.classList.toggle("active");
+
+            if (metricsPanel.classList.contains("active")) {
+                fetchMetrics();
+                metricsInterval = setInterval(fetchMetrics, 2000);
+            } else {
+                if (metricsInterval) {
+                    clearInterval(metricsInterval);
+                    metricsInterval = null;
+                }
+            }
+        });
+
+        async function resetMetrics() {
+            try {
+                await fetch("/transcode/reset-metrics");
+                console.log("Metrics reset");
+            } catch (e) {
+                console.warn("Failed to reset metrics:", e);
+            }
+        }
+
+        async function fetchMetrics() {
+            try {
+                const response = await fetch("/transcode/metrics");
+                if (!response.ok) return;
+
+                const data = await response.json();
+
+                // Format time values
+                const formatTime = (seconds) => {
+                    if (!seconds || seconds === 0) return "-";
+                    return seconds.toFixed(2) + "s";
+                };
+
+                // Get segment duration from metrics
+                const segmentDuration = data.segment_duration || 4;
+
+                // Determine color class based on avg time vs segment duration
+                const getTimeClass = (avgTime) => {
+                    if (!avgTime || avgTime === 0) return "";
+                    if (avgTime < segmentDuration * 0.5) return "good";
+                    if (avgTime < segmentDuration) return "warning";
+                    return "bad";
+                };
+
+                document.getElementById("metricAvgTime").textContent = formatTime(data.avg_segment_time);
+                document.getElementById("metricAvgTime").className = "metric-value " + getTimeClass(data.avg_segment_time);
+
+                document.getElementById("metricLastTime").textContent = formatTime(data.last_segment_time);
+                document.getElementById("metricLastTime").className = "metric-value " + getTimeClass(data.last_segment_time);
+
+                document.getElementById("metricMinTime").textContent = formatTime(data.min_segment_time);
+                document.getElementById("metricMinTime").className = "metric-value good";
+
+                document.getElementById("metricMaxTime").textContent = formatTime(data.max_segment_time);
+                document.getElementById("metricMaxTime").className = "metric-value " + getTimeClass(data.max_segment_time);
+
+                document.getElementById("metricCacheHit").textContent =
+                    data.cache_hit_rate ? data.cache_hit_rate.toFixed(1) + "%" : "-";
+                document.getElementById("metricCacheHit").className =
+                    "metric-value " + (data.cache_hit_rate > 50 ? "good" : "");
+
+                document.getElementById("metricSegments").textContent = data.total_segments || 0;
+                document.getElementById("metricActive").textContent = data.active_transcodes || 0;
+                document.getElementById("metricActive").className =
+                    "metric-value " + (data.active_transcodes > 0 ? "warning" : "");
+
+                document.getElementById("metricThreads").textContent = data.ffmpeg_threads || "-";
+                document.getElementById("metricSegDuration").textContent = segmentDuration + "s";
+
+            } catch (err) {
+                console.error("Failed to fetch metrics:", err);
+            }
         }
 
         // Initial load
