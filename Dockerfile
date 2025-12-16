@@ -1,5 +1,5 @@
 # SegmentPlayer - On-the-fly HLS streaming with live segment transcoding
-# Based on nginx-vod-module with Python transcoder for incompatible codecs
+# Uses nginx-vod-module base + static FFmpeg 7.x for faster AV1 decode
 
 FROM alfg/nginx-vod-module:latest
 
@@ -8,13 +8,22 @@ LABEL org.opencontainers.image.description="On-the-fly HLS streaming with live s
 LABEL org.opencontainers.image.source="https://github.com/Worph/SegmentPlayer"
 LABEL org.opencontainers.image.vendor="Worph"
 
-# Install Python and FFmpeg for live transcoding
+# Install dependencies and download static FFmpeg 7.x with modern libdav1d
+# Static build from johnvansickle.com includes libdav1d 1.4.x
 RUN apk add --no-cache \
-    python3 \
-    py3-pip \
-    ffmpeg \
-    curl \
-    supervisor
+        python3 \
+        curl \
+        supervisor \
+        xz \
+    && curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz \
+    && tar xf /tmp/ffmpeg.tar.xz -C /tmp \
+    && mv /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg \
+    && mv /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffprobe \
+    && rm -rf /tmp/ffmpeg* \
+    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+    && /usr/local/bin/ffmpeg -version | head -3 \
+    && echo "=== Checking libdav1d ===" \
+    && /usr/local/bin/ffmpeg -decoders 2>&1 | grep -i dav1d
 
 # Create directory structure
 RUN mkdir -p /data/www /data/media /data/cache /app /var/log/supervisor
@@ -56,7 +65,8 @@ EOF
 ENV MEDIA_DIR=/data/media \
     CACHE_DIR=/data/cache \
     SEGMENT_DURATION=4 \
-    PORT=8080
+    PORT=8080 \
+    PATH="/usr/local/bin:$PATH"
 
 # Expose web port
 EXPOSE 80

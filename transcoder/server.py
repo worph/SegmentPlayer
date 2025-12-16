@@ -2,6 +2,11 @@
 """
 HLS Live Transcoder Server
 Transcodes video segments on-demand using FFmpeg.
+
+Design: Single-threaded transcoding with one-ahead prefetch.
+- One FFmpeg process gets 100% CPU for fastest segment time
+- After serving segment N, prefetch N+1 in background thread
+- No parallel transcoding (would split CPU and increase latency)
 """
 from __future__ import annotations
 
@@ -10,20 +15,16 @@ import subprocess
 import hashlib
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
 import json
 import re
-from typing import Optional, Dict, Callable
 
 # Configuration
 MEDIA_DIR = os.environ.get('MEDIA_DIR', '/data/media')
 CACHE_DIR = os.environ.get('CACHE_DIR', '/data/cache')
 SEGMENT_DURATION = int(os.environ.get('SEGMENT_DURATION', '4'))
 PORT = int(os.environ.get('PORT', '8080'))
-MAX_WORKERS = int(os.environ.get('MAX_CONCURRENT_TRANSCODES', '4'))
-PREFETCH_COUNT = int(os.environ.get('PREFETCH_SEGMENTS', '3'))
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -38,77 +39,105 @@ RESOLUTIONS = {
 
 
 class SegmentManager:
-    """Manages segment transcoding with proper concurrency handling."""
+    """
+    Manages segment transcoding with single-threaded execution.
 
-    def __init__(self, max_workers: int):
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._futures: dict[str, Future] = {}
+    Design rationale:
+    - Single FFmpeg gets 100% CPU → fastest per-segment time
+    - One-ahead prefetch uses idle time while user watches current segment
+    - Multiple requests for same segment wait on shared Event
+    """
+
+    def __init__(self):
         self._lock = threading.Lock()
+        self._in_progress: dict[str, threading.Event] = {}  # key -> completion event
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_queue: tuple | None = None  # (key, transcode_fn)
 
         # Metrics
         self.total_segments = 0
         self.cache_hits = 0
-        self.active_jobs = 0
+        self.transcoding = False
         self.total_transcode_time = 0.0
         self.last_segment_time = 0.0
         self.min_segment_time = float('inf')
         self.max_segment_time = 0.0
-        self._transcode_times: list[float] = []  # Last N times for avg
+        self._transcode_times: list[float] = []
 
     def get_segment(self, key: str, transcode_fn) -> str | None:
         """
         Get a segment, transcoding if necessary.
-        Handles concurrent requests for the same segment.
-        Returns the path to the segment file or None on failure.
+        If another thread is transcoding this segment, wait for it.
         """
         with self._lock:
             self.total_segments += 1
 
             # Check if already being transcoded
-            if key in self._futures:
-                future = self._futures[key]
+            if key in self._in_progress:
+                event = self._in_progress[key]
+                wait_for_other = True
             else:
-                future = None
+                # We'll do the transcoding
+                event = threading.Event()
+                self._in_progress[key] = event
+                wait_for_other = False
 
-        if future:
-            # Wait for existing transcode to complete
-            try:
-                return future.result(timeout=120)
-            except Exception:
+        if wait_for_other:
+            # Wait for the other thread to finish
+            completed = event.wait(timeout=120)
+            if completed:
+                # Other thread finished, file should exist - call transcode_fn which returns cached path
+                return transcode_fn()
+            else:
+                # Timeout
                 return None
 
-        # We need to transcode - submit the job
-        with self._lock:
-            # Double-check another thread didn't start it
-            if key in self._futures:
-                future = self._futures[key]
-            else:
-                self.active_jobs += 1
-                future = self._executor.submit(self._transcode_wrapper, key, transcode_fn)
-                self._futures[key] = future
-
+        # We're the one transcoding
         try:
-            return future.result(timeout=120)
-        except Exception:
-            return None
-
-    def _transcode_wrapper(self, key: str, transcode_fn) -> str | None:
-        """Wrapper that cleans up after transcoding."""
-        try:
-            return transcode_fn()
+            result = transcode_fn()
+            return result
         finally:
             with self._lock:
-                self.active_jobs -= 1
-                self._futures.pop(key, None)
+                self._in_progress.pop(key, None)
+            event.set()  # Wake up any waiters
 
-    def prefetch(self, key: str, transcode_fn):
-        """Submit a prefetch job (fire and forget)."""
+    def schedule_prefetch(self, key: str, transcode_fn):
+        """Schedule one-ahead prefetch (only one at a time)."""
         with self._lock:
-            if key in self._futures:
+            # Skip if already cached or in progress
+            if key in self._in_progress:
                 return
-            self.active_jobs += 1
-            future = self._executor.submit(self._transcode_wrapper, key, transcode_fn)
-            self._futures[key] = future
+
+            # Skip if prefetch thread is busy
+            if self._prefetch_thread and self._prefetch_thread.is_alive():
+                return
+
+            # Start prefetch in background
+            self._prefetch_thread = threading.Thread(
+                target=self._do_prefetch,
+                args=(key, transcode_fn),
+                daemon=True
+            )
+            self._prefetch_thread.start()
+
+    def _do_prefetch(self, key: str, transcode_fn):
+        """Execute prefetch in background thread."""
+        with self._lock:
+            if key in self._in_progress:
+                return
+            event = threading.Event()
+            self._in_progress[key] = event
+
+        try:
+            transcode_fn()
+        finally:
+            with self._lock:
+                self._in_progress.pop(key, None)
+            event.set()
+
+    def is_in_progress(self, key: str) -> bool:
+        with self._lock:
+            return key in self._in_progress
 
     def record_cache_hit(self):
         with self._lock:
@@ -130,18 +159,30 @@ class SegmentManager:
     def get_metrics(self) -> dict:
         with self._lock:
             avg_time = sum(self._transcode_times) / len(self._transcode_times) if self._transcode_times else 0
+            # Transcode ratio: time to generate / segment duration
+            # e.g., 25% means 4s segment takes 1s to generate (good)
+            # 100% means realtime (borderline), >100% means buffering
+            last_ratio = (self.last_segment_time / SEGMENT_DURATION * 100) if self.last_segment_time > 0 else 0
+            avg_ratio = (avg_time / SEGMENT_DURATION * 100) if avg_time > 0 else 0
+            min_ratio = (self.min_segment_time / SEGMENT_DURATION * 100) if self.min_segment_time != float('inf') else 0
+            max_ratio = (self.max_segment_time / SEGMENT_DURATION * 100) if self.max_segment_time > 0 else 0
             return {
                 'total_segments': self.total_segments,
                 'cache_hits': self.cache_hits,
                 'cache_misses': self.total_segments - self.cache_hits,
                 'cache_hit_rate': (self.cache_hits / self.total_segments * 100) if self.total_segments > 0 else 0,
-                'active_jobs': self.active_jobs,
+                'prefetch_active': self._prefetch_thread.is_alive() if self._prefetch_thread else False,
                 'total_transcode_time': round(self.total_transcode_time, 2),
                 'last_segment_time': round(self.last_segment_time, 2),
                 'avg_segment_time': round(avg_time, 2),
                 'min_segment_time': round(self.min_segment_time, 2) if self.min_segment_time != float('inf') else 0,
                 'max_segment_time': round(self.max_segment_time, 2),
                 'segment_duration': SEGMENT_DURATION,
+                # Transcode ratio (lower is better, <100% required for smooth playback)
+                'transcode_ratio_last': round(last_ratio, 1),
+                'transcode_ratio_avg': round(avg_ratio, 1),
+                'transcode_ratio_min': round(min_ratio, 1),
+                'transcode_ratio_max': round(max_ratio, 1),
             }
 
     def reset_metrics(self):
@@ -154,14 +195,9 @@ class SegmentManager:
             self.max_segment_time = 0.0
             self._transcode_times.clear()
 
-    def is_in_progress(self, key: str) -> bool:
-        """Check if a segment is currently being transcoded."""
-        with self._lock:
-            return key in self._futures
-
 
 # Global segment manager
-segment_manager = SegmentManager(MAX_WORKERS)
+segment_manager = SegmentManager()
 
 
 def get_file_hash(filepath: str) -> str:
@@ -187,7 +223,15 @@ def get_segment_path(file_hash: str, audio: int, resolution: str, segment: int) 
 
 
 def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str, segment: int) -> str | None:
-    """Transcode a single segment using FFmpeg."""
+    """
+    Transcode a single segment using FFmpeg.
+
+    Optimized for maximum single-segment speed:
+    - libdav1d: fast multi-threaded AV1 decoder (if applicable)
+    - ultrafast preset: prioritize speed over compression
+    - threads 0: use all CPU cores for both decode and encode
+    - tune zerolatency: reduce encoding latency
+    """
     cache_dir = os.path.join(CACHE_DIR, file_hash)
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -201,17 +245,29 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
     preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
     width, height, crf = preset
 
+    # Get CPU count for threading
+    cpu_count = os.cpu_count() or 8
+
     cmd = [
         'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+        # Decoder threading (libdav1d for AV1 uses these)
+        '-threads', str(cpu_count),
         '-ss', str(start_offset),
         '-i', filepath,
         '-t', str(SEGMENT_DURATION),
         '-map', '0:v:0',
         '-map', f'0:a:{audio}',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', str(crf),
+        # Video output: optimized for speed with explicit threading
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-tune', 'zerolatency',
+        '-crf', str(crf),
         '-pix_fmt', 'yuv420p',
+        '-x264-params', f'threads={cpu_count}:lookahead_threads={min(cpu_count, 8)}',
         '-force_key_frames', 'expr:gte(t,0)',
+        # Audio: try copy (faster), FFmpeg will fail if incompatible with mpegts
         '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+        # Output format
         '-f', 'mpegts',
         '-mpegts_copyts', '1',
         '-output_ts_offset', str(start_offset),
@@ -277,24 +333,28 @@ def get_or_transcode_segment(filepath: str, file_hash: str, audio: int, resoluti
 
 
 def trigger_prefetch(filepath: str, file_hash: str, audio: int, resolution: str, current: int, info: dict):
-    """Prefetch upcoming segments."""
+    """
+    Prefetch the next segment (one-ahead only).
+
+    Only one prefetch at a time to avoid splitting CPU resources.
+    This runs in background while user watches current segment.
+    """
     duration = float(info.get('format', {}).get('duration', 0))
     total = int(duration / SEGMENT_DURATION) + 1
 
-    for i in range(1, PREFETCH_COUNT + 1):
-        next_seg = current + i
-        if next_seg >= total:
-            break
+    next_seg = current + 1
+    if next_seg >= total:
+        return
 
-        output = get_segment_path(file_hash, audio, resolution, next_seg)
-        if os.path.exists(output):
-            continue
+    output = get_segment_path(file_hash, audio, resolution, next_seg)
+    if os.path.exists(output):
+        return  # Already cached
 
-        key = f"{file_hash}:{audio}:{resolution}:{next_seg}"
-        segment_manager.prefetch(
-            key,
-            lambda s=next_seg: transcode_segment(filepath, file_hash, audio, resolution, s)
-        )
+    key = f"{file_hash}:{audio}:{resolution}:{next_seg}"
+    segment_manager.schedule_prefetch(
+        key,
+        lambda: transcode_segment(filepath, file_hash, audio, resolution, next_seg)
+    )
 
 
 def generate_master_playlist(info: dict) -> str:
@@ -542,7 +602,8 @@ class ThreadedServer(HTTPServer):
 
 def main():
     print(f"HLS Transcoder starting on port {PORT}")
-    print(f"Media: {MEDIA_DIR} | Cache: {CACHE_DIR} | Segment: {SEGMENT_DURATION}s | Workers: {MAX_WORKERS}")
+    print(f"Media: {MEDIA_DIR} | Cache: {CACHE_DIR} | Segment: {SEGMENT_DURATION}s")
+    print(f"Mode: Single-threaded + one-ahead prefetch (ultrafast preset)")
     ThreadedServer(('0.0.0.0', PORT), Handler).serve_forever()
 
 

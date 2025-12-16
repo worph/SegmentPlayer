@@ -390,40 +390,40 @@
                     <h3>Transcode Performance</h3>
                     <div class="metrics-grid">
                         <div class="metric-item">
+                            <div class="metric-value" id="metricRatioAvg">-</div>
+                            <div class="metric-label">Avg Ratio</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricRatioLast">-</div>
+                            <div class="metric-label">Last Ratio</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricRatioMin">-</div>
+                            <div class="metric-label">Best Ratio</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" id="metricRatioMax">-</div>
+                            <div class="metric-label">Worst Ratio</div>
+                        </div>
+                        <div class="metric-item">
                             <div class="metric-value" id="metricAvgTime">-</div>
-                            <div class="metric-label">Avg Segment Time</div>
+                            <div class="metric-label">Avg Time</div>
                         </div>
                         <div class="metric-item">
                             <div class="metric-value" id="metricLastTime">-</div>
-                            <div class="metric-label">Last Segment</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricMinTime">-</div>
-                            <div class="metric-label">Min Time</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricMaxTime">-</div>
-                            <div class="metric-label">Max Time</div>
+                            <div class="metric-label">Last Time</div>
                         </div>
                         <div class="metric-item">
                             <div class="metric-value" id="metricCacheHit">-</div>
-                            <div class="metric-label">Cache Hit Rate</div>
+                            <div class="metric-label">Cache Hit</div>
                         </div>
                         <div class="metric-item">
                             <div class="metric-value" id="metricSegments">-</div>
-                            <div class="metric-label">Total Segments</div>
+                            <div class="metric-label">Segments</div>
                         </div>
                         <div class="metric-item">
-                            <div class="metric-value" id="metricActive">-</div>
-                            <div class="metric-label">Active Jobs</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricThreads">-</div>
-                            <div class="metric-label">FFmpeg Threads</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricSegDuration">-</div>
-                            <div class="metric-label">Segment Duration</div>
+                            <div class="metric-value" id="metricPrefetch">-</div>
+                            <div class="metric-label">Prefetch</div>
                         </div>
                     </div>
                 </div>
@@ -1062,41 +1062,63 @@
                     return seconds.toFixed(2) + "s";
                 };
 
+                // Format ratio values (lower is better)
+                const formatRatio = (ratio) => {
+                    if (!ratio || ratio === 0) return "-";
+                    return ratio.toFixed(1) + "%";
+                };
+
+                // Determine color class based on ratio (lower is better)
+                // <25% = excellent, <50% = good, <100% = warning, >100% = bad
+                const getRatioClass = (ratio) => {
+                    if (!ratio || ratio === 0) return "";
+                    if (ratio < 25) return "good";
+                    if (ratio < 75) return "warning";
+                    return "bad";
+                };
+
                 // Get segment duration from metrics
                 const segmentDuration = data.segment_duration || 4;
 
                 // Determine color class based on avg time vs segment duration
                 const getTimeClass = (avgTime) => {
                     if (!avgTime || avgTime === 0) return "";
-                    if (avgTime < segmentDuration * 0.5) return "good";
-                    if (avgTime < segmentDuration) return "warning";
+                    if (avgTime < segmentDuration * 0.25) return "good";
+                    if (avgTime < segmentDuration * 0.75) return "warning";
                     return "bad";
                 };
 
+                // Ratio metrics (main performance indicator)
+                document.getElementById("metricRatioAvg").textContent = formatRatio(data.transcode_ratio_avg);
+                document.getElementById("metricRatioAvg").className = "metric-value " + getRatioClass(data.transcode_ratio_avg);
+
+                document.getElementById("metricRatioLast").textContent = formatRatio(data.transcode_ratio_last);
+                document.getElementById("metricRatioLast").className = "metric-value " + getRatioClass(data.transcode_ratio_last);
+
+                document.getElementById("metricRatioMin").textContent = formatRatio(data.transcode_ratio_min);
+                document.getElementById("metricRatioMin").className = "metric-value good";
+
+                document.getElementById("metricRatioMax").textContent = formatRatio(data.transcode_ratio_max);
+                document.getElementById("metricRatioMax").className = "metric-value " + getRatioClass(data.transcode_ratio_max);
+
+                // Time metrics
                 document.getElementById("metricAvgTime").textContent = formatTime(data.avg_segment_time);
                 document.getElementById("metricAvgTime").className = "metric-value " + getTimeClass(data.avg_segment_time);
 
                 document.getElementById("metricLastTime").textContent = formatTime(data.last_segment_time);
                 document.getElementById("metricLastTime").className = "metric-value " + getTimeClass(data.last_segment_time);
 
-                document.getElementById("metricMinTime").textContent = formatTime(data.min_segment_time);
-                document.getElementById("metricMinTime").className = "metric-value good";
-
-                document.getElementById("metricMaxTime").textContent = formatTime(data.max_segment_time);
-                document.getElementById("metricMaxTime").className = "metric-value " + getTimeClass(data.max_segment_time);
-
+                // Other metrics
                 document.getElementById("metricCacheHit").textContent =
                     data.cache_hit_rate ? data.cache_hit_rate.toFixed(1) + "%" : "-";
                 document.getElementById("metricCacheHit").className =
                     "metric-value " + (data.cache_hit_rate > 50 ? "good" : "");
 
                 document.getElementById("metricSegments").textContent = data.total_segments || 0;
-                document.getElementById("metricActive").textContent = data.active_transcodes || 0;
-                document.getElementById("metricActive").className =
-                    "metric-value " + (data.active_transcodes > 0 ? "warning" : "");
 
-                document.getElementById("metricThreads").textContent = data.ffmpeg_threads || "-";
-                document.getElementById("metricSegDuration").textContent = segmentDuration + "s";
+                document.getElementById("metricPrefetch").textContent = data.prefetch_active ? "Active" : "Idle";
+                document.getElementById("metricPrefetch").className =
+                    "metric-value " + (data.prefetch_active ? "warning" : "");
 
             } catch (err) {
                 console.error("Failed to fetch metrics:", err);
