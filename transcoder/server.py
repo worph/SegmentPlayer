@@ -380,8 +380,18 @@ def trigger_prefetch(filepath: str, file_hash: str, audio: int, resolution: str,
         )
 
 
-def generate_master_playlist(info: dict) -> str:
-    """Generate HLS master playlist."""
+def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
+    """
+    Generate HLS master playlist with proper multi-audio support.
+
+    Structure: Each audio track gets its own AUDIO group, and we create
+    video variants for each audio+resolution combination. This allows
+    players to switch audio tracks while keeping video+audio muxed together.
+
+    Args:
+        info: Video metadata from ffprobe
+        resolution_filter: Optional - if set, only include this resolution (e.g., '720p')
+    """
     streams = info.get('streams', [])
     video = next((s for s in streams if s.get('codec_type') == 'video'), None)
     audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
@@ -389,37 +399,60 @@ def generate_master_playlist(info: dict) -> str:
 
     lines = ["#EXTM3U", "#EXT-X-VERSION:4", ""]
 
-    # Audio tracks
+    # Define audio groups - one group per audio track
+    # Each group has a single audio entry (the track itself, embedded in video stream)
     for i, a in enumerate(audio_streams):
-        lang = a.get('tags', {}).get('language', f'aud{i}')
-        title = a.get('tags', {}).get('title', f'Audio {i+1}')
-        default = "YES" if i == 0 else "NO"
-        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{title} ({lang})",LANGUAGE="{lang}",DEFAULT={default},AUTOSELECT=YES,URI="stream_a{i}_original.m3u8"')
+        lang = a.get('tags', {}).get('language', 'und')
+        title = a.get('tags', {}).get('title', '')
+        channels = a.get('channels', 2)
 
-    # Subtitle tracks
+        # Build descriptive name
+        if title:
+            name = f"{title} ({lang})"
+        else:
+            name = f"{lang.upper()}" if lang != 'und' else f"Audio {i+1}"
+
+        # No URI = audio is embedded in video stream
+        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a{i}",NAME="{name}",LANGUAGE="{lang}",CHANNELS="{channels}",DEFAULT=YES,AUTOSELECT=YES')
+
+    # Subtitle tracks - single group, player can select
     for i, s in enumerate(subtitle_streams):
-        lang = s.get('tags', {}).get('language', f'sub{i}')
-        title = s.get('tags', {}).get('title', f'Subtitle {i+1}')
-        lines.append(f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{title} ({lang})",LANGUAGE="{lang}",DEFAULT=NO,AUTOSELECT=YES,URI="subs_{i}.m3u8"')
+        lang = s.get('tags', {}).get('language', 'und')
+        title = s.get('tags', {}).get('title', '')
+
+        if title:
+            name = f"{title} ({lang})"
+        else:
+            name = f"{lang.upper()}" if lang != 'und' else f"Subtitle {i+1}"
+
+        default = "YES" if i == 0 else "NO"
+        lines.append(f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",LANGUAGE="{lang}",DEFAULT={default},AUTOSELECT=YES,URI="subs_{i}.m3u8"')
 
     lines.append("")
 
-    # Video variants
+    # Video variants - create one per audio track per resolution
     if video:
         src_w = video.get('width', 1920)
         src_h = video.get('height', 1080)
         subs = ',SUBTITLES="subs"' if subtitle_streams else ''
 
-        for name, (w, h, _) in RESOLUTIONS.items():
-            if name != 'original' and h and h > src_h:
-                continue
+        # For each audio track, create all resolution variants
+        for audio_idx in range(max(1, len(audio_streams))):
+            for res_name, (w, h, _) in RESOLUTIONS.items():
+                # Skip resolutions higher than source
+                if res_name != 'original' and h and h > src_h:
+                    continue
 
-            width = w or src_w
-            height = h or src_h
-            bw = {None: 5000000, 1080: 4000000, 720: 2500000, 480: 1200000, 360: 800000}.get(h, 5000000)
+                # If filtering by resolution, only include that one
+                if resolution_filter and res_name != resolution_filter:
+                    continue
 
-            lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={width}x{height},AUDIO="audio"{subs}')
-            lines.append(f"stream_a0_{name}.m3u8")
+                width = w or src_w
+                height = h or src_h
+                bw = {None: 5000000, 1080: 4000000, 720: 2500000, 480: 1200000, 360: 800000}.get(h, 5000000)
+
+                lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={width}x{height},AUDIO="a{audio_idx}"{subs}')
+                lines.append(f"stream_a{audio_idx}_{res_name}.m3u8")
 
     return "\n".join(lines)
 
@@ -531,6 +564,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json')
             elif path.endswith('.ts'):
                 self.send_header('Content-Type', 'video/mp2t')
+            elif path.endswith('.vtt'):
+                self.send_header('Content-Type', 'text/vtt')
             self.end_headers()
         else:
             self.send_error(404)
@@ -564,10 +599,15 @@ class Handler(BaseHTTPRequestHandler):
             segment_manager.reset_metrics()
             return self.send_json({'status': 'ok'})
 
-        # Master playlist
+        # Master playlist (all resolutions)
         m = re.match(r'^/transcode/(.+?)/master\.m3u8$', path)
         if m:
             return self.handle_master(m.group(1))
+
+        # Quality-specific master playlist (e.g., master_720p.m3u8)
+        m = re.match(r'^/transcode/(.+?)/master_(\w+)\.m3u8$', path)
+        if m:
+            return self.handle_master(m.group(1), m.group(2))
 
         # Stream playlist
         m = re.match(r'^/transcode/(.+?)/stream_a(\d+)_(\w+)\.m3u8$', path)
@@ -647,11 +687,11 @@ class Handler(BaseHTTPRequestHandler):
 
         return full_path, get_file_hash(filepath), info
 
-    def handle_master(self, filepath: str):
+    def handle_master(self, filepath: str, resolution: str = None):
         full_path, file_hash, info = self.get_file_info(filepath)
         if not info:
             return
-        self.send_data(generate_master_playlist(info).encode(), 'application/vnd.apple.mpegurl')
+        self.send_data(generate_master_playlist(info, resolution).encode(), 'application/vnd.apple.mpegurl')
 
     def handle_stream(self, filepath: str, audio: int, resolution: str):
         full_path, file_hash, info = self.get_file_info(filepath)

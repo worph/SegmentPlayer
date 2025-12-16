@@ -284,49 +284,75 @@ def create_stream_response(file_id: str, base_url: str) -> Optional[dict]:
     info = get_video_info(filepath)
 
     streams = []
+    subtitles = []
+    video_height = 0
+    audio_info = ""
 
-    # Master playlist (adaptive quality)
-    streams.append({
-        "url": f"{base_url}/transcode/{encoded_path}/master.m3u8",
-        "title": "Auto (Adaptive Quality)",
-        "name": "SegmentPlayer - HLS",
-        "behaviorHints": {
-            "notWebReady": False
-        }
-    })
-
-    # Add resolution-specific streams if we have video info
     if info:
+        # Get subtitle tracks
+        subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
+        for i, sub in enumerate(subtitle_streams):
+            lang = sub.get('tags', {}).get('language', 'und')
+            title = sub.get('tags', {}).get('title', '')
+
+            # Build subtitle entry - id must be globally unique
+            subtitles.append({
+                "id": f"{file_id}-sub-{i}",
+                "url": f"{base_url}/transcode/{encoded_path}/subs_{i}.vtt",
+                "lang": lang,
+            })
+
+        # Get audio tracks info for title
+        audio_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'audio']
+        if len(audio_streams) > 1:
+            # Get unique languages
+            audio_langs = []
+            for aud in audio_streams:
+                lang = aud.get('tags', {}).get('language', 'und')
+                if lang not in audio_langs:
+                    audio_langs.append(lang)
+            audio_info = f" | Audio: {'/'.join(audio_langs)}"
+        elif len(audio_streams) == 1:
+            lang = audio_streams[0].get('tags', {}).get('language', 'und')
+            audio_info = f" | Audio: {lang}"
+
+        # Get video height
         for stream in info.get('streams', []):
             if stream.get('codec_type') == 'video':
-                height = stream.get('height', 0)
-
-                # Add available quality options based on source resolution
-                qualities = []
-                if height >= 1080:
-                    qualities.extend(['original', '1080p', '720p', '480p', '360p'])
-                elif height >= 720:
-                    qualities.extend(['original', '720p', '480p', '360p'])
-                elif height >= 480:
-                    qualities.extend(['original', '480p', '360p'])
-                else:
-                    qualities.extend(['original', '360p'])
-
-                for quality in qualities:
-                    if quality == 'original':
-                        title = f"Original ({height}p)"
-                    else:
-                        title = quality
-
-                    streams.append({
-                        "url": f"{base_url}/transcode/{encoded_path}/stream_a0_{quality}.m3u8",
-                        "title": title,
-                        "name": f"SegmentPlayer - {title}",
-                        "behaviorHints": {
-                            "notWebReady": False
-                        }
-                    })
+                video_height = stream.get('height', 0)
                 break
+
+    # Determine quality options based on source resolution
+    qualities = []
+    if video_height >= 1080:
+        qualities = [('original', f'Original ({video_height}p)'), ('1080p', '1080p'), ('720p', '720p'), ('480p', '480p'), ('360p', '360p')]
+    elif video_height >= 720:
+        qualities = [('original', f'Original ({video_height}p)'), ('720p', '720p'), ('480p', '480p'), ('360p', '360p')]
+    elif video_height >= 480:
+        qualities = [('original', f'Original ({video_height}p)'), ('480p', '480p'), ('360p', '360p')]
+    else:
+        qualities = [('original', f'Original ({video_height}p)'), ('360p', '360p')]
+
+    # Create quality-based streams using quality-specific master playlists
+    # This ensures audio/subtitle selection works for all quality levels
+    for quality_id, quality_title in qualities:
+        # Use master.m3u8 for 'original', master_{quality}.m3u8 for specific qualities
+        if quality_id == 'original':
+            url = f"{base_url}/transcode/{encoded_path}/master.m3u8"
+        else:
+            url = f"{base_url}/transcode/{encoded_path}/master_{quality_id}.m3u8"
+
+        stream_entry = {
+            "url": url,
+            "title": f"{quality_title}{audio_info}",
+            "name": "SegmentPlayer",
+            "behaviorHints": {
+                "notWebReady": False
+            }
+        }
+        if subtitles:
+            stream_entry["subtitles"] = subtitles
+        streams.append(stream_entry)
 
     return {"streams": streams}
 
