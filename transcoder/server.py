@@ -656,18 +656,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Video not found")
 
     def handle_stremio_stream(self, stream_type: str, stream_id: str):
-        # Update base URL from request host header if not set
-        if not stremio_handler.base_url:
-            host = self.headers.get('Host', 'localhost:8080')
-            # Check if behind proxy (X-Forwarded-Host)
-            forwarded_host = self.headers.get('X-Forwarded-Host', '')
-            forwarded_proto = self.headers.get('X-Forwarded-Proto', 'http')
-            if forwarded_host:
-                stremio_handler.base_url = f"{forwarded_proto}://{forwarded_host}"
-            else:
-                stremio_handler.base_url = f"http://{host}"
+        # Determine base URL from request headers (must be done on every request)
+        # Priority: X-Forwarded-Host > Host header
+        forwarded_host = self.headers.get('X-Forwarded-Host', '')
+        forwarded_proto = self.headers.get('X-Forwarded-Proto', 'https')  # Default to https for safety
+        host = self.headers.get('Host', 'localhost:8080')
 
-        data, content_type = stremio_handler.handle_stream(stream_type, stream_id)
+        if forwarded_host:
+            base_url = f"{forwarded_proto}://{forwarded_host}"
+        else:
+            # No proxy - use Host header, assume http for local
+            base_url = f"http://{host}"
+
+        data, content_type = stremio_handler.handle_stream(stream_type, stream_id, base_url)
         if data:
             self.send_data(data, content_type)
         else:

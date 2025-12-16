@@ -381,9 +381,11 @@ class StremioHandler:
             return json.dumps(response).encode(), 'application/json'
         return None, 'application/json'
 
-    def handle_stream(self, stream_type: str, stream_id: str) -> tuple[Optional[bytes], str]:
+    def handle_stream(self, stream_type: str, stream_id: str, base_url: str = None) -> tuple[Optional[bytes], str]:
         """Return stream URLs."""
-        response = create_stream_response(stream_id, self.base_url)
+        # Use provided base_url or fall back to configured one
+        url = base_url or self.base_url
+        response = create_stream_response(stream_id, url)
         if response:
             return json.dumps(response).encode(), 'application/json'
         return None, 'application/json'
