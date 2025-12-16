@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SegmentPlayer - Stremio Addon Setup</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+        h1 {
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            background: #8b5cf6;
+            color: #fff;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: bold;
+        }
+        .back-link {
+            color: #4dabf7;
+            text-decoration: none;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .back-link:hover {
+            text-decoration: underline;
+        }
+        .card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .card h2 {
+            color: #4dabf7;
+            font-size: 1.1rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .card h3 {
+            color: #22d3ee;
+            font-size: 0.95rem;
+            margin-top: 1.25rem;
+            margin-bottom: 0.75rem;
+        }
+        .card p {
+            color: #aaa;
+            line-height: 1.6;
+            margin-bottom: 0.75rem;
+        }
+        .card ul {
+            color: #aaa;
+            margin-left: 1.5rem;
+            margin-bottom: 0.75rem;
+        }
+        .card li {
+            margin-bottom: 0.5rem;
+            line-height: 1.5;
+        }
+        .url-box {
+            background: #111;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: monospace;
+            font-size: 0.9rem;
+            word-break: break-all;
+            margin: 1rem 0;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .url-text {
+            flex: 1;
+            color: #51cf66;
+        }
+        .copy-btn {
+            background: #4dabf7;
+            color: #000;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            white-space: nowrap;
+            transition: background 0.2s;
+        }
+        .copy-btn:hover {
+            background: #74c0fc;
+        }
+        .copy-btn.copied {
+            background: #51cf66;
+        }
+        .step {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            align-items: flex-start;
+        }
+        .step-number {
+            background: #4dabf7;
+            color: #000;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 0.85rem;
+            flex-shrink: 0;
+        }
+        .step-content {
+            flex: 1;
+        }
+        .step-content p {
+            margin-bottom: 0;
+        }
+        .note {
+            background: rgba(77, 171, 247, 0.1);
+            border-left: 3px solid #4dabf7;
+            padding: 1rem;
+            border-radius: 0 8px 8px 0;
+            margin: 1rem 0;
+        }
+        .note p {
+            margin: 0;
+            color: #ccc;
+        }
+        .note strong {
+            color: #4dabf7;
+        }
+        .warning {
+            background: rgba(255, 212, 59, 0.1);
+            border-left: 3px solid #ffd43b;
+        }
+        .warning strong {
+            color: #ffd43b;
+        }
+        .install-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+            color: #fff;
+            text-decoration: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-weight: 500;
+            font-size: 1rem;
+            margin-top: 1rem;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .install-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
+        }
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        .feature {
+            background: rgba(0,0,0,0.2);
+            padding: 1rem;
+            border-radius: 8px;
+        }
+        .feature-icon {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        .feature-title {
+            color: #fff;
+            font-weight: 500;
+            margin-bottom: 0.25rem;
+        }
+        .feature-desc {
+            color: #888;
+            font-size: 0.85rem;
+        }
+        code {
+            background: rgba(0,0,0,0.3);
+            padding: 0.15rem 0.4rem;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.85em;
+        }
+        .screenshots {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+        .screenshot {
+            background: #111;
+            border-radius: 8px;
+            padding: 0.5rem;
+        }
+        .screenshot img {
+            width: 100%;
+            border-radius: 4px;
+        }
+        .screenshot-caption {
+            text-align: center;
+            font-size: 0.8rem;
+            color: #888;
+            margin-top: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>
+                SegmentPlayer <span class="badge">STREMIO</span>
+            </h1>
+            <a href="/" class="back-link">
+                <span>&#8592;</span> Back to Player
+            </a>
+        </header>
+
+        <!-- Introduction -->
+        <div class="card">
+            <h2>What is the Stremio Addon?</h2>
+            <p>
+                The SegmentPlayer Stremio addon lets you browse and stream your media library directly
+                in <a href="https://www.stremio.com/" target="_blank" style="color: #4dabf7;">Stremio</a>,
+                a popular media center application available on Windows, macOS, Linux, Android, and iOS.
+            </p>
+
+            <div class="features">
+                <div class="feature">
+                    <div class="feature-icon">&#128250;</div>
+                    <div class="feature-title">Browse Library</div>
+                    <div class="feature-desc">View all your media files in Stremio's catalog</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">&#9889;</div>
+                    <div class="feature-title">Live Transcoding</div>
+                    <div class="feature-desc">Play any format with on-the-fly HLS conversion</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">&#127909;</div>
+                    <div class="feature-title">Quality Selection</div>
+                    <div class="feature-desc">Choose from multiple resolution options</div>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">&#127760;</div>
+                    <div class="feature-title">Remote Access</div>
+                    <div class="feature-desc">Stream from anywhere on your network</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Installation Steps -->
+        <div class="card">
+            <h2>&#9881; Installation Guide</h2>
+
+            <h3>Step 1: Get Your Addon URL</h3>
+            <p>Copy the addon manifest URL below. This URL should be accessible from where Stremio is running.</p>
+
+            <div class="url-box">
+                <span class="url-text" id="addonUrl">Loading...</span>
+                <button class="copy-btn" onclick="copyUrl()">Copy</button>
+            </div>
+
+            <div class="note warning">
+                <p>
+                    <strong>Important:</strong> Replace <code>localhost</code> with your server's IP address
+                    (e.g., <code>192.168.1.100</code>) if accessing from another device.
+                </p>
+            </div>
+
+            <h3>Step 2: Install in Stremio</h3>
+
+            <div class="step">
+                <div class="step-number">1</div>
+                <div class="step-content">
+                    <p>Open Stremio and go to <strong>Settings</strong> (gear icon) > <strong>Addons</strong></p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">2</div>
+                <div class="step-content">
+                    <p>Scroll down and click <strong>"Install addon from URL"</strong></p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">3</div>
+                <div class="step-content">
+                    <p>Paste the addon URL and click <strong>"Add"</strong></p>
+                </div>
+            </div>
+
+            <div class="step">
+                <div class="step-number">4</div>
+                <div class="step-content">
+                    <p>The addon will appear in your addon list. Click <strong>"Install"</strong> to confirm.</p>
+                </div>
+            </div>
+
+            <h3>Step 3: Browse Your Library</h3>
+            <p>
+                After installation, you'll find "SegmentPlayer" in your Stremio catalog.
+                Click on it to browse your media files. Select any video to see available streams.
+            </p>
+
+            <div class="note">
+                <p>
+                    <strong>Tip:</strong> Each video offers multiple stream options:
+                </p>
+                <ul style="margin-top: 0.5rem;">
+                    <li><strong>Auto (Adaptive Quality)</strong> - Automatically adjusts quality based on bandwidth</li>
+                    <li><strong>Original</strong> - Full source resolution</li>
+                    <li><strong>720p, 480p, 360p</strong> - Fixed lower resolutions (if source is higher)</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Alternative: One-Click Install -->
+        <div class="card">
+            <h2>&#128640; Quick Install (Web Browser)</h2>
+            <p>
+                If you have Stremio installed and running, you can use this button to install
+                the addon directly:
+            </p>
+            <a href="#" class="install-btn" id="installBtn" onclick="installAddon(event)">
+                <span>&#10003;</span> Install in Stremio
+            </a>
+            <p style="margin-top: 1rem; font-size: 0.85rem;">
+                This will open Stremio and prompt you to install the addon.
+            </p>
+        </div>
+
+        <!-- Troubleshooting -->
+        <div class="card">
+            <h2>&#128295; Troubleshooting</h2>
+
+            <h3>Addon not loading?</h3>
+            <ul>
+                <li>Make sure SegmentPlayer server is running</li>
+                <li>Check that the URL is accessible from your device (try opening it in a browser)</li>
+                <li>If using Docker, ensure port 80 is properly mapped</li>
+            </ul>
+
+            <h3>Videos not playing?</h3>
+            <ul>
+                <li>Check that your media files are in the <code>/data/media</code> directory</li>
+                <li>Try the web player first to verify transcoding works</li>
+                <li>Some Stremio clients may have issues with certain stream URLs - try different quality options</li>
+            </ul>
+
+            <h3>Slow or buffering?</h3>
+            <ul>
+                <li>Transcoding is CPU-intensive. Check server performance using the metrics panel in the web player</li>
+                <li>Try a lower resolution stream (480p or 360p)</li>
+                <li>If on WiFi, ensure good signal strength</li>
+            </ul>
+
+            <h3>Testing the Addon</h3>
+            <p>You can verify the addon is working by opening these URLs in your browser:</p>
+            <ul>
+                <li><a href="/stremio/manifest.json" target="_blank" style="color: #4dabf7;">/stremio/manifest.json</a> - Should show addon info</li>
+                <li><a href="/stremio/catalog/movie/segmentplayer_all.json" target="_blank" style="color: #4dabf7;">/stremio/catalog/movie/segmentplayer_all.json</a> - Should list your videos</li>
+            </ul>
+        </div>
+
+        <!-- Technical Info -->
+        <div class="card">
+            <h2>&#128196; Technical Details</h2>
+            <p>For developers and advanced users:</p>
+
+            <h3>API Endpoints</h3>
+            <ul>
+                <li><code>GET /stremio/manifest.json</code> - Addon manifest</li>
+                <li><code>GET /stremio/catalog/:type/:id.json</code> - Video catalog</li>
+                <li><code>GET /stremio/meta/:type/:id.json</code> - Video metadata</li>
+                <li><code>GET /stremio/stream/:type/:id.json</code> - Stream URLs</li>
+            </ul>
+
+            <h3>Stream Format</h3>
+            <p>
+                All streams are served as HLS (HTTP Live Streaming) with H.264 video and AAC audio.
+                The transcoder supports:
+            </p>
+            <ul>
+                <li>Input: Any format supported by FFmpeg (MKV, AV1, HEVC, etc.)</li>
+                <li>Output: MPEG-TS segments with 4-second duration</li>
+                <li>Resolutions: Original, 1080p, 720p, 480p, 360p</li>
+            </ul>
+
+            <h3>Environment Variables</h3>
+            <ul>
+                <li><code>BASE_URL</code> - Override the server URL (e.g., for reverse proxy)</li>
+                <li><code>MEDIA_DIR</code> - Media directory path (default: /data/media)</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // Determine the addon URL based on current page URL
+        function getAddonUrl() {
+            const protocol = window.location.protocol;
+            const host = window.location.host;
+            return `${protocol}//${host}/stremio/manifest.json`;
+        }
+
+        // Update URL display on page load
+        document.getElementById('addonUrl').textContent = getAddonUrl();
+
+        // Update install button href
+        function getInstallUrl() {
+            const manifestUrl = getAddonUrl();
+            // Stremio protocol handler
+            return `stremio://${manifestUrl.replace(/^https?:\/\//, '')}`;
+        }
+        document.getElementById('installBtn').href = getInstallUrl();
+
+        // Copy URL to clipboard
+        function copyUrl() {
+            const url = getAddonUrl();
+            navigator.clipboard.writeText(url).then(() => {
+                const btn = document.querySelector('.copy-btn');
+                btn.textContent = 'Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = 'Copy';
+                    btn.classList.remove('copied');
+                }, 2000);
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+                // Fallback
+                prompt('Copy this URL:', url);
+            });
+        }
+
+        // Install addon via Stremio protocol
+        function installAddon(event) {
+            const installUrl = getInstallUrl();
+            // Try to open Stremio protocol
+            window.location.href = installUrl;
+        }
+    </script>
+</body>
+</html>

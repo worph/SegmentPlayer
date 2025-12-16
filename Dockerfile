@@ -30,8 +30,11 @@ RUN mkdir -p /data/www /data/media /data/cache /app /var/log/supervisor
 
 # Copy application files
 COPY nginx/nginx.conf /usr/local/nginx/conf/nginx.conf
-COPY www/index.html /data/www/index.html
-COPY transcoder/server.py /app/server.py
+COPY www/ /data/www/
+COPY transcoder/ /app/
+
+# Ensure readable permissions
+RUN chmod -R 644 /data/www/* && chmod -R 644 /app/*
 
 # Create supervisord config for process management
 RUN cat > /etc/supervisord.conf <<'EOF'
