@@ -25,6 +25,7 @@ MEDIA_DIR = os.environ.get('MEDIA_DIR', '/data/media')
 CACHE_DIR = os.environ.get('CACHE_DIR', '/data/cache')
 SEGMENT_DURATION = int(os.environ.get('SEGMENT_DURATION', '4'))
 PORT = int(os.environ.get('PORT', '8080'))
+PREFETCH_SEGMENTS = int(os.environ.get('PREFETCH_SEGMENTS', '4'))  # How many segments to prefetch ahead
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -44,15 +45,16 @@ class SegmentManager:
 
     Design rationale:
     - Single FFmpeg gets 100% CPU → fastest per-segment time
-    - One-ahead prefetch uses idle time while user watches current segment
+    - Multi-ahead prefetch uses idle time while user watches current segment
     - Multiple requests for same segment wait on shared Event
+    - Prefetch queue allows scheduling multiple segments ahead
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._in_progress: dict[str, threading.Event] = {}  # key -> completion event
         self._prefetch_thread: threading.Thread | None = None
-        self._prefetch_queue: tuple | None = None  # (key, transcode_fn)
+        self._prefetch_queue: list[tuple[str, callable]] = []  # [(key, transcode_fn), ...]
 
         # Metrics
         self.total_segments = 0
@@ -102,38 +104,49 @@ class SegmentManager:
             event.set()  # Wake up any waiters
 
     def schedule_prefetch(self, key: str, transcode_fn):
-        """Schedule one-ahead prefetch (only one at a time)."""
+        """Schedule prefetch for a segment (queued, processed sequentially)."""
         with self._lock:
             # Skip if already cached or in progress
             if key in self._in_progress:
                 return
 
-            # Skip if prefetch thread is busy
-            if self._prefetch_thread and self._prefetch_thread.is_alive():
+            # Skip if already in queue
+            if any(k == key for k, _ in self._prefetch_queue):
                 return
 
-            # Start prefetch in background
-            self._prefetch_thread = threading.Thread(
-                target=self._do_prefetch,
-                args=(key, transcode_fn),
-                daemon=True
-            )
-            self._prefetch_thread.start()
+            # Add to queue
+            self._prefetch_queue.append((key, transcode_fn))
 
-    def _do_prefetch(self, key: str, transcode_fn):
-        """Execute prefetch in background thread."""
-        with self._lock:
-            if key in self._in_progress:
-                return
-            event = threading.Event()
-            self._in_progress[key] = event
+            # Start prefetch thread if not running
+            if not self._prefetch_thread or not self._prefetch_thread.is_alive():
+                self._prefetch_thread = threading.Thread(
+                    target=self._process_prefetch_queue,
+                    daemon=True
+                )
+                self._prefetch_thread.start()
 
-        try:
-            transcode_fn()
-        finally:
+    def _process_prefetch_queue(self):
+        """Process prefetch queue sequentially (single-threaded for max CPU per segment)."""
+        while True:
             with self._lock:
-                self._in_progress.pop(key, None)
-            event.set()
+                if not self._prefetch_queue:
+                    return  # Queue empty, thread exits
+
+                key, transcode_fn = self._prefetch_queue.pop(0)
+
+                # Skip if already in progress
+                if key in self._in_progress:
+                    continue
+
+                event = threading.Event()
+                self._in_progress[key] = event
+
+            try:
+                transcode_fn()
+            finally:
+                with self._lock:
+                    self._in_progress.pop(key, None)
+                event.set()
 
     def is_in_progress(self, key: str) -> bool:
         with self._lock:
@@ -172,6 +185,7 @@ class SegmentManager:
                 'cache_misses': self.total_segments - self.cache_hits,
                 'cache_hit_rate': (self.cache_hits / self.total_segments * 100) if self.total_segments > 0 else 0,
                 'prefetch_active': self._prefetch_thread.is_alive() if self._prefetch_thread else False,
+                'prefetch_queue_size': len(self._prefetch_queue),
                 'total_transcode_time': round(self.total_transcode_time, 2),
                 'last_segment_time': round(self.last_segment_time, 2),
                 'avg_segment_time': round(avg_time, 2),
@@ -334,27 +348,30 @@ def get_or_transcode_segment(filepath: str, file_hash: str, audio: int, resoluti
 
 def trigger_prefetch(filepath: str, file_hash: str, audio: int, resolution: str, current: int, info: dict):
     """
-    Prefetch the next segment (one-ahead only).
+    Prefetch upcoming segments (configurable via PREFETCH_SEGMENTS).
 
-    Only one prefetch at a time to avoid splitting CPU resources.
-    This runs in background while user watches current segment.
+    Schedules transcoding for next N segments sequentially.
+    SegmentManager ensures only one transcode runs at a time.
     """
     duration = float(info.get('format', {}).get('duration', 0))
     total = int(duration / SEGMENT_DURATION) + 1
 
-    next_seg = current + 1
-    if next_seg >= total:
-        return
+    for offset in range(1, PREFETCH_SEGMENTS + 1):
+        next_seg = current + offset
+        if next_seg >= total:
+            break
 
-    output = get_segment_path(file_hash, audio, resolution, next_seg)
-    if os.path.exists(output):
-        return  # Already cached
+        output = get_segment_path(file_hash, audio, resolution, next_seg)
+        if os.path.exists(output):
+            continue  # Already cached
 
-    key = f"{file_hash}:{audio}:{resolution}:{next_seg}"
-    segment_manager.schedule_prefetch(
-        key,
-        lambda: transcode_segment(filepath, file_hash, audio, resolution, next_seg)
-    )
+        key = f"{file_hash}:{audio}:{resolution}:{next_seg}"
+        # Use closure to capture segment number correctly
+        seg = next_seg
+        segment_manager.schedule_prefetch(
+            key,
+            lambda s=seg: transcode_segment(filepath, file_hash, audio, resolution, s)
+        )
 
 
 def generate_master_playlist(info: dict) -> str:
