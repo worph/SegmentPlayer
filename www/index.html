@@ -331,6 +331,27 @@
             50% { opacity: 0.5; transform: scale(0.8); }
         }
 
+        /* Subtitle loading indicator */
+        .subtitle-loading {
+            display: none;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.75rem;
+            color: #ffd43b;
+            margin-left: 0.25rem;
+        }
+        .subtitle-loading.active {
+            display: inline-flex;
+        }
+        .subtitle-loading .mini-spinner {
+            width: 12px;
+            height: 12px;
+            border: 2px solid #333;
+            border-top-color: #ffd43b;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
         /* Now Playing */
         .now-playing {
             padding: 1rem;
@@ -486,6 +507,10 @@
                                 <select id="subtitleSelect" disabled>
                                     <option value="">Off</option>
                                 </select>
+                                <span class="subtitle-loading" id="subtitleLoading">
+                                    <span class="mini-spinner"></span>
+                                    <span>Generating...</span>
+                                </span>
                             </div>
                             <div class="control-group">
                                 <label>
@@ -558,6 +583,7 @@
         const nowPlayingName = document.getElementById("nowPlayingName");
         const downloadBtn = document.getElementById("downloadBtn");
         const homeBtn = document.getElementById("homeBtn");
+        const subtitleLoading = document.getElementById("subtitleLoading");
 
         let hls = null;
         let currentPath = "";
@@ -1021,6 +1047,7 @@
             for (let i = 0; i < video.textTracks.length; i++) {
                 video.textTracks[i].mode = "hidden";
             }
+            subtitleLoading.classList.remove("active");
 
             if (val === -1 || this.value === "" || this.value === "-1") return;
 
@@ -1028,6 +1055,9 @@
                 hls.subtitleTrack = val;
                 return;
             }
+
+            // Show loading indicator for VTT that needs extraction
+            subtitleLoading.classList.add("active");
 
             if (currentTranscodeBase && transcodedSubtitleTracks[val]) {
                 const vttUrl = currentTranscodeBase + "/subs_" + val + ".vtt";
@@ -1038,9 +1068,13 @@
                 track.label = transcodedSubtitleTracks[val].name;
                 video.appendChild(track);
                 track.addEventListener("load", function() {
+                    subtitleLoading.classList.remove("active");
                     if (video.textTracks.length > 0) {
                         video.textTracks[0].mode = "showing";
                     }
+                });
+                track.addEventListener("error", function() {
+                    subtitleLoading.classList.remove("active");
                 });
                 return;
             }
@@ -1052,9 +1086,13 @@
                 track.default = true;
                 video.appendChild(track);
                 track.addEventListener("load", function() {
+                    subtitleLoading.classList.remove("active");
                     if (video.textTracks.length > 0) {
                         video.textTracks[0].mode = "showing";
                     }
+                });
+                track.addEventListener("error", function() {
+                    subtitleLoading.classList.remove("active");
                 });
             }
         });

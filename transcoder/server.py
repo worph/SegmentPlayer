@@ -708,13 +708,21 @@ def extract_subtitle(filepath: str, file_hash: str, sub_index: int) -> str | Non
             return f.read()
 
     try:
+        print(f"Extracting subtitle {sub_index} from {os.path.basename(filepath)}...")
         result = subprocess.run(
             ['ffmpeg', '-y', '-i', filepath, '-map', f'0:s:{sub_index}', '-c:s', 'webvtt', vtt_file],
-            capture_output=True, timeout=60
+            capture_output=True,
+            timeout=600
         )
         if result.returncode == 0 and os.path.exists(vtt_file):
+            print(f"Subtitle {sub_index} extraction complete")
             with open(vtt_file, 'r', encoding='utf-8') as f:
                 return f.read()
+        else:
+            stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+            print(f"Subtitle {sub_index} extraction failed (code {result.returncode}): {stderr[:500]}")
+    except subprocess.TimeoutExpired:
+        print(f"Subtitle {sub_index} extraction timed out after 600s")
     except Exception as e:
         print(f"Subtitle error: {e}")
 
