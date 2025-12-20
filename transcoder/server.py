@@ -27,6 +27,7 @@ CACHE_DIR = os.environ.get('CACHE_DIR', '/data/cache')
 SEGMENT_DURATION = int(os.environ.get('SEGMENT_DURATION', '4'))
 PORT = int(os.environ.get('PORT', '8080'))
 PREFETCH_SEGMENTS = int(os.environ.get('PREFETCH_SEGMENTS', '4'))  # How many segments to prefetch ahead
+FFMPEG_PRESET = os.environ.get('FFMPEG_PRESET', 'fast')  # x264 preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -246,9 +247,9 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
     """
     Transcode a single segment using FFmpeg.
 
-    Optimized for maximum single-segment speed:
+    Optimized for speed:
     - libdav1d: fast multi-threaded AV1 decoder (if applicable)
-    - ultrafast preset: prioritize speed over compression
+    - configurable preset via FFMPEG_PRESET env (default: fast)
     - threads 0: use all CPU cores for both decode and encode
     - tune zerolatency: reduce encoding latency
     """
@@ -279,7 +280,7 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         '-map', f'0:a:{audio}',
         # Video output: optimized for speed with explicit threading
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',
+        '-preset', FFMPEG_PRESET,
         '-tune', 'zerolatency',
         '-crf', str(crf),
         '-pix_fmt', 'yuv420p',
@@ -344,7 +345,7 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
         '-map', '0:v:0',
         '-map', '0:a?',  # All audio streams (optional, ? means don't fail if no audio)
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',
+        '-preset', FFMPEG_PRESET,
         '-tune', 'zerolatency',
         '-crf', str(crf),
         '-pix_fmt', 'yuv420p',
@@ -1026,7 +1027,7 @@ class ThreadedServer(HTTPServer):
 def main():
     print(f"HLS Transcoder starting on port {PORT}")
     print(f"Media: {MEDIA_DIR} | Cache: {CACHE_DIR} | Segment: {SEGMENT_DURATION}s")
-    print(f"Mode: Single-threaded + one-ahead prefetch (ultrafast preset)")
+    print(f"Mode: Single-threaded + prefetch | Preset: {FFMPEG_PRESET}")
     ThreadedServer(('0.0.0.0', PORT), Handler).serve_forever()
 
 

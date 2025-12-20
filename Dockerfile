@@ -15,6 +15,7 @@ RUN apk add --no-cache \
         curl \
         supervisor \
         xz \
+        gettext \
     && curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz \
     && tar xf /tmp/ffmpeg.tar.xz -C /tmp \
     && mv /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg \
@@ -29,7 +30,7 @@ RUN apk add --no-cache \
 RUN mkdir -p /data/www /data/media /data/cache /app /var/log/supervisor
 
 # Copy application files
-COPY nginx/nginx.conf /usr/local/nginx/conf/nginx.conf
+COPY nginx/nginx.conf /usr/local/nginx/conf/nginx.conf.template
 COPY www/ /data/www/
 COPY transcoder/ /app/
 
@@ -61,22 +62,34 @@ stdout_logfile=/dev/stdout
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
-environment=PYTHONUNBUFFERED="1",MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080"
+environment=PYTHONUNBUFFERED="1",MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080",FFMPEG_PRESET="%(ENV_FFMPEG_PRESET)s"
 EOF
+
+# Create entrypoint script to substitute env vars and start supervisord
+RUN cat > /entrypoint.sh <<'EOF'
+#!/bin/sh
+# Substitute environment variables in nginx config
+envsubst '${NGINX_PORT}' < /usr/local/nginx/conf/nginx.conf.template > /usr/local/nginx/conf/nginx.conf
+# Start supervisord
+exec /usr/bin/supervisord -c /etc/supervisord.conf
+EOF
+RUN chmod +x /entrypoint.sh
 
 # Environment variables
 ENV MEDIA_DIR=/data/media \
     CACHE_DIR=/data/cache \
     SEGMENT_DURATION=4 \
     PORT=8080 \
+    FFMPEG_PRESET=fast \
+    NGINX_PORT=80 \
     PATH="/usr/local/bin:$PATH"
 
-# Expose web port
+# Expose default web port
 EXPOSE 80
 
-# Health check
+# Health check - uses NGINX_PORT env var
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:80/ || exit 1
+    CMD curl -f http://localhost:${NGINX_PORT}/ || exit 1
 
-# Use supervisord to manage both processes
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
+# Use entrypoint to configure and start
+CMD ["/entrypoint.sh"]
