@@ -1228,11 +1228,19 @@
                     // Sort by height descending
                     levels.sort((a, b) => b.height - a.height);
 
-                    resolutionSelect.innerHTML = '<option value="auto">Auto</option>' +
-                        levels.map(l => `<option value="${l.height}">${l.height}p</option>`).join("");
+                    // First option is "Original" (highest quality)
+                    const originalHeight = levels[0].height;
+                    resolutionSelect.innerHTML =
+                        `<option value="${originalHeight}">Original (${originalHeight}p)</option>` +
+                        '<option value="auto">Auto</option>' +
+                        levels.slice(1).map(l => `<option value="${l.height}">${l.height}p</option>`).join("");
                     resolutionSelect.disabled = false;
-                    resolutionSelect.value = "auto";
-                    currentResolution = "auto";
+                    resolutionSelect.value = originalHeight.toString();
+                    currentResolution = originalHeight.toString();
+
+                    // Set HLS.js to use the highest quality level
+                    const highestLevelIdx = levels[0].index;
+                    hls.currentLevel = highestLevelIdx;
                 }
 
                 // Populate audio dropdown from HLS.js audio tracks

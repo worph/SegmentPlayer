@@ -54,14 +54,14 @@ stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
 
 [program:transcoder]
-command=python3 /app/server.py
+command=python3 -u /app/server.py
 autostart=true
 autorestart=true
 stdout_logfile=/dev/stdout
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
-environment=MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080"
+environment=PYTHONUNBUFFERED="1",MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080"
 EOF
 
 # Environment variables
