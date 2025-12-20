@@ -993,20 +993,25 @@
         audioSelect.addEventListener("change", function() {
             if (hls && this.value !== "") {
                 const idx = parseInt(this.value);
-                // For transcoded streams, HLS.js handles audio track switching via alternate audio
-                if (currentTranscodeBase && hls.audioTracks && hls.audioTracks.length > idx) {
-                    hls.audioTrack = idx;
-                } else if (currentTranscodeBase && transcodedAudioTracks[idx]) {
-                    // Fallback: reload with specific audio playlist if HLS.js doesn't see tracks
-                    const currentTime = video.currentTime;
-                    const audioUri = transcodedAudioTracks[idx].uri;
-                    // Note: This reloads the whole stream - HLS.js should handle this via audioTrack above
-                    console.log("Switching to audio track:", idx, audioUri);
-                    hls.audioTrack = idx;
-                } else {
-                    // For direct HLS (nginx vod-module), use HLS.js audio track switching
+                const currentTime = video.currentTime;
+                const wasPlaying = !video.paused;
+
+                // Switch audio track
+                if (hls.audioTracks && hls.audioTracks.length > idx) {
                     hls.audioTrack = idx;
                 }
+
+                // Flush buffer and seek to force immediate audio change
+                // With muxed segments, buffered content has old audio baked in
+                // Seeking forces reload from new audio stream
+                setTimeout(() => {
+                    // Small seek forward then back triggers buffer reload
+                    video.currentTime = currentTime + 0.1;
+                    setTimeout(() => {
+                        video.currentTime = currentTime;
+                        if (wasPlaying) video.play();
+                    }, 50);
+                }, 100);
             }
         });
 

@@ -512,23 +512,23 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
     """
     Generate HLS master playlist with multi-audio support.
 
-    Uses separate audio playlists (audio_N.m3u8) for HLS alternate audio.
-    Video segments are video-only, audio comes from separate audio tracks.
+    Uses muxed video+audio segments for performance. Each audio track gets its own
+    stream variant (stream_a0, stream_a1, etc.) with that audio muxed into the video.
     """
     streams = info.get('streams', [])
     video = next((s for s in streams if s.get('codec_type') == 'video'), None)
     audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
     subtitle_streams = [s for s in streams if s.get('codec_type') == 'subtitle']
 
-    lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    lines = ["#EXTM3U", "#EXT-X-VERSION:4", ""]
 
-    # Audio tracks - each with separate playlist URI for HLS alternate audio
+    # Audio tracks - each points to a muxed stream with that audio track
     for i, a in enumerate(audio_streams):
         lang = a.get('tags', {}).get('language', 'und')
         title = a.get('tags', {}).get('title', '')
         channels = a.get('channels', 2)
 
-        # Build descriptive name like MetaMesh: "Japanese - AAC 2.0"
+        # Build descriptive name
         codec = a.get('codec_name', 'AAC').upper()
         ch_str = f"{channels}.0" if channels else "2.0"
         if title:
@@ -537,17 +537,20 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
             lang_name = lang.upper() if lang != 'und' else f"Audio {i+1}"
             name = f"{lang_name} - {codec} {ch_str}"
 
-        # URI points to separate audio playlist for proper audio track switching
-        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",LANGUAGE="{lang}",CHANNELS="{channels}",DEFAULT=YES,AUTOSELECT=YES,URI="audio_{i}.m3u8"')
+        default = "YES" if i == 0 else "NO"
+        # URI points to muxed video+audio stream for this audio track
+        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",LANGUAGE="{lang}",CHANNELS="{channels}",DEFAULT={default},AUTOSELECT=YES,URI="stream_a{i}_original.m3u8"')
 
     # Subtitle tracks
     for i, s in enumerate(subtitle_streams):
         lang = s.get('tags', {}).get('language', 'und')
         title = s.get('tags', {}).get('title', '')
         name = f"{title}" if title else (lang.upper() if lang != 'und' else f"Subtitle {i+1}")
-        lines.append(f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",LANGUAGE="{lang}",URI="subtitle_{i}.m3u8"')
+        lines.append(f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",LANGUAGE="{lang}",DEFAULT=NO,AUTOSELECT=YES,URI="subtitle_{i}.m3u8"')
 
-    # Video variants - include all quality levels like MetaMesh
+    lines.append("")
+
+    # Video variants - all use default audio track (a0), player switches via EXT-X-MEDIA
     if video:
         src_w = video.get('width', 1920)
         src_h = video.get('height', 1080)
@@ -563,27 +566,29 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
             height = h or src_h
             bw = {None: 5000000, 1080: 4000000, 720: 2500000, 480: 1200000, 360: 800000}.get(h, 5000000)
             lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={width}x{height}{audio_ref}{subs_ref}')
-            lines.append(f"playlist_{res_name}_video.m3u8")
+            lines.append(f"stream_a0_{res_name}.m3u8")
         else:
             # Full ABR ladder - all qualities from source down
-            # (res_key, target_height, bandwidth)
             quality_order = [
-                ('original', None, 5000000, 'source'),
-                ('1080p', 1080, 4000000, '1080p'),
-                ('720p', 720, 2500000, '720p'),
-                ('480p', 480, 1200000, '480p'),
-                ('360p', 360, 800000, '360p'),
+                ('original', None, 5000000),
+                ('1080p', 1080, 4000000),
+                ('720p', 720, 2500000),
+                ('480p', 480, 1200000),
+                ('360p', 360, 800000),
             ]
-            for res_key, target_h, bw, playlist_name in quality_order:
+            for res_key, target_h, bw in quality_order:
                 # Skip resolutions higher than source
                 if target_h and target_h > src_h:
+                    continue
+                # Skip explicit resolution if it matches source (original already covers it)
+                if target_h and target_h == src_h:
                     continue
                 w, h, _ = RESOLUTIONS.get(res_key, RESOLUTIONS['original'])
                 width = w or src_w
                 height = h or src_h
                 label = f"{height}p (Original)" if res_key == 'original' else f"{height}p"
                 lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={width}x{height}{audio_ref}{subs_ref},NAME="{label}"')
-                lines.append(f"playlist_{playlist_name}_video.m3u8")
+                lines.append(f"stream_a0_{res_key}.m3u8")
 
     return "\n".join(lines) + "\n"
 
@@ -652,10 +657,10 @@ def transcode_audio_segment(filepath: str, file_hash: str, audio_index: int, seg
 
 
 def generate_stream_playlist(info: dict, audio: int, resolution: str) -> str:
-    """Generate HLS video-only stream playlist.
+    """Generate HLS stream playlist with muxed video+audio segments.
 
-    Video segments are video-only (no audio) to support HLS alternate audio.
-    Audio comes from separate audio track playlists (audio_N.m3u8).
+    Each segment contains both video and the selected audio track muxed together.
+    This is more efficient than separate streams (one transcode vs two).
     """
     duration = float(info.get('format', {}).get('duration', 0))
     num_segments = int(duration / SEGMENT_DURATION) + 1
@@ -673,8 +678,8 @@ def generate_stream_playlist(info: dict, audio: int, resolution: str) -> str:
         seg_dur = min(SEGMENT_DURATION, duration - (i * SEGMENT_DURATION))
         if seg_dur > 0.1:
             lines.append(f"#EXTINF:{seg_dur:.3f},")
-            # Video-only segments (no audio muxed)
-            lines.append(f"seg_v_{resolution}_{i:05d}.ts")
+            # Muxed video+audio segments
+            lines.append(f"seg_a{audio}_{resolution}_{i:05d}.ts")
 
     lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines)
