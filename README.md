@@ -70,6 +70,32 @@ Then open http://localhost:8080 in your browser.
 | `/hls/{file}/master.m3u8` | Direct HLS streaming (nginx-vod-module) |
 | `/transcode/{file}/master.m3u8` | Live transcoded HLS stream |
 | `/media/` | Direct file access |
+| `/stremio/manifest.json` | Stremio addon manifest |
+
+## Stremio Addon
+
+SegmentPlayer includes a built-in Stremio addon that lets you browse and stream your media library directly in Stremio.
+
+### Testing with Cloudflare Tunnel
+
+Stremio requires HTTPS for addons. Use Cloudflare's free quick tunnel for local testing:
+
+```bash
+# Install cloudflared (if not already installed)
+# macOS: brew install cloudflared
+# Linux: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
+
+# Start a temporary tunnel (no account required)
+cloudflared tunnel --url http://localhost:8080
+```
+
+This will output a URL like `https://random-words.trycloudflare.com`. Use this to install the addon in Stremio:
+
+1. Copy the tunnel URL
+2. In Stremio, go to **Addons** → **Community Addons** → search icon → paste: `https://your-tunnel-url.trycloudflare.com/stremio/manifest.json`
+3. Click **Install**
+
+Your local media library will now appear in Stremio's Discover and Search.
 
 ## Architecture
 
@@ -212,7 +238,33 @@ cd SegmentPlayer
 docker build -t segment-player .
 
 # Run locally
-docker run -p 8080:80 -v /path/to/videos:/data/media:ro segment-player
+docker run -d \
+  --name segment-player \
+  -p 8080:80 \
+  -v /path/to/videos:/data/media:ro \
+  -v segment-cache:/data/cache \
+  segment-player
+
+# Open http://localhost:8080 in your browser
+```
+
+### Container Management
+
+```bash
+# Stop the container
+docker stop segment-player
+
+# Start it again (faster - no rebuild needed)
+docker start segment-player
+
+# View logs
+docker logs -f segment-player
+
+# Remove container (to recreate with different settings)
+docker rm -f segment-player
+
+# Rebuild after code changes
+docker build -t segment-player . && docker rm -f segment-player && docker run -d --name segment-player -p 8080:80 -v /path/to/videos:/data/media:ro -v segment-cache:/data/cache segment-player
 ```
 
 ## License

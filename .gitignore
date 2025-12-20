@@ -18,3 +18,5 @@ Thumbs.db
 
 # Local testing
 docker-compose.local.yml
+CLAUDE.md
+.claude/settings.local.json
