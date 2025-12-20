@@ -235,6 +235,27 @@
             margin-right: 0.4rem;
             cursor: pointer;
         }
+        .controls button {
+            padding: 0.4rem 0.8rem;
+            border-radius: 6px;
+            border: 1px solid #333;
+            background: #222;
+            color: #fff;
+            font-size: 0.85rem;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            transition: all 0.2s;
+        }
+        .controls button:hover {
+            border-color: #4dabf7;
+            background: rgba(77, 171, 247, 0.1);
+        }
+        .controls button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         .status {
             margin-left: auto;
             padding: 0.4rem 0.8rem;
@@ -380,6 +401,9 @@
                                 <input type="checkbox" id="forceTranscode"> Force Transcode
                             </label>
                         </div>
+                        <button id="downloadBtn" disabled title="Download original file">
+                            <span>Download</span>
+                        </button>
                         <span class="status" id="status">Select a file</span>
                     </div>
                 </div>
@@ -444,6 +468,7 @@
         const breadcrumb = document.getElementById("breadcrumb");
         const nowPlaying = document.getElementById("nowPlaying");
         const nowPlayingName = document.getElementById("nowPlayingName");
+        const downloadBtn = document.getElementById("downloadBtn");
 
         let hls = null;
         let currentPath = "";
@@ -487,7 +512,7 @@
             return "📄";
         }
 
-        // Load file list
+        // Load file list (returns Promise for chaining)
         async function loadFiles(path = "") {
             fileList.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
 
@@ -638,6 +663,10 @@
             nowPlayingName.textContent = fileName;
             status.textContent = "Loading...";
             status.style.color = "#4dabf7";
+
+            // Enable download button
+            downloadBtn.disabled = false;
+            downloadBtn.title = "Download: " + fileName;
 
             // Destroy previous HLS instance
             if (hls) {
@@ -1128,8 +1157,58 @@
             }
         }
 
-        // Initial load
-        loadFiles();
+        // Download button handler
+        downloadBtn.addEventListener("click", function() {
+            if (currentFile) {
+                const downloadUrl = "/direct/" + encodeFilePath(currentFile);
+                const a = document.createElement("a");
+                a.href = downloadUrl;
+                a.download = currentFile.split("/").pop(); // Use filename
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            }
+        });
+
+        // Handle URL hash routing for direct file playback
+        // Format: #/play/path/to/file.mkv
+        function handleHashRoute() {
+            const hash = window.location.hash;
+            if (hash.startsWith("#/play/")) {
+                const encodedPath = hash.substring(7); // Remove "#/play/"
+                const filePath = decodeURIComponent(encodedPath);
+
+                if (filePath) {
+                    console.log("Hash route detected, playing:", filePath);
+
+                    // Extract directory and filename
+                    const lastSlash = filePath.lastIndexOf("/");
+                    const directory = lastSlash > 0 ? filePath.substring(0, lastSlash) : "";
+                    const fileName = lastSlash > 0 ? filePath.substring(lastSlash + 1) : filePath;
+
+                    // Update current path and load directory
+                    currentPath = directory;
+
+                    // Load directory first, then play file
+                    loadFiles(directory).then(() => {
+                        // Small delay to ensure file list is rendered
+                        setTimeout(() => {
+                            playFile(filePath, fileName);
+                        }, 100);
+                    });
+                }
+            }
+        }
+
+        // Listen for hash changes
+        window.addEventListener("hashchange", handleHashRoute);
+
+        // Initial load - check for hash route first
+        if (window.location.hash.startsWith("#/play/")) {
+            handleHashRoute();
+        } else {
+            loadFiles();
+        }
     </script>
 </body>
 </html>

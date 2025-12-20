@@ -798,6 +798,11 @@ class Handler(BaseHTTPRequestHandler):
             segment_manager.reset_metrics()
             return self.send_json({'status': 'ok'})
 
+        # Direct file serving
+        m = re.match(r'^/direct/(.+)$', path)
+        if m:
+            return self.handle_direct_file(m.group(1))
+
         # Master playlist (all resolutions)
         m = re.match(r'^/transcode/(.+?)/master\.m3u8$', path)
         if m:
@@ -982,6 +987,77 @@ class Handler(BaseHTTPRequestHandler):
             self.send_data(content.encode('utf-8'), 'text/vtt')
         else:
             self.send_error(500, "Subtitle extraction failed")
+
+    def handle_direct_file(self, filepath: str):
+        """Serve raw video file with range request support for seeking."""
+        full_path = os.path.join(MEDIA_DIR, filepath)
+        if not os.path.exists(full_path):
+            self.send_error(404, f"File not found: {filepath}")
+            return
+
+        # Determine content type from extension
+        ext = os.path.splitext(filepath)[1].lower()
+        content_types = {
+            '.mp4': 'video/mp4',
+            '.mkv': 'video/x-matroska',
+            '.webm': 'video/webm',
+            '.avi': 'video/x-msvideo',
+            '.mov': 'video/quicktime',
+            '.m4v': 'video/x-m4v',
+            '.ts': 'video/mp2t',
+            '.m2ts': 'video/mp2t',
+        }
+        content_type = content_types.get(ext, 'application/octet-stream')
+
+        file_size = os.path.getsize(full_path)
+        range_header = self.headers.get('Range')
+
+        if range_header:
+            # Parse range request (e.g., "bytes=0-1023")
+            range_match = re.match(r'bytes=(\d*)-(\d*)', range_header)
+            if range_match:
+                start = int(range_match.group(1)) if range_match.group(1) else 0
+                end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
+
+                # Clamp to file size
+                end = min(end, file_size - 1)
+                length = end - start + 1
+
+                self.send_response(206)  # Partial Content
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', length)
+                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+
+                with open(full_path, 'rb') as f:
+                    f.seek(start)
+                    remaining = length
+                    chunk_size = 64 * 1024  # 64KB chunks
+                    while remaining > 0:
+                        chunk = f.read(min(chunk_size, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+
+        # No range request - serve entire file
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', file_size)
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        with open(full_path, 'rb') as f:
+            chunk_size = 64 * 1024  # 64KB chunks
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
 
 class ThreadedServer(HTTPServer):

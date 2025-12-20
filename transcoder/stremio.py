@@ -272,20 +272,22 @@ def create_meta_response(file_id: str) -> Optional[dict]:
 
 
 def create_stream_response(file_id: str, base_url: str) -> Optional[dict]:
-    """Create stream response with HLS URLs."""
+    """Create stream response with 4 stream options."""
     filepath = get_filepath_from_id(file_id)
     if not filepath:
         return None
 
     # Encode filepath for URL
     encoded_path = '/'.join(quote(part, safe='') for part in filepath.split('/'))
+    filename = os.path.basename(filepath)
 
-    # Get video info for quality options
+    # Get video info
     info = get_video_info(filepath)
 
     streams = []
     subtitles = []
     video_height = 0
+    video_codec = ""
     audio_info = ""
 
     if info:
@@ -293,66 +295,84 @@ def create_stream_response(file_id: str, base_url: str) -> Optional[dict]:
         subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
         for i, sub in enumerate(subtitle_streams):
             lang = sub.get('tags', {}).get('language', 'und')
-            title = sub.get('tags', {}).get('title', '')
-
-            # Build subtitle entry - id must be globally unique
             subtitles.append({
                 "id": f"{file_id}-sub-{i}",
-                "url": f"{base_url}/transcode/{encoded_path}/subs_{i}.vtt",
+                "url": f"{base_url}/transcode/{encoded_path}/subtitle_{i}.vtt",
                 "lang": lang,
             })
 
         # Get audio tracks info for title
         audio_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'audio']
         if len(audio_streams) > 1:
-            # Get unique languages
             audio_langs = []
             for aud in audio_streams:
                 lang = aud.get('tags', {}).get('language', 'und')
                 if lang not in audio_langs:
                     audio_langs.append(lang)
-            audio_info = f" | Audio: {'/'.join(audio_langs)}"
+            audio_info = f" | {'/'.join(audio_langs)}"
         elif len(audio_streams) == 1:
             lang = audio_streams[0].get('tags', {}).get('language', 'und')
-            audio_info = f" | Audio: {lang}"
+            audio_info = f" | {lang}"
 
-        # Get video height
+        # Get video info
         for stream in info.get('streams', []):
             if stream.get('codec_type') == 'video':
                 video_height = stream.get('height', 0)
+                video_codec = stream.get('codec_name', '').upper()
                 break
 
-    # Determine quality options based on source resolution
-    qualities = []
-    if video_height >= 1080:
-        qualities = [('original', f'Original ({video_height}p)'), ('1080p', '1080p'), ('720p', '720p'), ('480p', '480p'), ('360p', '360p')]
-    elif video_height >= 720:
-        qualities = [('original', f'Original ({video_height}p)'), ('720p', '720p'), ('480p', '480p'), ('360p', '360p')]
-    elif video_height >= 480:
-        qualities = [('original', f'Original ({video_height}p)'), ('480p', '480p'), ('360p', '360p')]
-    else:
-        qualities = [('original', f'Original ({video_height}p)'), ('360p', '360p')]
-
-    # Create quality-based streams using quality-specific master playlists
-    # This ensures audio/subtitle selection works for all quality levels
-    for quality_id, quality_title in qualities:
-        # Use master.m3u8 for 'original', master_{quality}.m3u8 for specific qualities
-        if quality_id == 'original':
-            url = f"{base_url}/transcode/{encoded_path}/master.m3u8"
-        else:
-            url = f"{base_url}/transcode/{encoded_path}/master_{quality_id}.m3u8"
-
-        stream_entry = {
-            "url": url,
-            "title": f"{quality_title}{audio_info}",
-            "name": "SegmentPlayer",
-            "behaviorHints": {
-                "notWebReady": False
-            }
+    # 1. Direct File - serve the original file directly
+    direct_stream = {
+        "url": f"{base_url}/direct/{encoded_path}",
+        "title": f"Direct Play ({video_codec}){audio_info}",
+        "name": "SegmentPlayer - Direct",
+        "behaviorHints": {
+            "notWebReady": False,
+            "filename": filename,
         }
-        if subtitles:
-            stream_entry["subtitles"] = subtitles
-        streams.append(stream_entry)
+    }
+    if subtitles:
+        direct_stream["subtitles"] = subtitles
+    streams.append(direct_stream)
+
+    # 2. HLS Original - single quality at source resolution
+    hls_original = {
+        "url": f"{base_url}/transcode/{encoded_path}/master_source.m3u8",
+        "title": f"HLS Original ({video_height}p){audio_info}",
+        "name": "SegmentPlayer - HLS",
+        "behaviorHints": {
+            "notWebReady": False,
+        }
+    }
+    if subtitles:
+        hls_original["subtitles"] = subtitles
+    streams.append(hls_original)
+
+    # 3. HLS Auto - ABR with all quality variants
+    hls_auto = {
+        "url": f"{base_url}/transcode/{encoded_path}/master.m3u8",
+        "title": f"HLS Auto (ABR){audio_info}",
+        "name": "SegmentPlayer - HLS ABR",
+        "behaviorHints": {
+            "notWebReady": False,
+        }
+    }
+    if subtitles:
+        hls_auto["subtitles"] = subtitles
+    streams.append(hls_auto)
+
+    # 4. External link to SegmentPlayer web player
+    player_url = f"{base_url}/#/play/{encoded_path}"
+    player_stream = {
+        "externalUrl": player_url,
+        "title": "Open in SegmentPlayer",
+        "name": "SegmentPlayer Web",
+        "behaviorHints": {
+            "notWebReady": True,
+            "bingeGroup": "segmentplayer-external",
+        }
+    }
+    streams.append(player_stream)
 
     return {"streams": streams}
 
