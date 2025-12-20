@@ -537,12 +537,18 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
         # URI points to muxed video+audio stream for this audio track
         lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",LANGUAGE="{lang}",CHANNELS="{channels}",DEFAULT={default},AUTOSELECT=YES,URI="stream_a{i}_original.m3u8"')
 
-    # Subtitle tracks
+    # Subtitle tracks (skip unsupported image-based formats)
+    sub_counter = 0
     for i, s in enumerate(subtitle_streams):
+        codec = s.get('codec_name', '')
+        if codec in UNSUPPORTED_SUBTITLE_CODECS:
+            print(f"[Playlist] Skipping subtitle {i} - unsupported codec: {codec}")
+            continue
         lang = s.get('tags', {}).get('language', 'und')
         title = s.get('tags', {}).get('title', '')
-        name = f"{title}" if title else (lang.upper() if lang != 'und' else f"Subtitle {i+1}")
+        name = f"{title}" if title else (lang.upper() if lang != 'und' else f"Subtitle {sub_counter+1}")
         lines.append(f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="{name}",LANGUAGE="{lang}",DEFAULT=NO,AUTOSELECT=YES,URI="subtitle_{i}.m3u8"')
+        sub_counter += 1
 
     lines.append("")
 
@@ -551,7 +557,8 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
         src_w = video.get('width', 1920)
         src_h = video.get('height', 1080)
 
-        subs_ref = ',SUBTITLES="subs"' if subtitle_streams else ''
+        # Only reference subs group if we have supported subtitles
+        subs_ref = ',SUBTITLES="subs"' if sub_counter > 0 else ''
         audio_ref = ',AUDIO="audio"' if audio_streams else ''
 
         if resolution_filter:
@@ -697,37 +704,216 @@ def generate_subtitle_playlist(info: dict, sub_index: int) -> str:
     ])
 
 
-def extract_subtitle(filepath: str, file_hash: str, sub_index: int) -> str | None:
-    """Extract subtitle as WebVTT."""
-    cache_dir = os.path.join(CACHE_DIR, file_hash)
-    os.makedirs(cache_dir, exist_ok=True)
+# Subtitle codecs that cannot be converted to WebVTT (image-based)
+UNSUPPORTED_SUBTITLE_CODECS = {'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'}
 
-    vtt_file = os.path.join(cache_dir, f"subtitle_{sub_index}.vtt")
 
-    if os.path.exists(vtt_file):
-        with open(vtt_file, 'r', encoding='utf-8') as f:
-            return f.read()
-
-    try:
-        print(f"Extracting subtitle {sub_index} from {os.path.basename(filepath)}...")
-        result = subprocess.run(
-            ['ffmpeg', '-y', '-i', filepath, '-map', f'0:s:{sub_index}', '-c:s', 'webvtt', vtt_file],
-            capture_output=True,
-            timeout=600
-        )
-        if result.returncode == 0 and os.path.exists(vtt_file):
-            print(f"Subtitle {sub_index} extraction complete")
-            with open(vtt_file, 'r', encoding='utf-8') as f:
-                return f.read()
-        else:
-            stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
-            print(f"Subtitle {sub_index} extraction failed (code {result.returncode}): {stderr[:500]}")
-    except subprocess.TimeoutExpired:
-        print(f"Subtitle {sub_index} extraction timed out after 600s")
-    except Exception as e:
-        print(f"Subtitle error: {e}")
-
+def get_subtitle_info(info: dict, sub_index: int) -> dict | None:
+    """Get subtitle stream info by index."""
+    subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
+    if sub_index < len(subtitle_streams):
+        return subtitle_streams[sub_index]
     return None
+
+
+class SubtitleManager:
+    """
+    Manages subtitle extraction with background processing.
+
+    Design:
+    - Extraction runs in background thread, independent of HTTP request lifecycle
+    - Multiple requests for same subtitle wait on shared Event
+    - Extraction continues even if original requester disconnects
+    - Only one extraction per file runs at a time
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # key -> (event, result) where result is set before event is signaled
+        self._extractions: dict[str, tuple[threading.Event, list]] = {}
+
+    def get_subtitle(self, key: str, filepath: str, file_hash: str, sub_index: int, info: dict = None, timeout: float = 300) -> tuple[str | None, str | None]:
+        """
+        Get subtitle content, extracting if necessary.
+
+        If extraction is in progress, waits for it to complete.
+        If not started, starts extraction in background and waits.
+
+        Returns: (content, error_message)
+        """
+        cache_dir = os.path.join(CACHE_DIR, file_hash)
+        vtt_file = os.path.join(cache_dir, f"subtitle_{sub_index}.vtt")
+        error_file = os.path.join(cache_dir, f"subtitle_{sub_index}.error")
+
+        # Fast path: already cached on disk
+        if os.path.exists(vtt_file):
+            with open(vtt_file, 'r', encoding='utf-8') as f:
+                return f.read(), None
+
+        if os.path.exists(error_file):
+            with open(error_file, 'r', encoding='utf-8') as f:
+                return None, f.read()
+
+        with self._lock:
+            # Re-check disk cache after acquiring lock (another thread might have finished)
+            if os.path.exists(vtt_file):
+                with open(vtt_file, 'r', encoding='utf-8') as f:
+                    return f.read(), None
+            if os.path.exists(error_file):
+                with open(error_file, 'r', encoding='utf-8') as f:
+                    return None, f.read()
+
+            # Check if extraction in progress
+            if key in self._extractions:
+                event, result_holder = self._extractions[key]
+                print(f"[Subtitle {sub_index}] Waiting for in-progress extraction...")
+            else:
+                # Start extraction in background
+                event = threading.Event()
+                result_holder = [None]  # Mutable container to store result
+                self._extractions[key] = (event, result_holder)
+
+                # Launch background extraction thread
+                thread = threading.Thread(
+                    target=self._extract_background,
+                    args=(key, filepath, file_hash, sub_index, info, event, result_holder),
+                    daemon=True
+                )
+                thread.start()
+
+        # Wait for extraction to complete (outside lock so other requests can queue)
+        completed = event.wait(timeout=timeout)
+
+        if completed:
+            # Result is guaranteed to be set before event was signaled
+            if result_holder[0] is not None:
+                return result_holder[0]
+            # Fallback: check disk
+            if os.path.exists(vtt_file):
+                with open(vtt_file, 'r', encoding='utf-8') as f:
+                    return f.read(), None
+            if os.path.exists(error_file):
+                with open(error_file, 'r', encoding='utf-8') as f:
+                    return None, f.read()
+            return None, "Extraction completed but result not found"
+
+        return None, f"Extraction timed out after {timeout}s"
+
+    def _extract_background(self, key: str, filepath: str, file_hash: str, sub_index: int,
+                           info: dict, event: threading.Event, result_holder: list):
+        """Run extraction in background thread."""
+        try:
+            result = self._do_extract(filepath, file_hash, sub_index, info)
+            # Store result BEFORE signaling event
+            result_holder[0] = result
+        except Exception as e:
+            result_holder[0] = (None, f"Extraction thread error: {e}")
+        finally:
+            # Signal completion AFTER result is stored
+            event.set()
+            # Clean up after a delay (allow late-arriving requests to get result)
+            def cleanup():
+                time.sleep(30)
+                with self._lock:
+                    self._extractions.pop(key, None)
+            threading.Thread(target=cleanup, daemon=True).start()
+
+    def _do_extract(self, filepath: str, file_hash: str, sub_index: int, info: dict = None) -> tuple[str | None, str | None]:
+        """Actually perform the subtitle extraction."""
+        cache_dir = os.path.join(CACHE_DIR, file_hash)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        vtt_file = os.path.join(cache_dir, f"subtitle_{sub_index}.vtt")
+        error_file = os.path.join(cache_dir, f"subtitle_{sub_index}.error")
+
+        # Double-check cache (might have been created while waiting for lock)
+        if os.path.exists(vtt_file):
+            with open(vtt_file, 'r', encoding='utf-8') as f:
+                return f.read(), None
+
+        if os.path.exists(error_file):
+            with open(error_file, 'r', encoding='utf-8') as f:
+                return None, f.read()
+
+        # Check subtitle codec if info provided
+        if info:
+            sub_info = get_subtitle_info(info, sub_index)
+            if sub_info:
+                codec = sub_info.get('codec_name', '')
+                if codec in UNSUPPORTED_SUBTITLE_CODECS:
+                    error_msg = f"Subtitle format '{codec}' is image-based and cannot be converted to WebVTT"
+                    print(f"[Subtitle {sub_index}] {error_msg}")
+                    with open(error_file, 'w', encoding='utf-8') as f:
+                        f.write(error_msg)
+                    return None, error_msg
+
+        try:
+            filename = os.path.basename(filepath)
+            print(f"[Subtitle {sub_index}] Extracting from {filename}...")
+
+            # Write to temp file first, then rename atomically to avoid partial reads
+            temp_file = vtt_file + '.tmp'
+
+            result = subprocess.run(
+                ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                 '-i', filepath, '-map', f'0:s:{sub_index}', '-c:s', 'webvtt',
+                 '-f', 'webvtt', temp_file],  # Explicit format for temp file
+                capture_output=True,
+                timeout=600  # Allow long extraction since it runs in background
+            )
+
+            if result.returncode == 0 and os.path.exists(temp_file):
+                file_size = os.path.getsize(temp_file)
+                if file_size > 10:
+                    # Atomic rename - prevents partial reads by other threads
+                    os.rename(temp_file, vtt_file)
+                    print(f"[Subtitle {sub_index}] Extraction complete ({file_size} bytes)")
+                    with open(vtt_file, 'r', encoding='utf-8') as f:
+                        return f.read(), None
+                else:
+                    error_msg = "Extraction produced empty or invalid VTT file"
+                    os.remove(temp_file)
+            else:
+                stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else 'Unknown error'
+                if 'codec not currently supported' in stderr.lower():
+                    error_msg = "Subtitle codec not supported for WebVTT conversion"
+                elif 'no such file' in stderr.lower() or 'does not exist' in stderr.lower():
+                    error_msg = "Source file not found"
+                elif 'invalid subtitle' in stderr.lower():
+                    error_msg = "Invalid subtitle stream"
+                else:
+                    error_msg = f"FFmpeg error (code {result.returncode}): {stderr[:200]}"
+
+            print(f"[Subtitle {sub_index}] Failed: {error_msg}")
+            with open(error_file, 'w', encoding='utf-8') as f:
+                f.write(error_msg)
+            return None, error_msg
+
+        except subprocess.TimeoutExpired:
+            error_msg = "Extraction timed out (>600s)"
+            print(f"[Subtitle {sub_index}] {error_msg}")
+            with open(error_file, 'w', encoding='utf-8') as f:
+                f.write(error_msg)
+            # Clean up any partial files
+            for f_path in [vtt_file, temp_file]:
+                if os.path.exists(f_path):
+                    os.remove(f_path)
+            return None, error_msg
+
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            print(f"[Subtitle {sub_index}] {error_msg}")
+            with open(error_file, 'w', encoding='utf-8') as f:
+                f.write(error_msg)
+            # Clean up any partial files
+            for f_path in [vtt_file, temp_file]:
+                if os.path.exists(f_path):
+                    os.remove(f_path)
+            return None, error_msg
+
+
+# Global subtitle manager
+subtitle_manager = SubtitleManager()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -932,11 +1118,18 @@ class Handler(BaseHTTPRequestHandler):
         if not info:
             return
 
-        content = extract_subtitle(full_path, file_hash, sub_index)
+        # Use subtitle manager for coordinated extraction
+        # Multiple requests wait for same extraction, extraction continues even if client disconnects
+        key = f"{file_hash}:sub:{sub_index}"
+        content, error = subtitle_manager.get_subtitle(key, full_path, file_hash, sub_index, info)
+
         if content:
             self.send_data(content.encode('utf-8'), 'text/vtt')
         else:
-            self.send_error(500, "Subtitle extraction failed")
+            # Return empty VTT with error as cue so playback continues without subtitles
+            # This prevents breaking the HLS stream when subtitles fail
+            error_vtt = f"WEBVTT\n\nNOTE Subtitle extraction failed: {error or 'Unknown error'}\n"
+            self.send_data(error_vtt.encode('utf-8'), 'text/vtt')
 
     def handle_direct_file(self, filepath: str):
         """Serve raw video file with range request support for seeking."""
