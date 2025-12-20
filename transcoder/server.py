@@ -20,8 +20,6 @@ from urllib.parse import urlparse, unquote, parse_qs
 import json
 import re
 
-# Import Stremio addon handler
-from stremio import StremioHandler
 
 # Configuration
 MEDIA_DIR = os.environ.get('MEDIA_DIR', '/data/media')
@@ -215,9 +213,6 @@ class SegmentManager:
 
 # Global segment manager
 segment_manager = SegmentManager()
-
-# Global Stremio handler (BASE_URL set from environment)
-stremio_handler = StremioHandler()
 
 
 def get_file_hash(filepath: str) -> str:
@@ -758,8 +753,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
 
-        # For stremio and transcode endpoints, just return 200 OK
-        if path.startswith('/stremio/') or path.startswith('/transcode/'):
+        # For transcode endpoints, just return 200 OK
+        if path.startswith('/transcode/'):
             self.send_response(200)
             self.send_header('Access-Control-Allow-Origin', '*')
             if path.endswith('.m3u8'):
@@ -778,22 +773,6 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         query = parse_qs(parsed.query)
-
-        # Stremio addon endpoints
-        if path == '/stremio/manifest.json':
-            return self.handle_stremio_manifest()
-
-        m = re.match(r'^/stremio/catalog/(\w+)/([^/]+)(?:/([^.]+))?\.json$', path)
-        if m:
-            return self.handle_stremio_catalog(m.group(1), m.group(2), m.group(3))
-
-        m = re.match(r'^/stremio/meta/(\w+)/([^/]+)\.json$', path)
-        if m:
-            return self.handle_stremio_meta(m.group(1), m.group(2))
-
-        m = re.match(r'^/stremio/stream/(\w+)/([^/]+)\.json$', path)
-        if m:
-            return self.handle_stremio_stream(m.group(1), m.group(2))
 
         # Metrics
         if path in ('/metrics', '/transcode/metrics'):
@@ -863,86 +842,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_subtitle_vtt(m.group(1), int(m.group(2)))
 
         self.send_error(404)
-
-    # Stremio addon handlers
-    def handle_stremio_manifest(self):
-        data, content_type = stremio_handler.handle_manifest()
-        self.send_data(data, content_type)
-
-    def handle_stremio_catalog(self, catalog_type: str, catalog_id: str, extra: str = None):
-        extra_dict = {}
-        if extra:
-            # Parse extra params like "search=query"
-            for param in extra.split('&'):
-                if '=' in param:
-                    key, value = param.split('=', 1)
-                    extra_dict[key] = unquote(value)
-
-        data, content_type = stremio_handler.handle_catalog(catalog_type, catalog_id, extra_dict)
-        self.send_data(data, content_type)
-
-    def handle_stremio_meta(self, meta_type: str, meta_id: str):
-        data, content_type = stremio_handler.handle_meta(meta_type, meta_id)
-        if data:
-            self.send_data(data, content_type)
-        else:
-            self.send_error(404, "Video not found")
-
-    def handle_stremio_stream(self, stream_type: str, stream_id: str):
-        # Determine base URL from request headers with multiple fallbacks
-        # Same logic as MetaMesh url-helper.ts
-        base_url = self.get_base_url_from_request()
-
-        data, content_type = stremio_handler.handle_stream(stream_type, stream_id, base_url)
-        if data:
-            self.send_data(data, content_type)
-        else:
-            self.send_error(404, "Video not found")
-
-    def get_base_url_from_request(self) -> str:
-        """
-        Extract base URL from request headers with intelligent protocol detection.
-        Handles reverse proxy headers (X-Forwarded-Proto, Forwarded, Referer).
-        Same logic as MetaMesh url-helper.ts
-        """
-        host = self.headers.get('X-Forwarded-Host') or self.headers.get('Host', 'localhost:8080')
-
-        # Protocol detection with multiple fallbacks
-        proto = self.headers.get('X-Forwarded-Proto', '')
-
-        # Check standard Forwarded header (RFC 7239) if X-Forwarded-Proto not present
-        if not proto:
-            forwarded = self.headers.get('Forwarded', '')
-            if forwarded:
-                match = re.search(r'proto=([^;,\s]+)', forwarded, re.IGNORECASE)
-                if match:
-                    proto = match.group(1).lower()
-
-        # Try to infer from Referer header
-        if not proto:
-            referer = self.headers.get('Referer', '')
-            if referer:
-                match = re.match(r'^(https?)://', referer, re.IGNORECASE)
-                if match:
-                    proto = match.group(1).lower()
-                    print(f"[url-helper] Inferred protocol from Referer: {proto}")
-
-        # Final fallback: Assume HTTPS for non-localhost domains
-        if not proto:
-            is_localhost = 'localhost' in host or '127.0.0.1' in host or '::1' in host
-            if is_localhost:
-                proto = 'http'
-            else:
-                proto = 'https'
-                print(f"[url-helper] Non-localhost domain detected, assuming HTTPS: {host}")
-
-        # Remove default ports from host to keep URLs clean
-        clean_host = host.replace(':80', '').replace(':443', '')
-
-        base_url = f"{proto}://{clean_host}"
-        print(f"[url-helper] Detected base URL: {base_url}")
-
-        return base_url
 
     def get_file_info(self, filepath: str):
         """Get file path and info, or send error."""

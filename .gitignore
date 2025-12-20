@@ -20,3 +20,4 @@ Thumbs.db
 docker-compose.local.yml
 CLAUDE.md
 .claude/settings.local.json
+benchmarks/tomato.md
