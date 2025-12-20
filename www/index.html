@@ -993,15 +993,18 @@
         audioSelect.addEventListener("change", function() {
             if (hls && this.value !== "") {
                 const idx = parseInt(this.value);
-                if (currentTranscodeBase && transcodedAudioTracks[idx]) {
+                // For transcoded streams, HLS.js handles audio track switching via alternate audio
+                if (currentTranscodeBase && hls.audioTracks && hls.audioTracks.length > idx) {
+                    hls.audioTrack = idx;
+                } else if (currentTranscodeBase && transcodedAudioTracks[idx]) {
+                    // Fallback: reload with specific audio playlist if HLS.js doesn't see tracks
                     const currentTime = video.currentTime;
-                    const streamUrl = currentTranscodeBase + "/" + transcodedAudioTracks[idx].uri;
-                    hls.loadSource(streamUrl);
-                    hls.once(Hls.Events.MANIFEST_PARSED, () => {
-                        video.currentTime = currentTime;
-                        video.play().catch(() => {});
-                    });
+                    const audioUri = transcodedAudioTracks[idx].uri;
+                    // Note: This reloads the whole stream - HLS.js should handle this via audioTrack above
+                    console.log("Switching to audio track:", idx, audioUri);
+                    hls.audioTrack = idx;
                 } else {
+                    // For direct HLS (nginx vod-module), use HLS.js audio track switching
                     hls.audioTrack = idx;
                 }
             }
@@ -1080,11 +1083,14 @@
 
             const lines = manifest.split('\n');
             for (const line of lines) {
+                // Parse audio tracks from EXT-X-MEDIA declarations
                 if (line.startsWith('#EXT-X-MEDIA:TYPE=AUDIO')) {
                     const name = line.match(/NAME="([^"]+)"/)?.[1] || 'Audio';
                     const uri = line.match(/URI="([^"]+)"/)?.[1] || '';
                     transcodedAudioTracks.push({ name, uri });
-                } else if (line.startsWith('#EXT-X-MEDIA:TYPE=SUBTITLES')) {
+                }
+                // Parse subtitles from EXT-X-MEDIA declarations
+                else if (line.startsWith('#EXT-X-MEDIA:TYPE=SUBTITLES')) {
                     const name = line.match(/NAME="([^"]+)"/)?.[1] || 'Subtitle';
                     const uri = line.match(/URI="([^"]+)"/)?.[1] || '';
                     transcodedSubtitleTracks.push({ name, uri });
@@ -1143,23 +1149,39 @@
         }
 
         resolutionSelect.addEventListener("change", function() {
-            if (!currentTranscodeBase || !hls) return;
+            if (!hls || !hls.levels || hls.levels.length === 0) return;
 
             const newResolution = this.value;
             if (newResolution === currentResolution) return;
 
             resetMetrics();
             currentResolution = newResolution;
-            const currentTime = video.currentTime;
-            const audioIdx = audioSelect.value || "0";
 
-            const streamUrl = currentTranscodeBase + "/stream_a" + audioIdx + "_" + currentResolution + ".m3u8";
+            // Find the level index matching the selected resolution
+            // -1 means auto (ABR)
+            if (newResolution === 'auto') {
+                hls.currentLevel = -1;
+            } else {
+                const targetHeight = parseInt(newResolution) || 0;
+                let levelIdx = -1;
 
-            hls.loadSource(streamUrl);
-            hls.once(Hls.Events.MANIFEST_PARSED, () => {
-                video.currentTime = currentTime;
-                video.play().catch(() => {});
-            });
+                for (let i = 0; i < hls.levels.length; i++) {
+                    const level = hls.levels[i];
+                    if (newResolution === 'original' || newResolution === 'source') {
+                        // Pick highest quality for "original"
+                        if (levelIdx === -1 || level.height > hls.levels[levelIdx].height) {
+                            levelIdx = i;
+                        }
+                    } else if (level.height === targetHeight) {
+                        levelIdx = i;
+                        break;
+                    }
+                }
+
+                if (levelIdx >= 0) {
+                    hls.currentLevel = levelIdx;
+                }
+            }
         });
 
         async function playTranscoded(url, fileName, isLive = false) {
@@ -1187,13 +1209,42 @@
                 maxMaxBufferLength: MAX_BUFFER_LENGTH * 2
             });
 
-            currentResolution = resolutionSelect.value || "original";
-            const streamUrl = currentTranscodeBase + "/stream_a0_" + currentResolution + ".m3u8";
-            hls.loadSource(streamUrl);
+            // Load the master playlist - HLS.js will handle audio track switching
+            hls.loadSource(url);
             hls.attachMedia(video);
 
-            hls.on(Hls.Events.MANIFEST_PARSED, function() {
+            hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
                 setStatus("", "#51cf66");
+
+                // Populate resolution dropdown from HLS.js levels
+                if (hls.levels && hls.levels.length > 0) {
+                    const levels = hls.levels.map((level, i) => ({
+                        index: i,
+                        height: level.height,
+                        width: level.width,
+                        bitrate: level.bitrate
+                    }));
+
+                    // Sort by height descending
+                    levels.sort((a, b) => b.height - a.height);
+
+                    resolutionSelect.innerHTML = '<option value="auto">Auto</option>' +
+                        levels.map(l => `<option value="${l.height}">${l.height}p</option>`).join("");
+                    resolutionSelect.disabled = false;
+                    resolutionSelect.value = "auto";
+                    currentResolution = "auto";
+                }
+
+                // Populate audio dropdown from HLS.js audio tracks
+                if (hls.audioTracks && hls.audioTracks.length > 0) {
+                    audioSelect.innerHTML = hls.audioTracks.map((track, i) => {
+                        const label = track.name || track.lang || `Audio ${i + 1}`;
+                        return `<option value="${i}">${label}</option>`;
+                    }).join("");
+                    audioSelect.disabled = false;
+                    audioSelect.value = hls.audioTrack.toString();
+                }
+
                 video.play().catch(() => {});
             });
 
