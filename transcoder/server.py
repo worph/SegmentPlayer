@@ -633,8 +633,9 @@ def transcode_audio_segment(filepath: str, file_hash: str, audio_index: int, seg
         '-c:a', 'aac',
         '-b:a', '128k',
         '-ac', '2',
-        '-output_ts_offset', str(start_time),
         '-f', 'mpegts',
+        '-mpegts_copyts', '1',
+        '-output_ts_offset', str(start_time),
         output_file
     ]
 
