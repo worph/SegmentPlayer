@@ -884,23 +884,60 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "Video not found")
 
     def handle_stremio_stream(self, stream_type: str, stream_id: str):
-        # Determine base URL from request headers (must be done on every request)
-        # Priority: X-Forwarded-Host > Host header
-        forwarded_host = self.headers.get('X-Forwarded-Host', '')
-        forwarded_proto = self.headers.get('X-Forwarded-Proto', 'https')  # Default to https for safety
-        host = self.headers.get('Host', 'localhost:8080')
-
-        if forwarded_host:
-            base_url = f"{forwarded_proto}://{forwarded_host}"
-        else:
-            # No proxy - use Host header, assume http for local
-            base_url = f"http://{host}"
+        # Determine base URL from request headers with multiple fallbacks
+        # Same logic as MetaMesh url-helper.ts
+        base_url = self.get_base_url_from_request()
 
         data, content_type = stremio_handler.handle_stream(stream_type, stream_id, base_url)
         if data:
             self.send_data(data, content_type)
         else:
             self.send_error(404, "Video not found")
+
+    def get_base_url_from_request(self) -> str:
+        """
+        Extract base URL from request headers with intelligent protocol detection.
+        Handles reverse proxy headers (X-Forwarded-Proto, Forwarded, Referer).
+        Same logic as MetaMesh url-helper.ts
+        """
+        host = self.headers.get('X-Forwarded-Host') or self.headers.get('Host', 'localhost:8080')
+
+        # Protocol detection with multiple fallbacks
+        proto = self.headers.get('X-Forwarded-Proto', '')
+
+        # Check standard Forwarded header (RFC 7239) if X-Forwarded-Proto not present
+        if not proto:
+            forwarded = self.headers.get('Forwarded', '')
+            if forwarded:
+                match = re.search(r'proto=([^;,\s]+)', forwarded, re.IGNORECASE)
+                if match:
+                    proto = match.group(1).lower()
+
+        # Try to infer from Referer header
+        if not proto:
+            referer = self.headers.get('Referer', '')
+            if referer:
+                match = re.match(r'^(https?)://', referer, re.IGNORECASE)
+                if match:
+                    proto = match.group(1).lower()
+                    print(f"[url-helper] Inferred protocol from Referer: {proto}")
+
+        # Final fallback: Assume HTTPS for non-localhost domains
+        if not proto:
+            is_localhost = 'localhost' in host or '127.0.0.1' in host or '::1' in host
+            if is_localhost:
+                proto = 'http'
+            else:
+                proto = 'https'
+                print(f"[url-helper] Non-localhost domain detected, assuming HTTPS: {host}")
+
+        # Remove default ports from host to keep URLs clean
+        clean_host = host.replace(':80', '').replace(':443', '')
+
+        base_url = f"{proto}://{clean_host}"
+        print(f"[url-helper] Detected base URL: {base_url}")
+
+        return base_url
 
     def get_file_info(self, filepath: str):
         """Get file path and info, or send error."""

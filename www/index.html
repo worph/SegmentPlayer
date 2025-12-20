@@ -35,6 +35,10 @@
             display: flex;
             align-items: center;
             gap: 0.5rem;
+            cursor: pointer;
+        }
+        h1:hover {
+            opacity: 0.8;
         }
         .badge {
             display: inline-block;
@@ -45,53 +49,12 @@
             font-size: 0.7rem;
             font-weight: bold;
         }
-
-        /* Metrics Panel */
-        .metrics-panel {
-            padding: 1rem;
-            background: rgba(255,255,255,0.05);
-            border-radius: 8px;
-            font-size: 0.85rem;
-            display: none;
-        }
-        .metrics-panel.active {
-            display: block;
-        }
-        .metrics-panel h3 {
-            color: #22d3ee;
-            margin-bottom: 0.75rem;
-            font-size: 0.9rem;
+        .header-buttons {
             display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
             gap: 0.75rem;
+            align-items: center;
         }
-        .metric-item {
-            background: rgba(0,0,0,0.2);
-            padding: 0.75rem;
-            border-radius: 6px;
-            text-align: center;
-        }
-        .metric-value {
-            font-size: 1.25rem;
-            font-weight: 600;
-            color: #fff;
-        }
-        .metric-value.good { color: #51cf66; }
-        .metric-value.warning { color: #ffd43b; }
-        .metric-value.bad { color: #ff6b6b; }
-        .metric-label {
-            font-size: 0.7rem;
-            color: #888;
-            margin-top: 0.25rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        .metrics-toggle {
+        .header-btn {
             background: none;
             border: 1px solid #333;
             color: #888;
@@ -99,16 +62,102 @@
             border-radius: 6px;
             cursor: pointer;
             font-size: 0.8rem;
+            text-decoration: none;
             transition: all 0.2s;
         }
-        .metrics-toggle:hover {
-            border-color: #22d3ee;
-            color: #22d3ee;
+        .header-btn:hover {
+            border-color: #4dabf7;
+            color: #4dabf7;
         }
-        .metrics-toggle.active {
-            border-color: #22d3ee;
-            color: #22d3ee;
-            background: rgba(34, 211, 238, 0.1);
+
+        /* ============ BROWSE MODE ============ */
+        .browse-view {
+            display: block;
+        }
+        .browse-view.hidden {
+            display: none;
+        }
+        .browse-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .browse-breadcrumb {
+            font-size: 0.9rem;
+            color: #888;
+        }
+        .browse-breadcrumb span {
+            cursor: pointer;
+            color: #4dabf7;
+        }
+        .browse-breadcrumb span:hover {
+            text-decoration: underline;
+        }
+        .browse-stats {
+            font-size: 0.85rem;
+            color: #666;
+        }
+        .media-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 1rem;
+        }
+        .media-card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            overflow: hidden;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+        .media-card:hover {
+            background: rgba(255,255,255,0.1);
+            border-color: rgba(77, 171, 247, 0.3);
+            transform: translateY(-2px);
+        }
+        .media-card.folder {
+            background: rgba(255, 212, 59, 0.05);
+        }
+        .media-card.folder:hover {
+            background: rgba(255, 212, 59, 0.1);
+            border-color: rgba(255, 212, 59, 0.3);
+        }
+        .media-card-icon {
+            height: 120px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 3rem;
+            background: rgba(0,0,0,0.2);
+        }
+        .media-card.folder .media-card-icon {
+            background: rgba(255, 212, 59, 0.1);
+        }
+        .media-card-info {
+            padding: 1rem;
+        }
+        .media-card-name {
+            font-size: 0.95rem;
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .media-card-meta {
+            font-size: 0.8rem;
+            color: #888;
+            display: flex;
+            gap: 1rem;
+        }
+
+        /* ============ PLAYER MODE ============ */
+        .player-view {
+            display: none;
+        }
+        .player-view.active {
+            display: block;
         }
         .layout {
             display: grid;
@@ -121,7 +170,7 @@
             }
         }
 
-        /* File Browser */
+        /* File Browser Sidebar */
         .file-browser {
             background: rgba(255,255,255,0.05);
             border-radius: 12px;
@@ -170,17 +219,17 @@
             color: #888;
             font-size: 0.8rem;
         }
-        .breadcrumb {
+        .sidebar-breadcrumb {
             padding: 0.5rem 1rem;
             background: rgba(0,0,0,0.1);
             font-size: 0.85rem;
             color: #888;
         }
-        .breadcrumb span {
+        .sidebar-breadcrumb span {
             cursor: pointer;
             color: #4dabf7;
         }
-        .breadcrumb span:hover {
+        .sidebar-breadcrumb span:hover {
             text-decoration: underline;
         }
 
@@ -263,6 +312,23 @@
             border-radius: 6px;
             font-size: 0.8rem;
             color: #4dabf7;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            flex-shrink: 0;
+        }
+        .status-dot.pulse {
+            animation: pulse 1s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.8); }
         }
 
         /* Now Playing */
@@ -282,52 +348,54 @@
             word-break: break-word;
         }
 
-        /* Info Panel */
-        .info-panel {
+        /* Metrics Panel */
+        .metrics-panel {
             padding: 1rem;
             background: rgba(255,255,255,0.05);
             border-radius: 8px;
             font-size: 0.85rem;
+            display: none;
         }
-        .info-panel h3 {
-            color: #4dabf7;
+        .metrics-panel.active {
+            display: block;
+        }
+        .metrics-panel h3 {
+            color: #22d3ee;
             margin-bottom: 0.75rem;
             font-size: 0.9rem;
         }
-        .info-panel p {
-            color: #aaa;
-            line-height: 1.5;
-            margin-bottom: 0.5rem;
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 0.75rem;
         }
-        .info-panel code {
-            background: #222;
-            padding: 0.15rem 0.4rem;
-            border-radius: 4px;
-            font-family: monospace;
-            font-size: 0.8rem;
-        }
-
-        /* Empty State */
-        .empty-state {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 3rem;
-            color: #666;
+        .metric-item {
+            background: rgba(0,0,0,0.2);
+            padding: 0.75rem;
+            border-radius: 6px;
             text-align: center;
         }
-        .empty-state-icon {
-            font-size: 3rem;
-            margin-bottom: 1rem;
+        .metric-value {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #fff;
+        }
+        .metric-value.good { color: #51cf66; }
+        .metric-value.warning { color: #ffd43b; }
+        .metric-value.bad { color: #ff6b6b; }
+        .metric-label {
+            font-size: 0.7rem;
+            color: #888;
+            margin-top: 0.25rem;
+            text-transform: uppercase;
         }
 
-        /* Loading */
+        /* Loading & Empty States */
         .loading {
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 2rem;
+            padding: 3rem;
             color: #888;
         }
         .spinner {
@@ -342,115 +410,128 @@
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 3rem;
+            color: #666;
+            text-align: center;
+        }
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>
+            <h1 id="homeBtn">
                 SegmentPlayer <span class="badge">LIVE</span>
             </h1>
-            <div style="display: flex; gap: 0.75rem; align-items: center;">
-                <a href="/stremio.html" class="metrics-toggle" style="text-decoration: none;">Stremio Addon</a>
-                <button class="metrics-toggle" id="metricsToggle">Transcode Metrics</button>
+            <div class="header-buttons">
+                <a href="/stremio.html" class="header-btn">Stremio Addon</a>
+                <button class="header-btn" id="metricsToggle">Metrics</button>
             </div>
         </header>
 
-        <div class="layout">
-            <!-- File Browser -->
-            <div class="file-browser">
-                <div class="file-browser-header">Media Files</div>
-                <div class="breadcrumb" id="breadcrumb"></div>
-                <div class="file-list" id="fileList">
-                    <div class="loading">
-                        <div class="spinner"></div>
-                        Loading files...
-                    </div>
+        <!-- Browse Mode: Full-page media grid -->
+        <div class="browse-view" id="browseView">
+            <div class="browse-header">
+                <div class="browse-breadcrumb" id="browseBreadcrumb"></div>
+                <div class="browse-stats" id="browseStats"></div>
+            </div>
+            <div class="media-grid" id="mediaGrid">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    Loading media...
                 </div>
             </div>
+        </div>
 
-            <!-- Player Section -->
-            <div class="player-section">
-                <div class="video-container">
-                    <video id="video" controls crossorigin="anonymous"></video>
-                    <div class="controls">
-                        <div class="control-group">
-                            <label>Quality:</label>
-                            <select id="resolutionSelect" disabled>
-                                <option value="original">Original</option>
-                                <option value="1080p">1080p</option>
-                                <option value="720p">720p</option>
-                                <option value="480p">480p</option>
-                                <option value="360p">360p</option>
-                            </select>
+        <!-- Player Mode: Sidebar + Player -->
+        <div class="player-view" id="playerView">
+            <div class="layout">
+                <!-- File Browser Sidebar -->
+                <div class="file-browser">
+                    <div class="file-browser-header">Media Files</div>
+                    <div class="sidebar-breadcrumb" id="sidebarBreadcrumb"></div>
+                    <div class="file-list" id="fileList"></div>
+                </div>
+
+                <!-- Player Section -->
+                <div class="player-section">
+                    <div class="video-container">
+                        <video id="video" controls crossorigin="anonymous"></video>
+                        <div class="controls">
+                            <div class="control-group">
+                                <label>Quality:</label>
+                                <select id="resolutionSelect" disabled>
+                                    <option value="original">Original</option>
+                                    <option value="1080p">1080p</option>
+                                    <option value="720p">720p</option>
+                                    <option value="480p">480p</option>
+                                    <option value="360p">360p</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label>Audio:</label>
+                                <select id="audioSelect" disabled>
+                                    <option value="">Default</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label>Subtitles:</label>
+                                <select id="subtitleSelect" disabled>
+                                    <option value="">Off</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label>
+                                    <input type="checkbox" id="forceTranscode"> Force Transcode
+                                </label>
+                            </div>
+                            <button id="downloadBtn" disabled title="Download original file">
+                                <span>Download</span>
+                            </button>
+                            <span class="status" id="status"><span class="status-dot" id="statusDot"></span><span id="statusText">Select a file</span></span>
                         </div>
-                        <div class="control-group">
-                            <label>Audio:</label>
-                            <select id="audioSelect" disabled>
-                                <option value="">Default</option>
-                            </select>
-                        </div>
-                        <div class="control-group">
-                            <label>Subtitles:</label>
-                            <select id="subtitleSelect" disabled>
-                                <option value="">Off</option>
-                            </select>
-                        </div>
-                        <div class="control-group">
-                            <label>
-                                <input type="checkbox" id="forceTranscode"> Force Transcode
-                            </label>
-                        </div>
-                        <button id="downloadBtn" disabled title="Download original file">
-                            <span>Download</span>
-                        </button>
-                        <span class="status" id="status">Select a file</span>
                     </div>
-                </div>
 
-                <div class="now-playing" id="nowPlaying" style="display: none;">
-                    <div class="now-playing-title">Now Playing</div>
-                    <div class="now-playing-name" id="nowPlayingName"></div>
-                </div>
+                    <div class="now-playing" id="nowPlaying" style="display: none;">
+                        <div class="now-playing-title">Now Playing</div>
+                        <div class="now-playing-name" id="nowPlayingName"></div>
+                    </div>
 
-                <div class="metrics-panel" id="metricsPanel">
-                    <h3>Transcode Performance</h3>
-                    <div class="metrics-grid">
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricRatioAvg">-</div>
-                            <div class="metric-label">Avg Ratio</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricRatioLast">-</div>
-                            <div class="metric-label">Last Ratio</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricRatioMin">-</div>
-                            <div class="metric-label">Best Ratio</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricRatioMax">-</div>
-                            <div class="metric-label">Worst Ratio</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricAvgTime">-</div>
-                            <div class="metric-label">Avg Time</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricLastTime">-</div>
-                            <div class="metric-label">Last Time</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricCacheHit">-</div>
-                            <div class="metric-label">Cache Hit</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricSegments">-</div>
-                            <div class="metric-label">Segments</div>
-                        </div>
-                        <div class="metric-item">
-                            <div class="metric-value" id="metricPrefetch">-</div>
-                            <div class="metric-label">Prefetch</div>
+                    <div class="metrics-panel" id="metricsPanel">
+                        <h3>Transcode Performance</h3>
+                        <div class="metrics-grid">
+                            <div class="metric-item">
+                                <div class="metric-value" id="metricRatioAvg">-</div>
+                                <div class="metric-label">Avg Ratio</div>
+                            </div>
+                            <div class="metric-item">
+                                <div class="metric-value" id="metricRatioLast">-</div>
+                                <div class="metric-label">Last Ratio</div>
+                            </div>
+                            <div class="metric-item">
+                                <div class="metric-value" id="metricRatioMin">-</div>
+                                <div class="metric-label">Best</div>
+                            </div>
+                            <div class="metric-item">
+                                <div class="metric-value" id="metricRatioMax">-</div>
+                                <div class="metric-label">Worst</div>
+                            </div>
+                            <div class="metric-item">
+                                <div class="metric-value" id="metricCacheHit">-</div>
+                                <div class="metric-label">Cache Hit</div>
+                            </div>
+                            <div class="metric-item">
+                                <div class="metric-value" id="metricSegments">-</div>
+                                <div class="metric-label">Segments</div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -459,29 +540,46 @@
     </div>
 
     <script>
+        // DOM Elements
         const video = document.getElementById("video");
         const audioSelect = document.getElementById("audioSelect");
         const subtitleSelect = document.getElementById("subtitleSelect");
         const resolutionSelect = document.getElementById("resolutionSelect");
-        const status = document.getElementById("status");
+        const statusEl = document.getElementById("status");
+        const statusDot = document.getElementById("statusDot");
+        const statusText = document.getElementById("statusText");
         const fileList = document.getElementById("fileList");
-        const breadcrumb = document.getElementById("breadcrumb");
+        const mediaGrid = document.getElementById("mediaGrid");
+        const browseView = document.getElementById("browseView");
+        const playerView = document.getElementById("playerView");
+        const browseBreadcrumb = document.getElementById("browseBreadcrumb");
+        const sidebarBreadcrumb = document.getElementById("sidebarBreadcrumb");
+        const browseStats = document.getElementById("browseStats");
         const nowPlaying = document.getElementById("nowPlaying");
         const nowPlayingName = document.getElementById("nowPlayingName");
         const downloadBtn = document.getElementById("downloadBtn");
+        const homeBtn = document.getElementById("homeBtn");
 
         let hls = null;
         let currentPath = "";
         let currentFile = null;
         let currentResolution = "original";
+        let isPlayerMode = false;
 
-        // Configuration from environment (can be overridden via URL params)
+        // Configuration
         const urlParams = new URLSearchParams(window.location.search);
-        const MAX_BUFFER_LENGTH = parseInt(urlParams.get('buffer') || '300'); // 5 minutes default
+        const MAX_BUFFER_LENGTH = parseInt(urlParams.get('buffer') || '300');
 
-        // Video file extensions
+        // Video/subtitle extensions
         const videoExtensions = [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".m2ts"];
         const subtitleExtensions = [".vtt", ".srt", ".ass", ".ssa"];
+
+        // Status helper
+        function setStatus(text, color, pulsing = false) {
+            statusText.textContent = text;
+            statusEl.style.color = color;
+            statusDot.classList.toggle("pulse", pulsing);
+        }
 
         // Format file size
         function formatSize(bytes) {
@@ -492,19 +590,16 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
         }
 
-        // Check if file is video
         function isVideo(name) {
             const lower = name.toLowerCase();
             return videoExtensions.some(ext => lower.endsWith(ext));
         }
 
-        // Check if file is subtitle
         function isSubtitle(name) {
             const lower = name.toLowerCase();
             return subtitleExtensions.some(ext => lower.endsWith(ext));
         }
 
-        // Get file icon
         function getIcon(item) {
             if (item.type === "directory") return "📁";
             if (isVideo(item.name)) return "🎬";
@@ -512,18 +607,91 @@
             return "📄";
         }
 
-        // Load file list (returns Promise for chaining)
-        async function loadFiles(path = "") {
-            fileList.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
+        function encodeFilePath(path) {
+            return path.split('/').map(part => encodeURIComponent(part)).join('/');
+        }
+
+        // Switch between browse and player modes
+        function switchToPlayerMode() {
+            if (isPlayerMode) return;
+            isPlayerMode = true;
+            browseView.classList.add("hidden");
+            playerView.classList.add("active");
+        }
+
+        function switchToBrowseMode() {
+            if (!isPlayerMode) return;
+            isPlayerMode = false;
+            playerView.classList.remove("active");
+            browseView.classList.remove("hidden");
+
+            // Stop video and clear
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+            video.src = "";
+            currentFile = null;
+
+            // Clear URL hash
+            history.pushState(null, "", window.location.pathname);
+
+            // Reload browse view with current path
+            loadBrowseView(currentPath);
+        }
+
+        // Home button
+        homeBtn.addEventListener("click", () => {
+            if (isPlayerMode) {
+                switchToBrowseMode();
+            } else {
+                currentPath = "";
+                loadBrowseView("");
+            }
+        });
+
+        // Update URL hash when playing
+        function updateUrlHash(filePath) {
+            const encodedPath = encodeFilePath(filePath);
+            history.pushState(null, "", `#/play/${encodedPath}`);
+        }
+
+        // Build breadcrumb HTML
+        function buildBreadcrumb(path, targetId) {
+            const parts = path ? path.split("/") : [];
+            let html = '<span data-path="">Home</span>';
+            let accumulated = "";
+
+            parts.forEach((part) => {
+                accumulated += (accumulated ? "/" : "") + part;
+                html += ` / <span data-path="${accumulated}">${part}</span>`;
+            });
+
+            const container = document.getElementById(targetId);
+            container.innerHTML = html;
+
+            container.querySelectorAll("span").forEach(span => {
+                span.addEventListener("click", () => {
+                    currentPath = span.dataset.path;
+                    if (isPlayerMode) {
+                        loadSidebarFiles(currentPath);
+                    } else {
+                        loadBrowseView(currentPath);
+                    }
+                });
+            });
+        }
+
+        // Load browse view (full-page grid)
+        async function loadBrowseView(path = "") {
+            mediaGrid.innerHTML = '<div class="loading"><div class="spinner"></div>Loading media...</div>';
+            buildBreadcrumb(path, "browseBreadcrumb");
 
             try {
                 const response = await fetch("/api/files/" + (path ? path + "/" : ""));
                 if (!response.ok) throw new Error("Failed to load files");
 
                 const files = await response.json();
-
-                // Update breadcrumb
-                updateBreadcrumb(path);
 
                 // Sort: folders first, then by name
                 files.sort((a, b) => {
@@ -532,19 +700,103 @@
                     return a.name.localeCompare(b.name);
                 });
 
-                // Filter to show only videos, subtitles, and folders
-                const filtered = files.filter(f =>
-                    f.type === "directory" || isVideo(f.name) || isSubtitle(f.name)
-                );
+                // Filter to show only videos and folders
+                const filtered = files.filter(f => f.type === "directory" || isVideo(f.name));
+
+                // Stats
+                const folderCount = filtered.filter(f => f.type === "directory").length;
+                const videoCount = filtered.filter(f => f.type !== "directory").length;
+                browseStats.textContent = `${folderCount} folders, ${videoCount} videos`;
+
+                if (filtered.length === 0) {
+                    mediaGrid.innerHTML = `
+                        <div class="empty-state" style="grid-column: 1 / -1;">
+                            <div class="empty-state-icon">📂</div>
+                            <div>No media files found</div>
+                            <div style="font-size: 0.85rem; margin-top: 0.5rem; color: #888;">
+                                Add video files to your media folder
+                            </div>
+                        </div>
+                    `;
+                    return;
+                }
+
+                mediaGrid.innerHTML = filtered.map(file => {
+                    const fullPath = path ? path + "/" + file.name : file.name;
+                    const isFolder = file.type === "directory";
+
+                    return `
+                        <div class="media-card ${isFolder ? 'folder' : ''}"
+                             data-path="${fullPath}"
+                             data-type="${file.type}"
+                             data-name="${file.name}">
+                            <div class="media-card-icon">${getIcon(file)}</div>
+                            <div class="media-card-info">
+                                <div class="media-card-name" title="${file.name}">${file.name}</div>
+                                <div class="media-card-meta">
+                                    ${isFolder ? '<span>Folder</span>' : `<span>${formatSize(file.size || 0)}</span>`}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join("");
+
+                // Add click handlers
+                mediaGrid.querySelectorAll(".media-card").forEach(card => {
+                    card.addEventListener("click", () => {
+                        const cardPath = card.dataset.path;
+                        const cardType = card.dataset.type;
+                        const cardName = card.dataset.name;
+
+                        if (cardType === "directory") {
+                            currentPath = cardPath;
+                            loadBrowseView(cardPath);
+                        } else if (isVideo(cardName)) {
+                            // Switch to player mode and play
+                            switchToPlayerMode();
+                            loadSidebarFiles(currentPath).then(() => {
+                                playFile(cardPath, cardName);
+                            });
+                        }
+                    });
+                });
+
+            } catch (err) {
+                console.error("Error loading files:", err);
+                mediaGrid.innerHTML = `
+                    <div class="empty-state" style="grid-column: 1 / -1;">
+                        <div class="empty-state-icon">⚠️</div>
+                        <div>Error loading files</div>
+                        <div style="font-size: 0.85rem; margin-top: 0.5rem;">${err.message}</div>
+                    </div>
+                `;
+            }
+        }
+
+        // Load sidebar files (player mode)
+        async function loadSidebarFiles(path = "") {
+            fileList.innerHTML = '<div class="loading"><div class="spinner"></div>Loading...</div>';
+            buildBreadcrumb(path, "sidebarBreadcrumb");
+
+            try {
+                const response = await fetch("/api/files/" + (path ? path + "/" : ""));
+                if (!response.ok) throw new Error("Failed to load files");
+
+                const files = await response.json();
+
+                files.sort((a, b) => {
+                    if (a.type === "directory" && b.type !== "directory") return -1;
+                    if (a.type !== "directory" && b.type === "directory") return 1;
+                    return a.name.localeCompare(b.name);
+                });
+
+                const filtered = files.filter(f => f.type === "directory" || isVideo(f.name) || isSubtitle(f.name));
 
                 if (filtered.length === 0) {
                     fileList.innerHTML = `
                         <div class="empty-state">
                             <div class="empty-state-icon">📂</div>
-                            <div>No media files found</div>
-                            <div style="font-size: 0.85rem; margin-top: 0.5rem;">
-                                Add video files to your Downloads folder
-                            </div>
+                            <div>No media files</div>
                         </div>
                     `;
                     return;
@@ -567,7 +819,6 @@
                     `;
                 }).join("");
 
-                // Add click handlers
                 fileList.querySelectorAll(".file-item").forEach(item => {
                     item.addEventListener("click", () => {
                         const itemPath = item.dataset.path;
@@ -576,7 +827,7 @@
 
                         if (itemType === "directory") {
                             currentPath = itemPath;
-                            loadFiles(itemPath);
+                            loadSidebarFiles(itemPath);
                         } else if (isVideo(itemName)) {
                             playFile(itemPath, itemName);
                         }
@@ -588,35 +839,13 @@
                 fileList.innerHTML = `
                     <div class="empty-state">
                         <div class="empty-state-icon">⚠️</div>
-                        <div>Error loading files</div>
-                        <div style="font-size: 0.85rem; margin-top: 0.5rem;">${err.message}</div>
+                        <div>Error</div>
                     </div>
                 `;
             }
         }
 
-        // Update breadcrumb navigation
-        function updateBreadcrumb(path) {
-            const parts = path ? path.split("/") : [];
-            let html = '<span data-path="">Home</span>';
-            let accumulated = "";
-
-            parts.forEach((part, i) => {
-                accumulated += (accumulated ? "/" : "") + part;
-                html += ` / <span data-path="${accumulated}">${part}</span>`;
-            });
-
-            breadcrumb.innerHTML = html;
-
-            breadcrumb.querySelectorAll("span").forEach(span => {
-                span.addEventListener("click", () => {
-                    currentPath = span.dataset.path;
-                    loadFiles(currentPath);
-                });
-            });
-        }
-
-        // Find subtitle files for current video
+        // Find subtitles for video
         async function findSubtitles(videoPath) {
             const dir = videoPath.substring(0, videoPath.lastIndexOf("/")) || "";
             const videoName = videoPath.substring(videoPath.lastIndexOf("/") + 1);
@@ -639,11 +868,17 @@
             }
         }
 
-        // Extract language from subtitle filename
         function extractLang(subName, baseName) {
             const withoutBase = subName.substring(baseName.length);
             const match = withoutBase.match(/[._]([a-z]{2,3})/i);
             return match ? match[1].toUpperCase() : "Unknown";
+        }
+
+        // Reset metrics
+        async function resetMetrics() {
+            try {
+                await fetch("/transcode/reset-metrics");
+            } catch (e) {}
         }
 
         // Play video file
@@ -651,39 +886,35 @@
             currentFile = filePath;
             const forceTranscode = document.getElementById("forceTranscode").checked;
 
-            // Reset metrics when changing files
+            // Update URL hash
+            updateUrlHash(filePath);
+
             resetMetrics();
 
-            // Update UI
+            // Update sidebar active state
             document.querySelectorAll(".file-item").forEach(item => {
                 item.classList.toggle("active", item.dataset.path === filePath);
             });
 
             nowPlaying.style.display = "block";
             nowPlayingName.textContent = fileName;
-            status.textContent = "Loading...";
-            status.style.color = "#4dabf7";
+            setStatus("Loading...", "#4dabf7", true);
 
-            // Enable download button
             downloadBtn.disabled = false;
             downloadBtn.title = "Download: " + fileName;
 
-            // Destroy previous HLS instance
             if (hls) {
                 hls.destroy();
                 hls = null;
             }
 
-            // Reset selects
             audioSelect.innerHTML = '<option value="">Loading...</option>';
             audioSelect.disabled = true;
             subtitleSelect.innerHTML = '<option value="">Off</option>';
             subtitleSelect.disabled = true;
 
-            // Remove existing tracks
             video.querySelectorAll("track").forEach(t => t.remove());
 
-            // If force transcode is enabled, skip direct play
             if (forceTranscode) {
                 tryTranscodedFallback(filePath, fileName);
                 return;
@@ -704,10 +935,8 @@
                 hls.attachMedia(video);
 
                 hls.on(Hls.Events.MANIFEST_PARSED, async function(event, data) {
-                    status.textContent = "Ready";
-                    status.style.color = "#51cf66";
+                    setStatus("Ready", "#51cf66");
 
-                    // Populate audio tracks
                     if (hls.audioTracks && hls.audioTracks.length > 0) {
                         audioSelect.innerHTML = hls.audioTracks.map((track, i) => {
                             const label = track.name || track.lang || `Track ${i + 1}`;
@@ -720,7 +949,6 @@
                         audioSelect.disabled = true;
                     }
 
-                    // Find and populate subtitle files
                     const subs = await findSubtitles(filePath);
                     if (subs.length > 0) {
                         subtitleSelect.innerHTML = '<option value="">Off</option>' +
@@ -733,45 +961,38 @@
 
                 hls.on(Hls.Events.ERROR, function(event, data) {
                     if (data.fatal) {
-                        status.style.color = "#ff6b6b";
-
                         switch (data.type) {
                             case Hls.ErrorTypes.NETWORK_ERROR:
-                                // Try transcoded version as fallback
                                 tryTranscodedFallback(filePath, fileName);
                                 break;
                             case Hls.ErrorTypes.MEDIA_ERROR:
                                 hls.recoverMediaError();
                                 break;
                             default:
-                                status.textContent = "Error: " + data.type;
+                                setStatus("Error", "#ff6b6b");
                         }
                     }
                 });
 
                 hls.on(Hls.Events.FRAG_LOADED, function() {
-                    status.textContent = "Streaming";
-                    status.style.color = "#51cf66";
+                    setStatus("", "#51cf66");
                 });
 
             } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
                 video.src = videoSrc;
                 video.addEventListener("loadedmetadata", function() {
-                    status.textContent = "Ready (Native)";
-                    status.style.color = "#51cf66";
+                    setStatus("Ready", "#51cf66");
                     video.play().catch(() => {});
                 });
             } else {
-                status.textContent = "HLS not supported";
-                status.style.color = "#ff6b6b";
+                setStatus("HLS not supported", "#ff6b6b");
             }
         }
 
-        // Audio track change handler
+        // Audio track change
         audioSelect.addEventListener("change", function() {
             if (hls && this.value !== "") {
                 const idx = parseInt(this.value);
-                // For transcoded streams, switch to different stream URL
                 if (currentTranscodeBase && transcodedAudioTracks[idx]) {
                     const currentTime = video.currentTime;
                     const streamUrl = currentTranscodeBase + "/" + transcodedAudioTracks[idx].uri;
@@ -786,41 +1007,29 @@
             }
         });
 
-        // Subtitle change handler - works with HLS subtitles, transcoded subtitles, or external files
+        // Subtitle change
         subtitleSelect.addEventListener("change", function() {
             const val = parseInt(this.value);
-
-            // Remove existing tracks first
             video.querySelectorAll("track").forEach(t => t.remove());
-
-            // Hide all text tracks
             for (let i = 0; i < video.textTracks.length; i++) {
                 video.textTracks[i].mode = "hidden";
             }
 
-            // If "Off" selected
-            if (val === -1 || this.value === "" || this.value === "-1") {
-                return;
-            }
+            if (val === -1 || this.value === "" || this.value === "-1") return;
 
-            // For HLS embedded subtitles
             if (hls && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
                 hls.subtitleTrack = val;
                 return;
             }
 
-            // For transcoded subtitles
             if (currentTranscodeBase && transcodedSubtitleTracks[val]) {
                 const vttUrl = currentTranscodeBase + "/subs_" + val + ".vtt";
-                console.log("Loading subtitle from:", vttUrl);
-
                 const track = document.createElement("track");
                 track.kind = "subtitles";
                 track.src = vttUrl;
                 track.default = true;
                 track.label = transcodedSubtitleTracks[val].name;
                 video.appendChild(track);
-
                 track.addEventListener("load", function() {
                     if (video.textTracks.length > 0) {
                         video.textTracks[0].mode = "showing";
@@ -829,14 +1038,12 @@
                 return;
             }
 
-            // For external subtitle files (fallback)
             if (this.value) {
                 const track = document.createElement("track");
                 track.kind = "subtitles";
                 track.src = "/subs/" + this.value;
                 track.default = true;
                 video.appendChild(track);
-
                 track.addEventListener("load", function() {
                     if (video.textTracks.length > 0) {
                         video.textTracks[0].mode = "showing";
@@ -845,47 +1052,28 @@
             }
         });
 
-        // Encode path for URL while preserving directory slashes
-        function encodeFilePath(path) {
-            return path.split('/').map(part => encodeURIComponent(part)).join('/');
-        }
-
-        // Try live transcoded fallback when direct streaming fails
+        // Transcoded fallback
         async function tryTranscodedFallback(filePath, fileName) {
-            status.textContent = "Switching to live transcode...";
-            status.style.color = "#ffd43b";
+            setStatus("Transcoding...", "#ffd43b", true);
 
-            // Use live transcoding endpoint - encode the filepath for URL
             const transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
-            console.log("Trying transcoded source:", transcodedSrc);
 
             try {
                 const response = await fetch(transcodedSrc);
-                console.log("Transcode response:", response.status, response.statusText);
                 if (response.ok) {
-                    // Use live transcoded version
                     playTranscoded(transcodedSrc, fileName, true);
-                    return;
                 } else {
-                    console.error("Transcode response not ok:", response.status);
-                    status.textContent = "Transcode error: " + response.status;
-                    status.style.color = "#ff6b6b";
-                    return;
+                    setStatus("Error", "#ff6b6b");
                 }
             } catch (err) {
-                console.error("Transcode fetch error:", err);
-                status.textContent = "Fetch error: " + err.message;
-                status.style.color = "#ff6b6b";
-                return;
+                setStatus("Error", "#ff6b6b");
             }
         }
 
-        // Store current transcode base URL for track switching
         let currentTranscodeBase = "";
         let transcodedAudioTracks = [];
         let transcodedSubtitleTracks = [];
 
-        // Parse master playlist and populate dropdowns
         function parseAndPopulateTracks(manifest) {
             transcodedAudioTracks = [];
             transcodedSubtitleTracks = [];
@@ -903,7 +1091,6 @@
                 }
             }
 
-            // Populate audio dropdown
             if (transcodedAudioTracks.length > 0) {
                 audioSelect.innerHTML = transcodedAudioTracks.map((track, i) =>
                     `<option value="${i}">${track.name}</option>`
@@ -912,7 +1099,6 @@
                 audioSelect.value = "0";
             }
 
-            // Populate subtitle dropdown
             if (transcodedSubtitleTracks.length > 0) {
                 subtitleSelect.innerHTML = '<option value="-1">Off</option>' +
                     transcodedSubtitleTracks.map((track, i) =>
@@ -920,13 +1106,10 @@
                     ).join("");
                 subtitleSelect.disabled = false;
             }
-
-            console.log("Parsed audio tracks:", transcodedAudioTracks);
-            console.log("Parsed subtitle tracks:", transcodedSubtitleTracks);
         }
 
-        // Parse available resolutions from master playlist
         let availableResolutions = [];
+
         function parseAndPopulateResolutions(manifest) {
             availableResolutions = [];
             const lines = manifest.split('\n');
@@ -944,42 +1127,33 @@
                             const resName = uriMatch[1];
                             availableResolutions.push({
                                 name: resName === 'original' ? `Original (${width}x${height})` : `${height}p`,
-                                value: resName,
-                                width: width,
-                                height: height
+                                value: resName
                             });
                         }
                     }
                 }
             }
 
-            // Populate resolution dropdown with available options
             if (availableResolutions.length > 0) {
                 resolutionSelect.innerHTML = availableResolutions.map(res =>
                     `<option value="${res.value}">${res.name}</option>`
                 ).join("");
                 resolutionSelect.value = currentResolution;
             }
-
-            console.log("Available resolutions:", availableResolutions);
         }
 
-        // Resolution change handler
         resolutionSelect.addEventListener("change", function() {
             if (!currentTranscodeBase || !hls) return;
 
             const newResolution = this.value;
             if (newResolution === currentResolution) return;
 
-            // Reset metrics when changing resolution
             resetMetrics();
-
             currentResolution = newResolution;
             const currentTime = video.currentTime;
             const audioIdx = audioSelect.value || "0";
 
             const streamUrl = currentTranscodeBase + "/stream_a" + audioIdx + "_" + currentResolution + ".m3u8";
-            console.log("Switching resolution to:", streamUrl);
 
             hls.loadSource(streamUrl);
             hls.once(Hls.Events.MANIFEST_PARSED, () => {
@@ -988,29 +1162,22 @@
             });
         });
 
-        // Play transcoded version (live or cached)
         async function playTranscoded(url, fileName, isLive = false) {
             if (hls) {
                 hls.destroy();
             }
 
-            status.textContent = isLive ? "Transcoding..." : "Playing transcoded";
-            status.style.color = "#ffd43b";
+            setStatus(isLive ? "Transcoding..." : "Transcoded", "#ffd43b", isLive);
 
-            // Store base URL for audio track switching
             currentTranscodeBase = url.replace("/master.m3u8", "");
 
-            // Fetch and parse master playlist to get tracks and resolutions
             try {
                 const response = await fetch(url);
                 const manifest = await response.text();
                 parseAndPopulateTracks(manifest);
                 parseAndPopulateResolutions(manifest);
-            } catch (e) {
-                console.error("Failed to parse manifest:", e);
-            }
+            } catch (e) {}
 
-            // Enable resolution selector for transcoded streams
             resolutionSelect.disabled = false;
 
             hls = new Hls({
@@ -1020,39 +1187,47 @@
                 maxMaxBufferLength: MAX_BUFFER_LENGTH * 2
             });
 
-            // Start with selected resolution and first audio track
             currentResolution = resolutionSelect.value || "original";
             const streamUrl = currentTranscodeBase + "/stream_a0_" + currentResolution + ".m3u8";
             hls.loadSource(streamUrl);
             hls.attachMedia(video);
 
-            hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
-                status.textContent = isLive ? "Live transcoding" : "Transcoded";
-                status.style.color = "#51cf66";
+            hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                setStatus("", "#51cf66");
                 video.play().catch(() => {});
             });
 
             hls.on(Hls.Events.FRAG_LOADING, function() {
                 if (isLive) {
-                    status.textContent = "Transcoding segment...";
-                    status.style.color = "#ffd43b";
+                    setStatus("", "#ffd43b", true);
                 }
             });
 
             hls.on(Hls.Events.FRAG_LOADED, function() {
-                status.textContent = isLive ? "Streaming (live transcode)" : "Streaming (transcoded)";
-                status.style.color = "#51cf66";
+                setStatus("", "#51cf66");
             });
 
             hls.on(Hls.Events.ERROR, function(event, data) {
                 if (data.fatal) {
-                    status.textContent = "Playback error";
-                    status.style.color = "#ff6b6b";
+                    setStatus("Error", "#ff6b6b");
                 }
             });
         }
 
-        // Metrics toggle and fetching
+        // Download button
+        downloadBtn.addEventListener("click", function() {
+            if (currentFile) {
+                const downloadUrl = "/direct/" + encodeFilePath(currentFile);
+                const a = document.createElement("a");
+                a.href = downloadUrl;
+                a.download = currentFile.split("/").pop();
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            }
+        });
+
+        // Metrics
         const metricsToggle = document.getElementById("metricsToggle");
         const metricsPanel = document.getElementById("metricsPanel");
         let metricsInterval = null;
@@ -1072,15 +1247,6 @@
             }
         });
 
-        async function resetMetrics() {
-            try {
-                await fetch("/transcode/reset-metrics");
-                console.log("Metrics reset");
-            } catch (e) {
-                console.warn("Failed to reset metrics:", e);
-            }
-        }
-
         async function fetchMetrics() {
             try {
                 const response = await fetch("/transcode/metrics");
@@ -1088,39 +1254,14 @@
 
                 const data = await response.json();
 
-                // Format time values
-                const formatTime = (seconds) => {
-                    if (!seconds || seconds === 0) return "-";
-                    return seconds.toFixed(2) + "s";
-                };
-
-                // Format ratio values (lower is better)
-                const formatRatio = (ratio) => {
-                    if (!ratio || ratio === 0) return "-";
-                    return ratio.toFixed(1) + "%";
-                };
-
-                // Determine color class based on ratio (lower is better)
-                // <25% = excellent, <50% = good, <100% = warning, >100% = bad
+                const formatRatio = (ratio) => ratio ? ratio.toFixed(1) + "%" : "-";
                 const getRatioClass = (ratio) => {
-                    if (!ratio || ratio === 0) return "";
+                    if (!ratio) return "";
                     if (ratio < 25) return "good";
                     if (ratio < 75) return "warning";
                     return "bad";
                 };
 
-                // Get segment duration from metrics
-                const segmentDuration = data.segment_duration || 4;
-
-                // Determine color class based on avg time vs segment duration
-                const getTimeClass = (avgTime) => {
-                    if (!avgTime || avgTime === 0) return "";
-                    if (avgTime < segmentDuration * 0.25) return "good";
-                    if (avgTime < segmentDuration * 0.75) return "warning";
-                    return "bad";
-                };
-
-                // Ratio metrics (main performance indicator)
                 document.getElementById("metricRatioAvg").textContent = formatRatio(data.transcode_ratio_avg);
                 document.getElementById("metricRatioAvg").className = "metric-value " + getRatioClass(data.transcode_ratio_avg);
 
@@ -1133,65 +1274,29 @@
                 document.getElementById("metricRatioMax").textContent = formatRatio(data.transcode_ratio_max);
                 document.getElementById("metricRatioMax").className = "metric-value " + getRatioClass(data.transcode_ratio_max);
 
-                // Time metrics
-                document.getElementById("metricAvgTime").textContent = formatTime(data.avg_segment_time);
-                document.getElementById("metricAvgTime").className = "metric-value " + getTimeClass(data.avg_segment_time);
-
-                document.getElementById("metricLastTime").textContent = formatTime(data.last_segment_time);
-                document.getElementById("metricLastTime").className = "metric-value " + getTimeClass(data.last_segment_time);
-
-                // Other metrics
-                document.getElementById("metricCacheHit").textContent =
-                    data.cache_hit_rate ? data.cache_hit_rate.toFixed(1) + "%" : "-";
-                document.getElementById("metricCacheHit").className =
-                    "metric-value " + (data.cache_hit_rate > 50 ? "good" : "");
+                document.getElementById("metricCacheHit").textContent = data.cache_hit_rate ? data.cache_hit_rate.toFixed(1) + "%" : "-";
+                document.getElementById("metricCacheHit").className = "metric-value " + (data.cache_hit_rate > 50 ? "good" : "");
 
                 document.getElementById("metricSegments").textContent = data.total_segments || 0;
 
-                document.getElementById("metricPrefetch").textContent = data.prefetch_active ? "Active" : "Idle";
-                document.getElementById("metricPrefetch").className =
-                    "metric-value " + (data.prefetch_active ? "warning" : "");
-
-            } catch (err) {
-                console.error("Failed to fetch metrics:", err);
-            }
+            } catch (err) {}
         }
 
-        // Download button handler
-        downloadBtn.addEventListener("click", function() {
-            if (currentFile) {
-                const downloadUrl = "/direct/" + encodeFilePath(currentFile);
-                const a = document.createElement("a");
-                a.href = downloadUrl;
-                a.download = currentFile.split("/").pop(); // Use filename
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-            }
-        });
-
-        // Handle URL hash routing for direct file playback
-        // Format: #/play/path/to/file.mkv
+        // Handle URL hash routing
         function handleHashRoute() {
             const hash = window.location.hash;
             if (hash.startsWith("#/play/")) {
-                const encodedPath = hash.substring(7); // Remove "#/play/"
+                const encodedPath = hash.substring(7);
                 const filePath = decodeURIComponent(encodedPath);
 
                 if (filePath) {
-                    console.log("Hash route detected, playing:", filePath);
-
-                    // Extract directory and filename
                     const lastSlash = filePath.lastIndexOf("/");
                     const directory = lastSlash > 0 ? filePath.substring(0, lastSlash) : "";
                     const fileName = lastSlash > 0 ? filePath.substring(lastSlash + 1) : filePath;
 
-                    // Update current path and load directory
                     currentPath = directory;
-
-                    // Load directory first, then play file
-                    loadFiles(directory).then(() => {
-                        // Small delay to ensure file list is rendered
+                    switchToPlayerMode();
+                    loadSidebarFiles(directory).then(() => {
                         setTimeout(() => {
                             playFile(filePath, fileName);
                         }, 100);
@@ -1200,14 +1305,18 @@
             }
         }
 
-        // Listen for hash changes
         window.addEventListener("hashchange", handleHashRoute);
+        window.addEventListener("popstate", () => {
+            if (!window.location.hash.startsWith("#/play/") && isPlayerMode) {
+                switchToBrowseMode();
+            }
+        });
 
-        // Initial load - check for hash route first
+        // Initial load
         if (window.location.hash.startsWith("#/play/")) {
             handleHashRoute();
         } else {
-            loadFiles();
+            loadBrowseView("");
         }
     </script>
 </body>
