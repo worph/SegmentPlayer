@@ -214,37 +214,6 @@ class AdaptiveQuality:
 # Global coordinated quality manager
 adaptive_quality = AdaptiveQuality(initial_preset='fast')
 
-# Backward-compatible accessors
-class _PresetAccessor:
-    @property
-    def preset(self):
-        return adaptive_quality.preset
-
-    def record_transcode(self, elapsed):
-        # Handled by adaptive_quality
-        pass
-
-    def get_stats(self):
-        return adaptive_quality.get_preset_stats()
-
-class _CRFAccessor:
-    def get_crf(self, base_crf):
-        return adaptive_quality.get_crf(base_crf)
-
-    @property
-    def offset(self):
-        return adaptive_quality.get_crf_stats()['crf_offset']
-
-    def record_transcode(self, elapsed):
-        # Handled by adaptive_quality
-        pass
-
-    def get_stats(self):
-        return adaptive_quality.get_crf_stats()
-
-adaptive_preset = _PresetAccessor()
-adaptive_crf = _CRFAccessor()
-
 
 class SegmentManager:
     """
@@ -417,8 +386,8 @@ class SegmentManager:
                 'video_codec': self.current_video_codec,
                 'audio_codec': self.current_audio_codec,
                 # Adaptive preset info
-                'adaptive_preset': adaptive_preset.get_stats(),
-                'adaptive_crf': adaptive_crf.get_stats(),
+                'adaptive_preset': adaptive_quality.get_preset_stats(),
+                'adaptive_crf': adaptive_quality.get_crf_stats(),
             }
 
     def reset_metrics(self):
@@ -472,7 +441,7 @@ def extract_codecs(info: dict) -> tuple[str | None, str | None]:
 
 
 def get_segment_path(file_hash: str, audio: int, resolution: str, segment: int) -> str:
-    """Get cache path for a muxed segment (legacy, kept for compatibility)."""
+    """Get cache path for a muxed video+audio segment."""
     return os.path.join(CACHE_DIR, file_hash, f"seg_a{audio}_{resolution}_{segment:05d}.ts")
 
 
@@ -505,8 +474,8 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
     width, height, base_crf = res_preset
 
     # Get current adaptive preset and CRF
-    current_preset = adaptive_preset.preset
-    current_crf = adaptive_crf.get_crf(base_crf)
+    current_preset = adaptive_quality.preset
+    current_crf = adaptive_quality.get_crf(base_crf)
 
     # Get CPU count for threading
     cpu_count = os.cpu_count() or 8
@@ -578,8 +547,8 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
     width, height, base_crf = res_preset
 
     # Get current adaptive preset and CRF
-    current_preset = adaptive_preset.preset
-    current_crf = adaptive_crf.get_crf(base_crf)
+    current_preset = adaptive_quality.preset
+    current_crf = adaptive_quality.get_crf(base_crf)
 
     # Get CPU count for threading
     cpu_count = os.cpu_count() or 8
@@ -864,69 +833,6 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def generate_audio_playlist(info: dict, audio_index: int) -> str:
-    """Generate audio-only HLS playlist pointing to audio-only segments."""
-    duration = float(info.get('format', {}).get('duration', 0))
-    num_segments = int(duration / SEGMENT_DURATION) + 1
-
-    lines = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:3",
-        f"#EXT-X-TARGETDURATION:{SEGMENT_DURATION}",
-        "#EXT-X-MEDIA-SEQUENCE:0",
-        "#EXT-X-PLAYLIST-TYPE:VOD",
-        ""
-    ]
-
-    for i in range(num_segments):
-        seg_dur = min(SEGMENT_DURATION, duration - (i * SEGMENT_DURATION))
-        if seg_dur > 0.1:
-            lines.append(f"#EXTINF:{seg_dur:.3f},")
-            lines.append(f"audio_{audio_index}_{i:05d}.ts")
-
-    lines.append("#EXT-X-ENDLIST")
-    return "\n".join(lines)
-
-
-def transcode_audio_segment(filepath: str, file_hash: str, audio_index: int, segment: int) -> str | None:
-    """Transcode audio-only segment."""
-    cache_dir = os.path.join(CACHE_DIR, file_hash)
-    os.makedirs(cache_dir, exist_ok=True)
-
-    output_file = os.path.join(cache_dir, f"audio_{audio_index}_{segment:05d}.ts")
-
-    if os.path.exists(output_file):
-        return output_file
-
-    start_time = segment * SEGMENT_DURATION
-
-    cmd = [
-        'ffmpeg', '-y',
-        '-ss', str(start_time),
-        '-i', filepath,
-        '-t', str(SEGMENT_DURATION),
-        '-map', f'0:a:{audio_index}',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-ac', '2',
-        '-f', 'mpegts',
-        '-mpegts_copyts', '1',
-        '-output_ts_offset', str(start_time),
-        output_file
-    ]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode == 0 and os.path.exists(output_file):
-            return output_file
-        else:
-            print(f"FFmpeg audio error: {result.stderr.decode()}")
-            return None
-    except Exception as e:
-        print(f"Audio transcode error: {e}")
-        return None
-
-
 def generate_stream_playlist(info: dict, audio: int, resolution: str) -> str:
     """Generate HLS stream playlist with muxed video+audio segments.
 
@@ -1092,6 +998,7 @@ class SubtitleManager:
         os.makedirs(cache_dir, exist_ok=True)
 
         vtt_file = os.path.join(cache_dir, f"subtitle_{sub_index}.vtt")
+        temp_file = vtt_file + '.tmp'
         error_file = os.path.join(cache_dir, f"subtitle_{sub_index}.error")
 
         # Double-check cache (might have been created while waiting for lock)
@@ -1118,9 +1025,6 @@ class SubtitleManager:
         try:
             filename = os.path.basename(filepath)
             print(f"[Subtitle {sub_index}] Extracting from {filename}...")
-
-            # Write to temp file first, then rename atomically to avoid partial reads
-            temp_file = vtt_file + '.tmp'
 
             # Speed optimizations:
             # - probesize/analyzeduration: limit initial file scanning (5MB should find all streams)
@@ -1280,22 +1184,12 @@ class Handler(BaseHTTPRequestHandler):
                 resolution = 'original'
             return self.handle_stream(m.group(1), 0, resolution)
 
-        # Audio playlist (for HLS alternate audio)
-        m = re.match(r'^/transcode/(.+?)/audio_(\d+)\.m3u8$', path)
-        if m:
-            return self.handle_audio_playlist(m.group(1), int(m.group(2)))
-
-        # Audio segment
-        m = re.match(r'^/transcode/(.+?)/audio_(\d+)_(\d+)\.ts$', path)
-        if m:
-            return self.handle_audio_segment(m.group(1), int(m.group(2)), int(m.group(3)))
-
         # Video-only segment (for HLS alternate audio support)
         m = re.match(r'^/transcode/(.+?)/seg_v_(\w+)_(\d+)\.ts$', path)
         if m:
             return self.handle_video_segment(m.group(1), m.group(2), int(m.group(3)))
 
-        # Muxed video+audio segment (legacy, kept for compatibility)
+        # Muxed video+audio segment
         m = re.match(r'^/transcode/(.+?)/seg_a(\d+)_(\w+)_(\d+)\.ts$', path)
         if m:
             return self.handle_segment(m.group(1), int(m.group(2)), m.group(3), int(m.group(4)))
@@ -1401,26 +1295,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_data(data, 'video/mp2t')
         else:
             self.send_error(500, "Video transcode failed")
-
-    def handle_audio_playlist(self, filepath: str, audio_index: int):
-        """Handle audio playlist request."""
-        full_path, file_hash, info = self.get_file_info(filepath)
-        if not info:
-            return
-        self.send_data(generate_audio_playlist(info, audio_index).encode(), 'application/vnd.apple.mpegurl')
-
-    def handle_audio_segment(self, filepath: str, audio_index: int, segment: int):
-        """Handle audio-only segment request."""
-        full_path, file_hash, info = self.get_file_info(filepath)
-        if not info:
-            return
-
-        output_file = transcode_audio_segment(full_path, file_hash, audio_index, segment)
-        if output_file and os.path.exists(output_file):
-            with open(output_file, 'rb') as f:
-                self.send_data(f.read(), 'video/mp2t')
-        else:
-            self.send_error(500, "Audio transcode failed")
 
     def handle_subtitle_playlist(self, filepath: str, sub_index: int):
         full_path, file_hash, info = self.get_file_info(filepath)

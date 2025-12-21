@@ -15,7 +15,6 @@ var SP = {
         currentTranscodeBase: "",
         transcodedAudioTracks: [],
         transcodedSubtitleTracks: [],
-        availableResolutions: [],
         metricsInterval: null
     },
 

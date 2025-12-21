@@ -147,12 +147,6 @@ function initSubtitleControl() {
             });
         }
     });
-
-    // TEST: Double-click subtitle dropdown to test progress bar
-    SP.elements.subtitleSelect.addEventListener('dblclick', function() {
-        showSubtitleProgress("Test Track (Japanese)");
-        setTimeout(function() { hideSubtitleProgress(true); }, 5000);
-    });
 }
 
 function initResolutionControl() {

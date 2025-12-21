@@ -194,46 +194,14 @@ function parseAndPopulateTracks(manifest) {
     }
 }
 
-function parseAndPopulateResolutions(manifest) {
-    SP.state.availableResolutions = [];
-    var lines = manifest.split('\n');
-
-    for (var i = 0; i < lines.length; i++) {
-        var line = lines[i];
-        if (line.startsWith('#EXT-X-STREAM-INF')) {
-            var resMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
-            var nextLine = lines[i + 1];
-            if (resMatch && nextLine) {
-                var width = parseInt(resMatch[1]);
-                var height = parseInt(resMatch[2]);
-                var uriMatch = nextLine.match(/stream_a\d+_(\w+)\.m3u8/);
-                if (uriMatch) {
-                    var resName = uriMatch[1];
-                    SP.state.availableResolutions.push({
-                        name: resName === 'original' ? 'Original (' + width + 'x' + height + ')' : height + 'p',
-                        value: resName
-                    });
-                }
-            }
-        }
-    }
-
-    if (SP.state.availableResolutions.length > 0) {
-        SP.elements.resolutionSelect.innerHTML = SP.state.availableResolutions.map(function(res) {
-            return '<option value="' + res.value + '">' + res.name + '</option>';
-        }).join("");
-        SP.elements.resolutionSelect.value = SP.state.currentResolution;
-    }
-}
-
-async function playTranscoded(url, fileName, isLive) {
-    if (isLive === undefined) isLive = false;
+async function playTranscoded(url, fileName, isActiveTranscode) {
+    if (isActiveTranscode === undefined) isActiveTranscode = false;
 
     if (SP.state.hls) {
         SP.state.hls.destroy();
     }
 
-    setStatus(isLive ? "Transcoding..." : "Transcoded", "#ffd43b", isLive);
+    setStatus(isActiveTranscode ? "Transcoding..." : "Transcoded", "#ffd43b", isActiveTranscode);
 
     SP.state.currentTranscodeBase = url.replace("/master.m3u8", "");
 
@@ -241,7 +209,6 @@ async function playTranscoded(url, fileName, isLive) {
         var response = await fetch(url);
         var manifest = await response.text();
         parseAndPopulateTracks(manifest);
-        parseAndPopulateResolutions(manifest);
     } catch (e) {}
 
     SP.elements.resolutionSelect.disabled = false;
@@ -332,7 +299,7 @@ async function playTranscoded(url, fileName, isLive) {
     });
 
     SP.state.hls.on(Hls.Events.FRAG_LOADING, function() {
-        if (isLive) {
+        if (isActiveTranscode) {
             setStatus("", "#ffd43b", true);
         }
     });
