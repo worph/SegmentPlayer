@@ -445,11 +445,6 @@ def get_segment_path(file_hash: str, audio: int, resolution: str, segment: int) 
     return os.path.join(CACHE_DIR, file_hash, f"seg_a{audio}_{resolution}_{segment:05d}.ts")
 
 
-def get_video_segment_path(file_hash: str, resolution: str, segment: int) -> str:
-    """Get cache path for a video-only segment."""
-    return os.path.join(CACHE_DIR, file_hash, f"seg_v_{resolution}_{segment:05d}.ts")
-
-
 def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str, segment: int) -> str | None:
     """
     Transcode a single segment using FFmpeg.
@@ -518,135 +513,6 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         print(f"Transcode error: {e}")
 
     return None
-
-
-def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segment: int) -> str | None:
-    """
-    Transcode a video segment with all audio tracks muxed in.
-
-    Audio is included in video segments for maximum compatibility.
-    Separate audio playlists are also available for players that support HLS alternate audio.
-    Uses adaptive preset that auto-adjusts based on transcode ratio (target 70-80%).
-    """
-    cache_dir = os.path.join(CACHE_DIR, file_hash)
-    os.makedirs(cache_dir, exist_ok=True)
-
-    output = get_video_segment_path(file_hash, resolution, segment)
-
-    # Already cached?
-    if os.path.exists(output):
-        return output
-
-    start_offset = segment * SEGMENT_DURATION
-    res_preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
-    width, height, base_crf = res_preset
-
-    # Get current adaptive preset and CRF
-    current_preset = adaptive_quality.preset
-    current_crf = adaptive_quality.get_crf(base_crf)
-
-    # Get CPU count for threading
-    cpu_count = os.cpu_count() or 8
-
-    cmd = [
-        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-        '-threads', str(cpu_count),
-        '-ss', str(start_offset),
-        '-i', filepath,
-        '-t', str(SEGMENT_DURATION),
-        '-map', '0:v:0',
-        '-map', '0:a?',
-        '-c:v', 'libx264',
-        '-preset', current_preset,
-        '-tune', 'zerolatency',
-        '-crf', str(current_crf),
-        '-pix_fmt', 'yuv420p',
-        '-x264-params', f'threads={cpu_count}:lookahead_threads={min(cpu_count, 8)}',
-        '-force_key_frames', 'expr:gte(t,0)',
-        '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-        '-f', 'mpegts',
-        '-mpegts_copyts', '1',
-        '-output_ts_offset', str(start_offset),
-    ]
-
-    if width and height:
-        cmd.extend(['-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2'])
-
-    cmd.append(output)
-
-    start_time = time.time()
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
-        elapsed = time.time() - start_time
-        if result.returncode == 0 and os.path.exists(output):
-            segment_manager.record_transcode_time(elapsed)
-            adaptive_quality.record_transcode(elapsed)
-            return output
-        print(f"FFmpeg video error: {result.stderr.decode()[-200:]}")
-    except Exception as e:
-        print(f"Video transcode error: {e}")
-
-    return None
-
-
-def get_or_transcode_video_segment(filepath: str, file_hash: str, resolution: str, segment: int, info: dict) -> bytes | None:
-    """Get video-only segment data, transcoding if necessary."""
-    output = get_video_segment_path(file_hash, resolution, segment)
-    key = f"{file_hash}:v:{resolution}:{segment}"
-
-    # Check if a transcode is in progress for this segment
-    if segment_manager.is_in_progress(key):
-        result = segment_manager.get_segment(
-            key,
-            lambda: transcode_video_segment(filepath, file_hash, resolution, segment)
-        )
-        if result and os.path.exists(result):
-            trigger_video_prefetch(filepath, file_hash, resolution, segment, info)
-            with open(result, 'rb') as f:
-                return f.read()
-        return None
-
-    # Fast path: cached
-    if os.path.exists(output):
-        segment_manager.record_cache_hit()
-        trigger_video_prefetch(filepath, file_hash, resolution, segment, info)
-        with open(output, 'rb') as f:
-            return f.read()
-
-    # Need to transcode
-    result = segment_manager.get_segment(
-        key,
-        lambda: transcode_video_segment(filepath, file_hash, resolution, segment)
-    )
-
-    if result and os.path.exists(result):
-        trigger_video_prefetch(filepath, file_hash, resolution, segment, info)
-        with open(result, 'rb') as f:
-            return f.read()
-
-    return None
-
-
-def trigger_video_prefetch(filepath: str, file_hash: str, resolution: str, current: int, info: dict):
-    """Prefetch upcoming video-only segments."""
-    duration = float(info.get('format', {}).get('duration', 0))
-    total = int(duration / SEGMENT_DURATION) + 1
-
-    for offset in range(1, PREFETCH_SEGMENTS + 1):
-        next_seg = current + offset
-        if next_seg >= total:
-            break
-
-        output = get_video_segment_path(file_hash, resolution, next_seg)
-        if os.path.exists(output):
-            continue
-
-        key = f"{file_hash}:v:{resolution}:{next_seg}"
-        seg = next_seg
-        segment_manager.schedule_prefetch(
-            key,
-            lambda s=seg: transcode_video_segment(filepath, file_hash, resolution, s)
-        )
 
 
 def get_or_transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str, segment: int, info: dict) -> bytes | None:
@@ -1179,11 +1045,6 @@ class Handler(BaseHTTPRequestHandler):
                 resolution = 'original'
             return self.handle_stream(m.group(1), 0, resolution)
 
-        # Video-only segment (for HLS alternate audio support)
-        m = re.match(r'^/transcode/(.+?)/seg_v_(\w+)_(\d+)\.ts$', path)
-        if m:
-            return self.handle_video_segment(m.group(1), m.group(2), int(m.group(3)))
-
         # Muxed video+audio segment
         m = re.match(r'^/transcode/(.+?)/seg_a(\d+)_(\w+)_(\d+)\.ts$', path)
         if m:
@@ -1274,22 +1135,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_data(data, 'video/mp2t')
         else:
             self.send_error(500, "Transcode failed")
-
-    def handle_video_segment(self, filepath: str, resolution: str, segment: int):
-        """Handle video-only segment request (no audio muxed)."""
-        full_path, file_hash, info = self.get_file_info(filepath)
-        if not info:
-            return
-
-        # Update codec info in metrics
-        video_codec, audio_codec = extract_codecs(info)
-        segment_manager.set_codec_info(video_codec, audio_codec)
-
-        data = get_or_transcode_video_segment(full_path, file_hash, resolution, segment, info)
-        if data:
-            self.send_data(data, 'video/mp2t')
-        else:
-            self.send_error(500, "Video transcode failed")
 
     def handle_subtitle_playlist(self, filepath: str, sub_index: int):
         full_path, file_hash, info = self.get_file_info(filepath)
