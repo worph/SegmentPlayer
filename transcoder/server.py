@@ -27,7 +27,6 @@ CACHE_DIR = os.environ.get('CACHE_DIR', '/data/cache')
 SEGMENT_DURATION = int(os.environ.get('SEGMENT_DURATION', '4'))
 PORT = int(os.environ.get('PORT', '8080'))
 PREFETCH_SEGMENTS = int(os.environ.get('PREFETCH_SEGMENTS', '4'))  # How many segments to prefetch ahead
-FFMPEG_PRESET = os.environ.get('FFMPEG_PRESET', 'fast')  # x264 preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -39,6 +38,128 @@ RESOLUTIONS = {
     '480p': (854, 480, 25),
     '360p': (640, 360, 26),
 }
+
+# x264 presets ordered from fastest to slowest
+X264_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']
+
+
+class AdaptivePreset:
+    """
+    Automatically adjusts x264 preset based on segment transcode time.
+
+    Target: 70-80% of segment duration (transcode ratio)
+    - If ratio < 70%: we have headroom, increase quality (slower preset)
+    - If ratio > 80%: too slow, decrease quality (faster preset)
+
+    Uses hysteresis (consecutive signals) to avoid oscillation.
+    """
+
+    def __init__(self, initial_preset: str = 'fast', target_min: float = 70.0, target_max: float = 80.0):
+        self._lock = threading.Lock()
+        self._preset_index = X264_PRESETS.index(initial_preset) if initial_preset in X264_PRESETS else 4
+        self._target_min = target_min  # Minimum target ratio (%)
+        self._target_max = target_max  # Maximum target ratio (%)
+        self._recent_ratios: list[float] = []  # Rolling window of recent ratios
+        self._window_size = 5  # Number of segments to consider
+        self._consecutive_signals = 0  # Positive = need faster, negative = need slower
+        self._hysteresis_threshold = 3  # Consecutive signals needed to change preset
+        self._last_change_time = 0.0
+        self._min_change_interval = 10.0  # Minimum seconds between preset changes
+        self._total_adjustments_up = 0  # Times we increased quality
+        self._total_adjustments_down = 0  # Times we decreased quality
+
+    @property
+    def preset(self) -> str:
+        with self._lock:
+            return X264_PRESETS[self._preset_index]
+
+    def record_transcode(self, elapsed: float) -> str | None:
+        """
+        Record a transcode time and potentially adjust preset.
+
+        Returns the new preset name if changed, None if unchanged.
+        """
+        ratio = (elapsed / SEGMENT_DURATION) * 100  # Transcode ratio as percentage
+
+        with self._lock:
+            # Add to rolling window
+            self._recent_ratios.append(ratio)
+            if len(self._recent_ratios) > self._window_size:
+                self._recent_ratios.pop(0)
+
+            # Need enough samples
+            if len(self._recent_ratios) < self._window_size:
+                return None
+
+            avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios)
+            current_time = time.time()
+
+            # Determine signal direction
+            if avg_ratio > self._target_max:
+                # Too slow, need faster preset
+                if self._consecutive_signals >= 0:
+                    self._consecutive_signals += 1
+                else:
+                    self._consecutive_signals = 1
+            elif avg_ratio < self._target_min:
+                # Too fast, can afford slower (higher quality) preset
+                if self._consecutive_signals <= 0:
+                    self._consecutive_signals -= 1
+                else:
+                    self._consecutive_signals = -1
+            else:
+                # In target range, reset signals
+                self._consecutive_signals = 0
+                return None
+
+            # Check if we should adjust
+            if abs(self._consecutive_signals) < self._hysteresis_threshold:
+                return None
+
+            # Respect minimum change interval
+            if current_time - self._last_change_time < self._min_change_interval:
+                return None
+
+            # Make adjustment
+            old_preset = X264_PRESETS[self._preset_index]
+            if self._consecutive_signals > 0 and self._preset_index > 0:
+                # Need faster preset (lower index)
+                self._preset_index -= 1
+                self._total_adjustments_down += 1
+                new_preset = X264_PRESETS[self._preset_index]
+                print(f"[AdaptivePreset] Ratio {avg_ratio:.1f}% > {self._target_max}% → {old_preset} → {new_preset}")
+            elif self._consecutive_signals < 0 and self._preset_index < len(X264_PRESETS) - 1:
+                # Can afford slower preset (higher index)
+                self._preset_index += 1
+                self._total_adjustments_up += 1
+                new_preset = X264_PRESETS[self._preset_index]
+                print(f"[AdaptivePreset] Ratio {avg_ratio:.1f}% < {self._target_min}% → {old_preset} → {new_preset}")
+            else:
+                # Already at limit
+                return None
+
+            self._consecutive_signals = 0
+            self._last_change_time = current_time
+            self._recent_ratios.clear()  # Reset window after change
+            return new_preset
+
+    def get_stats(self) -> dict:
+        """Get adaptive preset statistics."""
+        with self._lock:
+            avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios) if self._recent_ratios else 0
+            return {
+                'current_preset': X264_PRESETS[self._preset_index],
+                'preset_index': self._preset_index,
+                'target_range': f"{self._target_min:.0f}-{self._target_max:.0f}%",
+                'recent_avg_ratio': round(avg_ratio, 1),
+                'consecutive_signals': self._consecutive_signals,
+                'adjustments_up': self._total_adjustments_up,
+                'adjustments_down': self._total_adjustments_down,
+            }
+
+
+# Global adaptive preset manager
+adaptive_preset = AdaptivePreset(initial_preset='fast')
 
 
 class SegmentManager:
@@ -199,6 +320,8 @@ class SegmentManager:
                 'transcode_ratio_avg': round(avg_ratio, 1),
                 'transcode_ratio_min': round(min_ratio, 1),
                 'transcode_ratio_max': round(max_ratio, 1),
+                # Adaptive preset info
+                'adaptive_preset': adaptive_preset.get_stats(),
             }
 
     def reset_metrics(self):
@@ -249,7 +372,7 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
 
     Optimized for speed:
     - libdav1d: fast multi-threaded AV1 decoder (if applicable)
-    - configurable preset via FFMPEG_PRESET env (default: fast)
+    - adaptive preset: auto-adjusts based on transcode ratio (target 70-80%)
     - threads 0: use all CPU cores for both decode and encode
     - tune zerolatency: reduce encoding latency
     """
@@ -263,8 +386,11 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         return output
 
     start_offset = segment * SEGMENT_DURATION
-    preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
-    width, height, crf = preset
+    res_preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
+    width, height, crf = res_preset
+
+    # Get current adaptive preset
+    current_preset = adaptive_preset.preset
 
     # Get CPU count for threading
     cpu_count = os.cpu_count() or 8
@@ -280,7 +406,7 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         '-map', f'0:a:{audio}',
         # Video output: optimized for speed with explicit threading
         '-c:v', 'libx264',
-        '-preset', FFMPEG_PRESET,
+        '-preset', current_preset,
         '-tune', 'zerolatency',
         '-crf', str(crf),
         '-pix_fmt', 'yuv420p',
@@ -305,6 +431,7 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         elapsed = time.time() - start_time
         if result.returncode == 0 and os.path.exists(output):
             segment_manager.record_transcode_time(elapsed)
+            adaptive_preset.record_transcode(elapsed)
             return output
         print(f"FFmpeg error: {result.stderr.decode()[-200:]}")
     except Exception as e:
@@ -319,6 +446,7 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
 
     Audio is included in video segments for maximum compatibility.
     Separate audio playlists are also available for players that support HLS alternate audio.
+    Uses adaptive preset that auto-adjusts based on transcode ratio (target 70-80%).
     """
     cache_dir = os.path.join(CACHE_DIR, file_hash)
     os.makedirs(cache_dir, exist_ok=True)
@@ -330,8 +458,11 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
         return output
 
     start_offset = segment * SEGMENT_DURATION
-    preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
-    width, height, crf = preset
+    res_preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
+    width, height, crf = res_preset
+
+    # Get current adaptive preset
+    current_preset = adaptive_preset.preset
 
     # Get CPU count for threading
     cpu_count = os.cpu_count() or 8
@@ -345,7 +476,7 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
         '-map', '0:v:0',
         '-map', '0:a?',  # All audio streams (optional, ? means don't fail if no audio)
         '-c:v', 'libx264',
-        '-preset', FFMPEG_PRESET,
+        '-preset', current_preset,
         '-tune', 'zerolatency',
         '-crf', str(crf),
         '-pix_fmt', 'yuv420p',
@@ -368,6 +499,7 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
         elapsed = time.time() - start_time
         if result.returncode == 0 and os.path.exists(output):
             segment_manager.record_transcode_time(elapsed)
+            adaptive_preset.record_transcode(elapsed)
             return output
         print(f"FFmpeg video error: {result.stderr.decode()[-200:]}")
     except Exception as e:
@@ -1259,7 +1391,7 @@ class ThreadedServer(HTTPServer):
 def main():
     print(f"HLS Transcoder starting on port {PORT}")
     print(f"Media: {MEDIA_DIR} | Cache: {CACHE_DIR} | Segment: {SEGMENT_DURATION}s")
-    print(f"Mode: Single-threaded + prefetch | Preset: {FFMPEG_PRESET}")
+    print(f"Mode: Single-threaded + prefetch | Adaptive preset: target 70-80% ratio")
     ThreadedServer(('0.0.0.0', PORT), Handler).serve_forever()
 
 

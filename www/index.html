@@ -380,24 +380,32 @@
         .metrics-panel.active {
             display: block;
         }
+        .metrics-section {
+            margin-bottom: 1.25rem;
+        }
+        .metrics-section:last-child {
+            margin-bottom: 0;
+        }
         .metrics-panel h3 {
             color: #22d3ee;
             margin-bottom: 0.75rem;
-            font-size: 0.9rem;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
         }
         .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-            gap: 0.75rem;
+            grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+            gap: 0.5rem;
         }
         .metric-item {
             background: rgba(0,0,0,0.2);
-            padding: 0.75rem;
+            padding: 0.6rem;
             border-radius: 6px;
             text-align: center;
         }
         .metric-value {
-            font-size: 1.25rem;
+            font-size: 1.1rem;
             font-weight: 600;
             color: #fff;
         }
@@ -405,11 +413,143 @@
         .metric-value.warning { color: #ffd43b; }
         .metric-value.bad { color: #ff6b6b; }
         .metric-label {
-            font-size: 0.7rem;
+            font-size: 0.65rem;
             color: #888;
-            margin-top: 0.25rem;
+            margin-top: 0.2rem;
             text-transform: uppercase;
         }
+
+        /* Adaptive Preset Display */
+        .preset-display {
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            padding: 0.75rem;
+        }
+        .preset-current {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.75rem;
+        }
+        .preset-label {
+            color: #888;
+            font-size: 0.8rem;
+        }
+        .preset-value {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #4dabf7;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .preset-bar-container {
+            margin-bottom: 0.5rem;
+        }
+        .preset-bar {
+            position: relative;
+            height: 8px;
+            background: linear-gradient(to right, #51cf66, #ffd43b, #ff6b6b);
+            border-radius: 4px;
+            margin-bottom: 0.4rem;
+        }
+        .preset-marker {
+            position: absolute;
+            top: -4px;
+            width: 16px;
+            height: 16px;
+            background: #fff;
+            border-radius: 50%;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+            transform: translateX(-50%);
+            transition: left 0.3s ease;
+        }
+        .preset-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.6rem;
+            color: #666;
+        }
+        .preset-stats {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            margin-top: 0.5rem;
+        }
+        .preset-stat {
+            padding: 0.25rem 0.5rem;
+            background: rgba(0,0,0,0.3);
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .preset-stat:first-child {
+            color: #51cf66;
+        }
+        .preset-stat:last-child {
+            color: #ff6b6b;
+        }
+
+        /* Ratio Gauge */
+        .ratio-gauge {
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+            padding: 0.75rem;
+        }
+        .ratio-bar {
+            position: relative;
+            height: 24px;
+            background: linear-gradient(to right,
+                #51cf66 0%, #51cf66 50%,
+                #ffd43b 50%, #ffd43b 70%,
+                #51cf66 70%, #51cf66 80%,
+                #ffd43b 80%, #ffd43b 90%,
+                #ff6b6b 90%, #ff6b6b 100%
+            );
+            border-radius: 4px;
+            margin-bottom: 0.4rem;
+            overflow: visible;
+        }
+        .ratio-target {
+            position: absolute;
+            top: 0;
+            height: 100%;
+            background: rgba(255,255,255,0.15);
+            border: 2px solid rgba(255,255,255,0.4);
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .ratio-needle {
+            position: absolute;
+            top: -6px;
+            width: 4px;
+            height: 36px;
+            background: #fff;
+            border-radius: 2px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+            transform: translateX(-50%);
+            transition: left 0.3s ease;
+            left: 0%;
+        }
+        .ratio-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.65rem;
+            color: #666;
+            padding: 0 0.25rem;
+        }
+        .ratio-labels .target-label {
+            color: #51cf66;
+            font-weight: 600;
+        }
+        .ratio-value {
+            text-align: center;
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-top: 0.5rem;
+        }
+        .ratio-value.good { color: #51cf66; }
+        .ratio-value.warning { color: #ffd43b; }
+        .ratio-value.bad { color: #ff6b6b; }
 
         /* Loading & Empty States */
         .loading {
@@ -530,31 +670,74 @@
                     </div>
 
                     <div class="metrics-panel" id="metricsPanel">
-                        <h3>Transcode Performance</h3>
-                        <div class="metrics-grid">
-                            <div class="metric-item">
-                                <div class="metric-value" id="metricRatioAvg">-</div>
-                                <div class="metric-label">Avg Ratio</div>
+                        <div class="metrics-section">
+                            <h3>Adaptive Preset</h3>
+                            <div class="preset-display">
+                                <div class="preset-current">
+                                    <span class="preset-label">Current:</span>
+                                    <span class="preset-value" id="metricPreset">fast</span>
+                                </div>
+                                <div class="preset-bar-container">
+                                    <div class="preset-bar">
+                                        <div class="preset-marker" id="presetMarker"></div>
+                                        <div class="preset-labels">
+                                            <span>ultrafast</span>
+                                            <span>fast</span>
+                                            <span>medium</span>
+                                            <span>slow</span>
+                                            <span>veryslow</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="preset-stats">
+                                    <span class="preset-stat" id="presetAdjustUp" title="Quality increased">+0</span>
+                                    <span class="preset-stat" id="presetAdjustDown" title="Quality decreased">-0</span>
+                                </div>
                             </div>
-                            <div class="metric-item">
-                                <div class="metric-value" id="metricRatioLast">-</div>
-                                <div class="metric-label">Last Ratio</div>
+                        </div>
+                        <div class="metrics-section">
+                            <h3>Transcode Ratio</h3>
+                            <div class="ratio-gauge">
+                                <div class="ratio-bar">
+                                    <div class="ratio-target" style="left: 70%; width: 10%;"></div>
+                                    <div class="ratio-needle" id="ratioNeedle"></div>
+                                </div>
+                                <div class="ratio-labels">
+                                    <span>0%</span>
+                                    <span>50%</span>
+                                    <span class="target-label">70-80%</span>
+                                    <span>100%</span>
+                                </div>
+                                <div class="ratio-value" id="ratioValue">-</div>
                             </div>
-                            <div class="metric-item">
-                                <div class="metric-value" id="metricRatioMin">-</div>
-                                <div class="metric-label">Best</div>
-                            </div>
-                            <div class="metric-item">
-                                <div class="metric-value" id="metricRatioMax">-</div>
-                                <div class="metric-label">Worst</div>
-                            </div>
-                            <div class="metric-item">
-                                <div class="metric-value" id="metricCacheHit">-</div>
-                                <div class="metric-label">Cache Hit</div>
-                            </div>
-                            <div class="metric-item">
-                                <div class="metric-value" id="metricSegments">-</div>
-                                <div class="metric-label">Segments</div>
+                        </div>
+                        <div class="metrics-section">
+                            <h3>Performance</h3>
+                            <div class="metrics-grid">
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricRatioAvg">-</div>
+                                    <div class="metric-label">Avg Ratio</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricRatioLast">-</div>
+                                    <div class="metric-label">Last Ratio</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricRatioMin">-</div>
+                                    <div class="metric-label">Best</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricRatioMax">-</div>
+                                    <div class="metric-label">Worst</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricCacheHit">-</div>
+                                    <div class="metric-label">Cache Hit</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricSegments">-</div>
+                                    <div class="metric-label">Segments</div>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1348,6 +1531,9 @@
             }
         });
 
+        // Preset order for position calculation
+        const PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'];
+
         async function fetchMetrics() {
             try {
                 const response = await fetch("/transcode/metrics");
@@ -1358,11 +1544,40 @@
                 const formatRatio = (ratio) => ratio ? ratio.toFixed(1) + "%" : "-";
                 const getRatioClass = (ratio) => {
                     if (!ratio) return "";
-                    if (ratio < 25) return "good";
-                    if (ratio < 75) return "warning";
+                    if (ratio >= 70 && ratio <= 80) return "good";  // Target range
+                    if (ratio < 70) return "good";  // Below target is fine
+                    if (ratio < 90) return "warning";
                     return "bad";
                 };
 
+                // Update adaptive preset display
+                if (data.adaptive_preset) {
+                    const preset = data.adaptive_preset;
+                    document.getElementById("metricPreset").textContent = preset.current_preset;
+
+                    // Position marker on preset bar (0-100%)
+                    const presetIndex = PRESETS.indexOf(preset.current_preset);
+                    const presetPosition = presetIndex >= 0 ? (presetIndex / (PRESETS.length - 1)) * 100 : 50;
+                    document.getElementById("presetMarker").style.left = presetPosition + "%";
+
+                    // Update adjustment counts
+                    document.getElementById("presetAdjustUp").textContent = "+" + (preset.adjustments_up || 0);
+                    document.getElementById("presetAdjustDown").textContent = "-" + (preset.adjustments_down || 0);
+                }
+
+                // Update ratio gauge
+                const avgRatio = data.transcode_ratio_avg || 0;
+                const ratioNeedle = document.getElementById("ratioNeedle");
+                const ratioValue = document.getElementById("ratioValue");
+
+                // Clamp ratio to 0-100% for display
+                const needlePos = Math.min(100, Math.max(0, avgRatio));
+                ratioNeedle.style.left = needlePos + "%";
+
+                ratioValue.textContent = formatRatio(avgRatio);
+                ratioValue.className = "ratio-value " + getRatioClass(avgRatio);
+
+                // Update performance metrics
                 document.getElementById("metricRatioAvg").textContent = formatRatio(data.transcode_ratio_avg);
                 document.getElementById("metricRatioAvg").className = "metric-value " + getRatioClass(data.transcode_ratio_avg);
 

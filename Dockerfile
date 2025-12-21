@@ -62,7 +62,7 @@ stdout_logfile=/dev/stdout
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
-environment=PYTHONUNBUFFERED="1",MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080",FFMPEG_PRESET="%(ENV_FFMPEG_PRESET)s"
+environment=PYTHONUNBUFFERED="1",MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080"
 EOF
 
 # Create entrypoint script to substitute env vars and start supervisord
@@ -80,7 +80,6 @@ ENV MEDIA_DIR=/data/media \
     CACHE_DIR=/data/cache \
     SEGMENT_DURATION=4 \
     PORT=8080 \
-    FFMPEG_PRESET=fast \
     NGINX_PORT=80 \
     PATH="/usr/local/bin:$PATH"
 
