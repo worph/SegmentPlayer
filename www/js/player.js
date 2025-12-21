@@ -229,25 +229,22 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
 
         // Populate resolution dropdown from HLS.js levels
         if (SP.state.hls.levels && SP.state.hls.levels.length > 0) {
-            var levels = SP.state.hls.levels.map(function(level, i) {
-                return {
-                    index: i,
-                    height: level.height,
-                    width: level.width,
-                    bitrate: level.bitrate
-                };
+            // Get unique heights (avoid duplicates from multiple audio tracks)
+            var heightSet = {};
+            SP.state.hls.levels.forEach(function(level) {
+                if (!heightSet[level.height]) {
+                    heightSet[level.height] = true;
+                }
             });
-
-            // Sort by height descending
-            levels.sort(function(a, b) { return b.height - a.height; });
+            var uniqueHeights = Object.keys(heightSet).map(Number).sort(function(a, b) { return b - a; });
 
             // First option is "Original" (highest quality)
-            var originalHeight = levels[0].height;
+            var originalHeight = uniqueHeights[0];
             SP.elements.resolutionSelect.innerHTML =
                 '<option value="auto">Auto</option>' +
                 '<option value="' + originalHeight + '">Original (' + originalHeight + 'p)</option>' +
-                levels.slice(1).map(function(l) {
-                    return '<option value="' + l.height + '">' + l.height + 'p</option>';
+                uniqueHeights.slice(1).map(function(h) {
+                    return '<option value="' + h + '">' + h + 'p</option>';
                 }).join("");
             SP.elements.resolutionSelect.disabled = false;
             SP.elements.resolutionSelect.value = "auto";
