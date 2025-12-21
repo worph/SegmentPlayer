@@ -47,27 +47,33 @@ class AdaptiveQuality:
     """
     Coordinated adaptive quality control using both preset and CRF.
 
-    Strategy:
-    - Preset is the PRIMARY control (big impact on speed)
-    - CRF is SECONDARY (fine-tuning, only used when preset alone isn't enough)
+    Strategy - PRIORITIZE LOW CRF (quality over compression efficiency):
+    - CRF directly affects output quality (lower = better visual quality)
+    - Preset affects encoding speed (faster = less CPU, slightly worse compression)
+    - For streaming, visual quality matters more than file size
+    - So: keep CRF low, use faster presets when needed
 
     Target: 60-80% of segment duration (transcode ratio)
-    - Below 60%: We have lots of headroom, can increase quality
+    - Below 60%: We have headroom, can increase quality
     - 60-80%: Sweet spot, maintain current settings
-    - Above 80%: Too slow, decrease quality
+    - Above 80%: Too slow, decrease quality (preset first!)
     - Above 100%: EMERGENCY, drop to fastest settings
 
     Coordination rules:
-    - Only increase preset quality when CRF offset is 0
-    - CRF adjusts first for fine-tuning
-    - On emergency, both drop to fastest
+    - DECREASE quality: Drop preset first (faster encoding), CRF only as last resort
+    - INCREASE quality: Decrease CRF first (better quality), then preset (capped at 'medium')
+    - Max preset is 'medium' - slower presets waste CPU for minimal streaming benefit
     """
+
+    # Cap preset at 'medium' (index 5) - slower presets not worth it for streaming
+    MAX_PRESET_INDEX = 5  # 'medium'
 
     def __init__(self, initial_preset: str = 'fast'):
         self._lock = threading.Lock()
 
-        # Preset state
-        self._preset_index = X264_PRESETS.index(initial_preset) if initial_preset in X264_PRESETS else 4
+        # Preset state (capped at medium)
+        initial_index = X264_PRESETS.index(initial_preset) if initial_preset in X264_PRESETS else 4
+        self._preset_index = min(initial_index, self.MAX_PRESET_INDEX)
 
         # CRF state
         self._crf_offset = 0  # 0 to 7
@@ -112,7 +118,6 @@ class AdaptiveQuality:
 
             avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios)
             current_time = time.time()
-            changes = {}
 
             old_preset = X264_PRESETS[self._preset_index]
             old_crf = self._crf_offset
@@ -131,32 +136,34 @@ class AdaptiveQuality:
                     return {'preset': 'ultrafast', 'crf_offset': 7, 'emergency': True}
 
             # === DECREASE QUALITY: last ratio > 80% ===
+            # Priority: Drop PRESET first (keep CRF low for better quality)
             if last_ratio > self._target_max:
                 self._consecutive_good_signals = 0
 
-                # First try increasing CRF (finer adjustment)
-                if self._crf_offset < 7:
-                    self._crf_offset = min(self._crf_offset + 2, 7)
-                    self._crf_ups += 1
-                    self._last_change_time = current_time
-                    print(f"[AdaptiveQuality] Last {last_ratio:.1f}% > {self._target_max}% → CRF +{old_crf} → +{self._crf_offset}")
-                    return {'crf_offset': self._crf_offset}
-                # If CRF maxed, decrease preset
-                elif self._preset_index > 0:
+                # First: use faster preset (maintains quality, faster encoding)
+                if self._preset_index > 0:
                     self._preset_index -= 1
                     self._preset_downs += 1
                     self._last_change_time = current_time
                     new_preset = X264_PRESETS[self._preset_index]
                     print(f"[AdaptiveQuality] Last {last_ratio:.1f}% > {self._target_max}% → {old_preset} → {new_preset}")
                     return {'preset': new_preset}
+                # Last resort: increase CRF (only when already at ultrafast)
+                elif self._crf_offset < 7:
+                    self._crf_offset = min(self._crf_offset + 2, 7)
+                    self._crf_ups += 1
+                    self._last_change_time = current_time
+                    print(f"[AdaptiveQuality] Last {last_ratio:.1f}% > {self._target_max}% (ultrafast) → CRF +{old_crf} → +{self._crf_offset}")
+                    return {'crf_offset': self._crf_offset}
 
             # === INCREASE QUALITY: avg ratio < 60% ===
+            # Priority: Decrease CRF first (better quality), then slower preset (capped)
             elif avg_ratio < self._target_min:
                 self._consecutive_good_signals += 1
 
                 # Need 3 consecutive good signals and 5 second cooldown
                 if self._consecutive_good_signals >= 3 and current_time - self._last_change_time >= 5.0:
-                    # First decrease CRF back to 0
+                    # First: decrease CRF (improve visual quality)
                     if self._crf_offset > 0:
                         self._crf_offset -= 1
                         self._crf_downs += 1
@@ -164,8 +171,8 @@ class AdaptiveQuality:
                         self._last_change_time = current_time
                         print(f"[AdaptiveQuality] Avg {avg_ratio:.1f}% < {self._target_min}% → CRF +{old_crf} → +{self._crf_offset}")
                         return {'crf_offset': self._crf_offset}
-                    # Only increase preset when CRF is at 0
-                    elif self._preset_index < len(X264_PRESETS) - 1:
+                    # Then: slower preset (capped at medium - slower not worth it)
+                    elif self._preset_index < self.MAX_PRESET_INDEX:
                         self._preset_index += 1
                         self._preset_ups += 1
                         self._consecutive_good_signals = 0
