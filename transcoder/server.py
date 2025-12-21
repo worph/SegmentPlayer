@@ -455,7 +455,6 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
     Transcode a single segment using FFmpeg.
 
     Optimized for speed:
-    - libdav1d: fast multi-threaded AV1 decoder (if applicable)
     - adaptive preset: auto-adjusts based on transcode ratio (target 70-80%)
     - threads 0: use all CPU cores for both decode and encode
     - tune zerolatency: reduce encoding latency
@@ -482,14 +481,12 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
 
     cmd = [
         'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-        # Decoder threading (libdav1d for AV1 uses these)
         '-threads', str(cpu_count),
         '-ss', str(start_offset),
         '-i', filepath,
         '-t', str(SEGMENT_DURATION),
         '-map', '0:v:0',
         '-map', f'0:a:{audio}',
-        # Video output: optimized for speed with explicit threading
         '-c:v', 'libx264',
         '-preset', current_preset,
         '-tune', 'zerolatency',
@@ -497,9 +494,7 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         '-pix_fmt', 'yuv420p',
         '-x264-params', f'threads={cpu_count}:lookahead_threads={min(cpu_count, 8)}',
         '-force_key_frames', 'expr:gte(t,0)',
-        # Audio: try copy (faster), FFmpeg will fail if incompatible with mpegts
         '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-        # Output format
         '-f', 'mpegts',
         '-mpegts_copyts', '1',
         '-output_ts_offset', str(start_offset),
@@ -560,7 +555,7 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
         '-i', filepath,
         '-t', str(SEGMENT_DURATION),
         '-map', '0:v:0',
-        '-map', '0:a?',  # All audio streams (optional, ? means don't fail if no audio)
+        '-map', '0:a?',
         '-c:v', 'libx264',
         '-preset', current_preset,
         '-tune', 'zerolatency',

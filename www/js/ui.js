@@ -7,19 +7,8 @@ function setStatus(text, color, pulsing) {
     SP.elements.statusDot.classList.toggle("pulse", pulsing);
 }
 
-function updateModeDisplay() {
-    var modeEl = document.getElementById("metricMode");
+function updateQualityDisplay() {
     var resEl = document.getElementById("adaptiveQualityRes");
-
-    if (modeEl) {
-        if (SP.state.isTranscoding) {
-            modeEl.textContent = "Transcode";
-            modeEl.className = "metric-value warning";
-        } else {
-            modeEl.textContent = "Repack";
-            modeEl.className = "metric-value good";
-        }
-    }
 
     // Update current quality display
     if (resEl) {

@@ -96,11 +96,6 @@ video {
     border-color: #555;
 }
 
-.controls input[type="checkbox"] {
-    margin-right: 0.4rem;
-    cursor: pointer;
-}
-
 .controls button {
     padding: 0.4rem 0.8rem;
     border-radius: var(--radius-md);

@@ -83,7 +83,7 @@ async function fetchMetrics() {
         document.getElementById("metricAudioCodec").textContent = data.audio_codec ? data.audio_codec.toUpperCase() : "-";
 
         // Update mode display
-        updateModeDisplay();
+        updateQualityDisplay();
 
     } catch (err) {}
 }

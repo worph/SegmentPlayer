@@ -104,12 +104,8 @@
 
                     <div class="metrics-panel" id="metricsPanel">
                         <div class="metrics-section">
-                            <h3>Player Mode</h3>
-                            <div class="metrics-grid" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
-                                <div class="metric-item">
-                                    <div class="metric-value" id="metricMode">-</div>
-                                    <div class="metric-label">Mode</div>
-                                </div>
+                            <h3>Source Codecs</h3>
+                            <div class="metrics-grid" style="grid-template-columns: 1fr 1fr;">
                                 <div class="metric-item">
                                     <div class="metric-value" id="metricVideoCodec">-</div>
                                     <div class="metric-label">Video</div>
@@ -118,14 +114,6 @@
                                     <div class="metric-value" id="metricAudioCodec">-</div>
                                     <div class="metric-label">Audio</div>
                                 </div>
-                                <div class="metric-item" style="display: flex; align-items: center; justify-content: center;">
-                                    <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.85rem; color: #888;">
-                                        <input type="checkbox" id="forceTranscode" style="cursor: pointer;"> Force Transcode
-                                    </label>
-                                </div>
-                            </div>
-                            <div style="font-size: 0.75rem; color: #666; margin-top: 0.5rem; line-height: 1.4;">
-                                <b>Repack</b>: H.264 + AAC only (fast, no CPU). <b>Transcode</b>: HEVC, AV1, VP9, AC3, DTS, 10-bit (re-encodes to H.264+AAC).
                             </div>
                         </div>
                         <div class="metrics-section">

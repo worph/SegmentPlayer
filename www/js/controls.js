@@ -54,7 +54,7 @@ function initAudioControl() {
                     SP.state.currentResolution = targetLevel.height.toString();
                     SP.state.actualResolution = targetLevel.height;
                     SP.elements.resolutionSelect.value = targetLevel.height.toString();
-                    updateModeDisplay();
+                    updateQualityDisplay();
                 }
 
                 // Lock to this level (disable ABR to prevent switching back to old audio)
@@ -160,7 +160,7 @@ function initResolutionControl() {
         SP.state.currentResolution = newResolution;
         // Reset actual resolution - will be updated by LEVEL_SWITCHED event
         SP.state.actualResolution = null;
-        updateModeDisplay();
+        updateQualityDisplay();
 
         // For transcoded mode, filter levels by current audio track
         var candidateLevels = SP.state.isTranscoding

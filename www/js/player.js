@@ -8,7 +8,6 @@ async function resetMetrics() {
 
 async function playFile(filePath, fileName) {
     SP.state.currentFile = filePath;
-    var forceTranscode = document.getElementById("forceTranscode").checked;
 
     // Update URL hash
     updateUrlHash(filePath);
@@ -38,15 +37,6 @@ async function playFile(filePath, fileName) {
     SP.state.currentAudioIdx = 0;
 
     SP.elements.video.querySelectorAll("track").forEach(function(t) { t.remove(); });
-
-    if (forceTranscode) {
-        tryTranscodedFallback(filePath, fileName);
-        return;
-    }
-
-    // Direct HLS = repack mode
-    SP.state.isTranscoding = false;
-    updateModeDisplay();
 
     var videoSrc = "/hls/" + encodeURIComponent(filePath) + "/master.m3u8";
 
@@ -114,7 +104,7 @@ async function playFile(filePath, fileName) {
         SP.state.hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {
             if (SP.state.hls.levels && SP.state.hls.levels[data.level]) {
                 SP.state.actualResolution = SP.state.hls.levels[data.level].height;
-                updateModeDisplay();
+                updateQualityDisplay();
                 // Update Auto option in dropdown
                 var autoOption = SP.elements.resolutionSelect.querySelector('option[value="auto"]');
                 if (autoOption) {
@@ -139,7 +129,7 @@ async function tryTranscodedFallback(filePath, fileName) {
 
     // Mark as transcode mode
     SP.state.isTranscoding = true;
-    updateModeDisplay();
+    updateQualityDisplay();
 
     var transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
 
@@ -250,7 +240,7 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
             SP.elements.resolutionSelect.value = "auto";
             SP.state.currentResolution = "auto";
             SP.state.actualResolution = null;
-            updateModeDisplay();
+            updateQualityDisplay();
 
             // For multi-audio content, we can't use ABR because it might pick a different audio track
             // Instead, find the highest quality level for audio track 0
@@ -315,7 +305,7 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
     SP.state.hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {
         if (SP.state.hls.levels && SP.state.hls.levels[data.level]) {
             SP.state.actualResolution = SP.state.hls.levels[data.level].height;
-            updateModeDisplay();
+            updateQualityDisplay();
             // Update Auto option in dropdown
             var autoOption = SP.elements.resolutionSelect.querySelector('option[value="auto"]');
             if (autoOption) {
