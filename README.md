@@ -6,9 +6,10 @@ On-the-fly HLS streaming server with live segment-level transcoding.
 
 - **Direct HLS streaming** - Uses nginx-vod-module for on-the-fly HLS packaging (no pre-transcoding)
 - **Live segment transcoding** - FFmpeg transcodes incompatible codecs (HEVC, VP9, AV1, etc.) at the segment level
+- **Adaptive quality** - Automatically adjusts encoding preset/CRF based on CPU performance
 - **Multi-audio track support** - Switch between audio tracks (e.g., English/Japanese dubs)
 - **Embedded subtitle extraction** - Extracts embedded subtitles to WebVTT format
-- **Modern web player** - Responsive interface with hls.js
+- **Modern web player** - Responsive interface with hls.js, quality selection, real-time metrics
 - **Instant seeking** - No waiting for full transcoding
 
 ## Supported Formats
@@ -60,6 +61,7 @@ Then open http://localhost:8080 in your browser.
 | `MEDIA_DIR` | Path to media files inside container | `/data/media` |
 | `CACHE_DIR` | Path for transcoded segment cache | `/data/cache` |
 | `SEGMENT_DURATION` | HLS segment duration in seconds | `4` |
+| `PREFETCH_SEGMENTS` | Number of segments to prefetch ahead | `4` |
 
 ## API Endpoints
 
@@ -69,63 +71,38 @@ Then open http://localhost:8080 in your browser.
 | `/api/files/` | JSON listing of media files |
 | `/hls/{file}/master.m3u8` | Direct HLS streaming (nginx-vod-module) |
 | `/transcode/{file}/master.m3u8` | Live transcoded HLS stream |
-| `/media/` | Direct file access |
-| `/stremio/manifest.json` | Stremio addon manifest |
-
-## Stremio Addon
-
-SegmentPlayer includes a built-in Stremio addon that lets you browse and stream your media library directly in Stremio.
-
-### Testing with Cloudflare Tunnel
-
-Stremio requires HTTPS for addons. Use Cloudflare's free quick tunnel for local testing:
-
-```bash
-# Install cloudflared (if not already installed)
-# macOS: brew install cloudflared
-# Linux: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
-
-# Start a temporary tunnel (no account required)
-cloudflared tunnel --url http://localhost:8080
-```
-
-This will output a URL like `https://random-words.trycloudflare.com`. Use this to install the addon in Stremio:
-
-1. Copy the tunnel URL
-2. In Stremio, go to **Addons** → **Community Addons** → search icon → paste: `https://your-tunnel-url.trycloudflare.com/stremio/manifest.json`
-3. Click **Install**
-
-Your local media library will now appear in Stremio's Discover and Search.
+| `/direct/{file}` | Direct file download with range request support |
+| `/transcode/metrics` | Transcoding performance statistics |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     SegmentPlayer                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │                    nginx (port 80)                   │   │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │   │
-│  │  │ Web Player  │  │  VOD Module │  │   Proxy     │  │   │
-│  │  │   (/)       │  │   (/hls/)   │  │ (/transcode)│  │   │
-│  │  └─────────────┘  └─────────────┘  └──────┬──────┘  │   │
-│  └───────────────────────────────────────────┼─────────┘   │
-│                                              │              │
-│  ┌───────────────────────────────────────────▼─────────┐   │
-│  │              Python Transcoder (port 8080)          │   │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │   │
-│  │  │  Playlist   │  │   Segment   │  │  Subtitle   │  │   │
-│  │  │  Generator  │  │  Transcoder │  │  Extractor  │  │   │
-│  │  └─────────────┘  └──────┬──────┘  └─────────────┘  │   │
-│  └──────────────────────────┼──────────────────────────┘   │
-│                             │                               │
-│                      ┌──────▼──────┐                       │
-│                      │   FFmpeg    │                       │
-│                      └─────────────┘                       │
-└─────────────────────────────────────────────────────────────┘
-        │                                      │
-        ▼                                      ▼
-   /data/media                            /data/cache
-   (video files)                      (transcoded segments)
+┌──────────────────────────────────────────────────────────────────┐
+│                        SegmentPlayer                              │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │                      nginx (port 80)                        │  │
+│  │  ┌───────────┐  ┌───────────┐  ┌────────────────────────┐  │  │
+│  │  │Web Player │  │VOD Module │  │   Proxy to Transcoder  │  │  │
+│  │  │   (/)     │  │  (/hls/)  │  │ (/transcode, /direct)  │  │  │
+│  │  └───────────┘  └───────────┘  └───────────┬────────────┘  │  │
+│  └────────────────────────────────────────────┼───────────────┘  │
+│                                               │                   │
+│  ┌────────────────────────────────────────────▼───────────────┐  │
+│  │               Python Transcoder (port 8080)                 │  │
+│  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌─────────┐  │  │
+│  │  │ Playlist  │  │  Segment  │  │ Subtitle  │  │ Direct  │  │  │
+│  │  │ Generator │  │ Transcoder│  │ Extractor │  │  File   │  │  │
+│  │  └───────────┘  └─────┬─────┘  └───────────┘  └─────────┘  │  │
+│  └───────────────────────┼────────────────────────────────────┘  │
+│                          │                                        │
+│                   ┌──────▼──────┐                                │
+│                   │   FFmpeg    │                                │
+│                   └─────────────┘                                │
+└──────────────────────────────────────────────────────────────────┘
+         │                                       │
+         ▼                                       ▼
+    /data/media                             /data/cache
+    (video files)                       (transcoded segments)
 ```
 
 ## How It Works
@@ -155,20 +132,24 @@ Parallel segment transcoding (e.g., 4 concurrent FFmpeg processes) splits CPU re
 
 Instead, we use:
 1. **Single-threaded transcoding**: One FFmpeg process gets 100% CPU → fastest possible segment time
-2. **One-ahead prefetch**: After serving segment N, immediately start transcoding N+1
-3. **No idle time**: While user watches segment N, segment N+1 is being prepared
+2. **Multi-ahead prefetch**: After serving segment N, queue segments N+1 through N+4 for transcoding
+3. **No idle time**: While user watches current segment, upcoming segments are being prepared
 
 This gives:
 - Minimum latency for initial playback
 - No buffering during normal playback (prefetch fills the gap)
+- Better seek performance (more segments pre-cached)
 - Simpler architecture, fewer race conditions
 
 ### FFmpeg Optimizations
 
-- `-preset ultrafast`: Prioritize speed over compression efficiency
+- **Adaptive preset**: Automatically adjusts x264 preset based on transcode ratio (target 60-80%)
+  - Starts at `fast`, can range from `ultrafast` to `medium`
+  - If ratio > 80%: uses faster preset for speed
+  - If ratio < 60%: uses slower preset for better quality
+- **Adaptive CRF**: Quality offset adjusts alongside preset (0 to +7)
 - `-threads 0`: Use all available CPU cores for single segment
 - `-tune zerolatency`: Reduce encoding latency
-- Hardware acceleration: NVENC/VAAPI/QSV can be enabled if GPU available
 
 ## Benchmarking Transcode Performance
 
@@ -178,9 +159,9 @@ The transcoder exposes a **transcode ratio** metric that measures encoding effic
 Transcode Ratio = (time to generate segment / segment duration) × 100%
 ```
 
-- **< 25%**: Excellent - segment generates 4x faster than realtime
-- **25-75%**: Good - comfortable margin for smooth playback
-- **75-100%**: Warning - barely keeping up, may buffer on seek
+- **< 60%**: Excellent - CPU has headroom, quality can increase
+- **60-80%**: Target - optimal balance of speed and quality
+- **80-100%**: Warning - quality may decrease to maintain playback
 - **> 100%**: Critical - cannot keep up with playback, will buffer
 
 ### Running Benchmarks

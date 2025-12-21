@@ -273,6 +273,10 @@ class SegmentManager:
         self.max_segment_time = 0.0
         self._transcode_times: list[float] = []
 
+        # Current file codec info
+        self.current_video_codec: str | None = None
+        self.current_audio_codec: str | None = None
+
     def get_segment(self, key: str, transcode_fn) -> str | None:
         """
         Get a segment, transcoding if necessary.
@@ -376,6 +380,11 @@ class SegmentManager:
             if len(self._transcode_times) > 100:
                 self._transcode_times.pop(0)
 
+    def set_codec_info(self, video_codec: str | None, audio_codec: str | None):
+        with self._lock:
+            self.current_video_codec = video_codec
+            self.current_audio_codec = audio_codec
+
     def get_metrics(self) -> dict:
         with self._lock:
             avg_time = sum(self._transcode_times) / len(self._transcode_times) if self._transcode_times else 0
@@ -404,6 +413,9 @@ class SegmentManager:
                 'transcode_ratio_avg': round(avg_ratio, 1),
                 'transcode_ratio_min': round(min_ratio, 1),
                 'transcode_ratio_max': round(max_ratio, 1),
+                # Current file codec info
+                'video_codec': self.current_video_codec,
+                'audio_codec': self.current_audio_codec,
                 # Adaptive preset info
                 'adaptive_preset': adaptive_preset.get_stats(),
                 'adaptive_crf': adaptive_crf.get_stats(),
@@ -418,6 +430,8 @@ class SegmentManager:
             self.min_segment_time = float('inf')
             self.max_segment_time = 0.0
             self._transcode_times.clear()
+            self.current_video_codec = None
+            self.current_audio_codec = None
 
 
 # Global segment manager
@@ -439,6 +453,22 @@ def get_video_info(filepath: str) -> dict | None:
         return json.loads(result.stdout) if result.returncode == 0 else None
     except Exception:
         return None
+
+
+def extract_codecs(info: dict) -> tuple[str | None, str | None]:
+    """Extract video and audio codec names from ffprobe info."""
+    streams = info.get('streams', [])
+    video_codec = None
+    audio_codec = None
+
+    for stream in streams:
+        codec_type = stream.get('codec_type')
+        if codec_type == 'video' and video_codec is None:
+            video_codec = stream.get('codec_name')
+        elif codec_type == 'audio' and audio_codec is None:
+            audio_codec = stream.get('codec_name')
+
+    return video_codec, audio_codec
 
 
 def get_segment_path(file_hash: str, audio: int, resolution: str, segment: int) -> str:
@@ -729,6 +759,10 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
 
     Uses muxed video+audio segments for performance. Each audio track gets its own
     stream variant (stream_a0, stream_a1, etc.) with that audio muxed into the video.
+
+    Each audio track is declared in its own GROUP-ID without URI (inband audio).
+    Stream variants reference the appropriate audio group. HLS.js switches between
+    stream variants when audio is changed, avoiding duplicate segment requests.
     """
     streams = info.get('streams', [])
     video = next((s for s in streams if s.get('codec_type') == 'video'), None)
@@ -737,7 +771,8 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
 
     lines = ["#EXTM3U", "#EXT-X-VERSION:4", ""]
 
-    # Audio tracks - each points to a muxed stream with that audio track
+    # Build audio track metadata
+    audio_tracks = []
     for i, a in enumerate(audio_streams):
         lang = a.get('tags', {}).get('language', 'und')
         title = a.get('tags', {}).get('title', '')
@@ -752,9 +787,20 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
             lang_name = lang.upper() if lang != 'und' else f"Audio {i+1}"
             name = f"{lang_name} - {codec} {ch_str}"
 
-        default = "YES" if i == 0 else "NO"
-        # URI points to muxed video+audio stream for this audio track
-        lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",LANGUAGE="{lang}",CHANNELS="{channels}",DEFAULT={default},AUTOSELECT=YES,URI="stream_a{i}_original.m3u8"')
+        audio_tracks.append({
+            'index': i,
+            'name': name,
+            'lang': lang,
+            'channels': channels,
+            'group_id': f"audio-{i}"
+        })
+
+    # Audio track declarations - each in its own group, NO URI (audio is inband/muxed)
+    for track in audio_tracks:
+        lines.append(
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="{track["group_id"]}",NAME="{track["name"]}",'
+            f'LANGUAGE="{track["lang"]}",CHANNELS="{track["channels"]}",DEFAULT=YES,AUTOSELECT=YES'
+        )
 
     # Subtitle tracks (skip unsupported image-based formats)
     sub_counter = 0
@@ -771,26 +817,20 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
 
     lines.append("")
 
-    # Video variants - all use default audio track (a0), player switches via EXT-X-MEDIA
+    # Video variants - create variants for each audio track + quality combination
     if video:
         src_w = video.get('width', 1920)
         src_h = video.get('height', 1080)
 
         # Only reference subs group if we have supported subtitles
         subs_ref = ',SUBTITLES="subs"' if sub_counter > 0 else ''
-        audio_ref = ',AUDIO="audio"' if audio_streams else ''
 
+        # Build quality ladder
         if resolution_filter:
-            # Single quality requested (e.g., master_720p.m3u8)
-            res_name = resolution_filter
-            w, h, _ = RESOLUTIONS.get(res_name, RESOLUTIONS['original'])
-            width = w or src_w
-            height = h or src_h
-            bw = {None: 5000000, 1080: 4000000, 720: 2500000, 480: 1200000, 360: 800000}.get(h, 5000000)
-            lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={width}x{height}{audio_ref}{subs_ref}')
-            lines.append(f"stream_a0_{res_name}.m3u8")
+            quality_order = [(resolution_filter, RESOLUTIONS.get(resolution_filter, RESOLUTIONS['original'])[1],
+                             {None: 5000000, 1080: 4000000, 720: 2500000, 480: 1200000, 360: 800000}.get(
+                                 RESOLUTIONS.get(resolution_filter, RESOLUTIONS['original'])[1], 5000000))]
         else:
-            # Full ABR ladder - all qualities from source down
             quality_order = [
                 ('original', None, 5000000),
                 ('1080p', 1080, 4000000),
@@ -798,6 +838,12 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
                 ('480p', 480, 1200000),
                 ('360p', 360, 800000),
             ]
+
+        # Generate stream variants for each audio track
+        for track in audio_tracks if audio_tracks else [None]:
+            audio_idx = track['index'] if track else 0
+            audio_ref = f',AUDIO="{track["group_id"]}"' if track else ''
+
             for res_key, target_h, bw in quality_order:
                 # Skip resolutions higher than source
                 if target_h and target_h > src_h:
@@ -810,7 +856,7 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
                 height = h or src_h
                 label = f"{height}p (Original)" if res_key == 'original' else f"{height}p"
                 lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={width}x{height}{audio_ref}{subs_ref},NAME="{label}"')
-                lines.append(f"stream_a0_{res_key}.m3u8")
+                lines.append(f"stream_a{audio_idx}_{res_key}.m3u8")
 
     return "\n".join(lines) + "\n"
 
@@ -1327,6 +1373,10 @@ class Handler(BaseHTTPRequestHandler):
         if not info:
             return
 
+        # Update codec info in metrics
+        video_codec, audio_codec = extract_codecs(info)
+        segment_manager.set_codec_info(video_codec, audio_codec)
+
         data = get_or_transcode_segment(full_path, file_hash, audio, resolution, segment, info)
         if data:
             self.send_data(data, 'video/mp2t')
@@ -1338,6 +1388,10 @@ class Handler(BaseHTTPRequestHandler):
         full_path, file_hash, info = self.get_file_info(filepath)
         if not info:
             return
+
+        # Update codec info in metrics
+        video_codec, audio_codec = extract_codecs(info)
+        segment_manager.set_codec_info(video_codec, audio_codec)
 
         data = get_or_transcode_video_segment(full_path, file_hash, resolution, segment, info)
         if data:
