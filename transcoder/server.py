@@ -43,100 +43,143 @@ RESOLUTIONS = {
 X264_PRESETS = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']
 
 
-class AdaptivePreset:
+class AdaptiveQuality:
     """
-    Automatically adjusts x264 preset based on segment transcode time.
+    Coordinated adaptive quality control using both preset and CRF.
 
-    Target: 70-80% of segment duration (transcode ratio)
-    - If last ratio > 100%: EMERGENCY - drop to ultrafast immediately
-    - If last ratio > 80%: decrease quality (fast reaction to slowdowns)
-    - If avg ratio < 70%: increase quality (stable, uses average)
+    Strategy:
+    - Preset is the PRIMARY control (big impact on speed)
+    - CRF is SECONDARY (fine-tuning, only used when preset alone isn't enough)
 
-    Uses asymmetric logic:
-    - Decrease: based on LAST ratio (react fast to problems)
-    - Increase: based on AVERAGE ratio (stable, avoid oscillation)
+    Target: 60-80% of segment duration (transcode ratio)
+    - Below 60%: We have lots of headroom, can increase quality
+    - 60-80%: Sweet spot, maintain current settings
+    - Above 80%: Too slow, decrease quality
+    - Above 100%: EMERGENCY, drop to fastest settings
+
+    Coordination rules:
+    - Only increase preset quality when CRF offset is 0
+    - CRF adjusts first for fine-tuning
+    - On emergency, both drop to fastest
     """
 
-    def __init__(self, initial_preset: str = 'fast', target_min: float = 70.0, target_max: float = 80.0):
+    def __init__(self, initial_preset: str = 'fast'):
         self._lock = threading.Lock()
+
+        # Preset state
         self._preset_index = X264_PRESETS.index(initial_preset) if initial_preset in X264_PRESETS else 4
-        self._target_min = target_min  # Minimum target ratio (%)
-        self._target_max = target_max  # Maximum target ratio (%)
-        self._recent_ratios: list[float] = []  # Rolling window of recent ratios
-        self._window_size = 5  # Number of segments to consider for average
-        self._consecutive_up_signals = 0  # Consecutive signals to increase quality
-        self._hysteresis_threshold = 3  # Consecutive signals needed to increase quality
+
+        # CRF state
+        self._crf_offset = 0  # 0 to 7
+
+        # Shared state
+        self._recent_ratios: list[float] = []
+        self._window_size = 5
+        self._consecutive_good_signals = 0  # For quality increases
         self._last_change_time = 0.0
-        self._min_change_interval = 5.0  # Minimum seconds between normal preset changes
-        self._total_adjustments_up = 0  # Times we increased quality
-        self._total_adjustments_down = 0  # Times we decreased quality
+
+        # Thresholds
+        self._target_min = 60.0  # Below this, we can increase quality
+        self._target_max = 80.0  # Above this, decrease quality
+
+        # Stats
+        self._preset_ups = 0
+        self._preset_downs = 0
+        self._crf_ups = 0  # CRF increased = quality decreased
+        self._crf_downs = 0  # CRF decreased = quality increased
 
     @property
     def preset(self) -> str:
         with self._lock:
             return X264_PRESETS[self._preset_index]
 
-    def record_transcode(self, elapsed: float) -> str | None:
-        """
-        Record a transcode time and potentially adjust preset.
+    def get_crf(self, base_crf: int) -> int:
+        with self._lock:
+            return min(base_crf + self._crf_offset, 30)
 
-        Returns the new preset name if changed, None if unchanged.
+    def record_transcode(self, elapsed: float) -> dict | None:
         """
-        last_ratio = (elapsed / SEGMENT_DURATION) * 100  # Transcode ratio as percentage
+        Record transcode time and adjust quality settings.
+
+        Returns dict with changes if any, None if unchanged.
+        """
+        last_ratio = (elapsed / SEGMENT_DURATION) * 100
 
         with self._lock:
-            # Add to rolling window
             self._recent_ratios.append(last_ratio)
             if len(self._recent_ratios) > self._window_size:
                 self._recent_ratios.pop(0)
 
-            avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios) if self._recent_ratios else last_ratio
+            avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios)
             current_time = time.time()
+            changes = {}
+
             old_preset = X264_PRESETS[self._preset_index]
+            old_crf = self._crf_offset
 
-            # EMERGENCY: If last ratio > 100%, drop to ultrafast immediately
-            if last_ratio > 100 and self._preset_index > 0:
-                self._preset_index = 0  # ultrafast
-                self._total_adjustments_down += 1
-                self._consecutive_up_signals = 0
-                self._last_change_time = current_time
-                self._recent_ratios.clear()
-                print(f"[AdaptivePreset] EMERGENCY {last_ratio:.1f}% > 100% → {old_preset} → ultrafast")
-                return 'ultrafast'
+            # === EMERGENCY: ratio > 100% ===
+            if last_ratio > 100:
+                if self._preset_index > 0 or self._crf_offset < 7:
+                    self._preset_index = 0  # ultrafast
+                    self._crf_offset = 7  # max offset
+                    self._consecutive_good_signals = 0
+                    self._last_change_time = current_time
+                    self._recent_ratios.clear()
+                    self._preset_downs += 1
+                    self._crf_ups += 1
+                    print(f"[AdaptiveQuality] EMERGENCY {last_ratio:.1f}% → ultrafast, CRF +7")
+                    return {'preset': 'ultrafast', 'crf_offset': 7, 'emergency': True}
 
-            # DECREASE QUALITY: Based on LAST ratio (fast reaction)
-            if last_ratio > self._target_max and self._preset_index > 0:
-                # React immediately to slowdowns
-                self._preset_index -= 1
-                self._total_adjustments_down += 1
-                self._consecutive_up_signals = 0
-                self._last_change_time = current_time
-                new_preset = X264_PRESETS[self._preset_index]
-                print(f"[AdaptivePreset] Last {last_ratio:.1f}% > {self._target_max}% → {old_preset} → {new_preset}")
-                return new_preset
+            # === DECREASE QUALITY: last ratio > 80% ===
+            if last_ratio > self._target_max:
+                self._consecutive_good_signals = 0
 
-            # INCREASE QUALITY: Based on AVERAGE ratio (stable)
-            if avg_ratio < self._target_min:
-                self._consecutive_up_signals += 1
-            else:
-                self._consecutive_up_signals = 0
+                # First try increasing CRF (finer adjustment)
+                if self._crf_offset < 7:
+                    self._crf_offset = min(self._crf_offset + 2, 7)
+                    self._crf_ups += 1
+                    self._last_change_time = current_time
+                    print(f"[AdaptiveQuality] Last {last_ratio:.1f}% > {self._target_max}% → CRF +{old_crf} → +{self._crf_offset}")
+                    return {'crf_offset': self._crf_offset}
+                # If CRF maxed, decrease preset
+                elif self._preset_index > 0:
+                    self._preset_index -= 1
+                    self._preset_downs += 1
+                    self._last_change_time = current_time
+                    new_preset = X264_PRESETS[self._preset_index]
+                    print(f"[AdaptiveQuality] Last {last_ratio:.1f}% > {self._target_max}% → {old_preset} → {new_preset}")
+                    return {'preset': new_preset}
 
-            # Need enough consecutive signals and minimum interval
-            if self._consecutive_up_signals >= self._hysteresis_threshold:
-                if current_time - self._last_change_time >= self._min_change_interval:
-                    if self._preset_index < len(X264_PRESETS) - 1:
+            # === INCREASE QUALITY: avg ratio < 60% ===
+            elif avg_ratio < self._target_min:
+                self._consecutive_good_signals += 1
+
+                # Need 3 consecutive good signals and 5 second cooldown
+                if self._consecutive_good_signals >= 3 and current_time - self._last_change_time >= 5.0:
+                    # First decrease CRF back to 0
+                    if self._crf_offset > 0:
+                        self._crf_offset -= 1
+                        self._crf_downs += 1
+                        self._consecutive_good_signals = 0
+                        self._last_change_time = current_time
+                        print(f"[AdaptiveQuality] Avg {avg_ratio:.1f}% < {self._target_min}% → CRF +{old_crf} → +{self._crf_offset}")
+                        return {'crf_offset': self._crf_offset}
+                    # Only increase preset when CRF is at 0
+                    elif self._preset_index < len(X264_PRESETS) - 1:
                         self._preset_index += 1
-                        self._total_adjustments_up += 1
-                        self._consecutive_up_signals = 0
+                        self._preset_ups += 1
+                        self._consecutive_good_signals = 0
                         self._last_change_time = current_time
                         new_preset = X264_PRESETS[self._preset_index]
-                        print(f"[AdaptivePreset] Avg {avg_ratio:.1f}% < {self._target_min}% → {old_preset} → {new_preset}")
-                        return new_preset
+                        print(f"[AdaptiveQuality] Avg {avg_ratio:.1f}% < {self._target_min}% → {old_preset} → {new_preset}")
+                        return {'preset': new_preset}
+            else:
+                # In target range, reset signals
+                self._consecutive_good_signals = 0
 
             return None
 
-    def get_stats(self) -> dict:
-        """Get adaptive preset statistics."""
+    def get_preset_stats(self) -> dict:
         with self._lock:
             avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios) if self._recent_ratios else 0
             last_ratio = self._recent_ratios[-1] if self._recent_ratios else 0
@@ -146,14 +189,54 @@ class AdaptivePreset:
                 'target_range': f"{self._target_min:.0f}-{self._target_max:.0f}%",
                 'recent_avg_ratio': round(avg_ratio, 1),
                 'last_ratio': round(last_ratio, 1),
-                'consecutive_up_signals': self._consecutive_up_signals,
-                'adjustments_up': self._total_adjustments_up,
-                'adjustments_down': self._total_adjustments_down,
+                'consecutive_up_signals': self._consecutive_good_signals,
+                'adjustments_up': self._preset_ups,
+                'adjustments_down': self._preset_downs,
+            }
+
+    def get_crf_stats(self) -> dict:
+        with self._lock:
+            return {
+                'crf_offset': self._crf_offset,
+                'consecutive_down_signals': self._consecutive_good_signals,
+                'increases': self._crf_ups,
+                'decreases': self._crf_downs,
             }
 
 
-# Global adaptive preset manager
-adaptive_preset = AdaptivePreset(initial_preset='fast')
+# Global coordinated quality manager
+adaptive_quality = AdaptiveQuality(initial_preset='fast')
+
+# Backward-compatible accessors
+class _PresetAccessor:
+    @property
+    def preset(self):
+        return adaptive_quality.preset
+
+    def record_transcode(self, elapsed):
+        # Handled by adaptive_quality
+        pass
+
+    def get_stats(self):
+        return adaptive_quality.get_preset_stats()
+
+class _CRFAccessor:
+    def get_crf(self, base_crf):
+        return adaptive_quality.get_crf(base_crf)
+
+    @property
+    def offset(self):
+        return adaptive_quality.get_crf_stats()['crf_offset']
+
+    def record_transcode(self, elapsed):
+        # Handled by adaptive_quality
+        pass
+
+    def get_stats(self):
+        return adaptive_quality.get_crf_stats()
+
+adaptive_preset = _PresetAccessor()
+adaptive_crf = _CRFAccessor()
 
 
 class SegmentManager:
@@ -316,6 +399,7 @@ class SegmentManager:
                 'transcode_ratio_max': round(max_ratio, 1),
                 # Adaptive preset info
                 'adaptive_preset': adaptive_preset.get_stats(),
+                'adaptive_crf': adaptive_crf.get_stats(),
             }
 
     def reset_metrics(self):
@@ -381,10 +465,11 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
 
     start_offset = segment * SEGMENT_DURATION
     res_preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
-    width, height, crf = res_preset
+    width, height, base_crf = res_preset
 
-    # Get current adaptive preset
+    # Get current adaptive preset and CRF
     current_preset = adaptive_preset.preset
+    current_crf = adaptive_crf.get_crf(base_crf)
 
     # Get CPU count for threading
     cpu_count = os.cpu_count() or 8
@@ -402,7 +487,7 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         '-c:v', 'libx264',
         '-preset', current_preset,
         '-tune', 'zerolatency',
-        '-crf', str(crf),
+        '-crf', str(current_crf),
         '-pix_fmt', 'yuv420p',
         '-x264-params', f'threads={cpu_count}:lookahead_threads={min(cpu_count, 8)}',
         '-force_key_frames', 'expr:gte(t,0)',
@@ -425,7 +510,7 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
         elapsed = time.time() - start_time
         if result.returncode == 0 and os.path.exists(output):
             segment_manager.record_transcode_time(elapsed)
-            adaptive_preset.record_transcode(elapsed)
+            adaptive_quality.record_transcode(elapsed)
             return output
         print(f"FFmpeg error: {result.stderr.decode()[-200:]}")
     except Exception as e:
@@ -453,10 +538,11 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
 
     start_offset = segment * SEGMENT_DURATION
     res_preset = RESOLUTIONS.get(resolution, RESOLUTIONS['original'])
-    width, height, crf = res_preset
+    width, height, base_crf = res_preset
 
-    # Get current adaptive preset
+    # Get current adaptive preset and CRF
     current_preset = adaptive_preset.preset
+    current_crf = adaptive_crf.get_crf(base_crf)
 
     # Get CPU count for threading
     cpu_count = os.cpu_count() or 8
@@ -472,7 +558,7 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
         '-c:v', 'libx264',
         '-preset', current_preset,
         '-tune', 'zerolatency',
-        '-crf', str(crf),
+        '-crf', str(current_crf),
         '-pix_fmt', 'yuv420p',
         '-x264-params', f'threads={cpu_count}:lookahead_threads={min(cpu_count, 8)}',
         '-force_key_frames', 'expr:gte(t,0)',
@@ -493,7 +579,7 @@ def transcode_video_segment(filepath: str, file_hash: str, resolution: str, segm
         elapsed = time.time() - start_time
         if result.returncode == 0 and os.path.exists(output):
             segment_manager.record_transcode_time(elapsed)
-            adaptive_preset.record_transcode(elapsed)
+            adaptive_quality.record_transcode(elapsed)
             return output
         print(f"FFmpeg video error: {result.stderr.decode()[-200:]}")
     except Exception as e:
@@ -1385,7 +1471,7 @@ class ThreadedServer(HTTPServer):
 def main():
     print(f"HLS Transcoder starting on port {PORT}")
     print(f"Media: {MEDIA_DIR} | Cache: {CACHE_DIR} | Segment: {SEGMENT_DURATION}s")
-    print(f"Mode: Single-threaded + prefetch | Adaptive preset: target 70-80% ratio")
+    print(f"Mode: Single-threaded + prefetch | Adaptive quality: target 60-80% ratio")
     ThreadedServer(('0.0.0.0', PORT), Handler).serve_forever()
 
 

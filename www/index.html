@@ -419,75 +419,85 @@
             text-transform: uppercase;
         }
 
-        /* Adaptive Preset Display */
-        .preset-display {
-            background: rgba(0,0,0,0.2);
+        /* Adaptive Quality Display */
+        .adaptive-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+        .adaptive-item {
+            background: rgba(0,0,0,0.25);
             border-radius: 8px;
             padding: 0.75rem;
+            text-align: center;
         }
-        .preset-current {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            margin-bottom: 0.75rem;
-        }
-        .preset-label {
+        .adaptive-label {
+            font-size: 0.7rem;
             color: #888;
-            font-size: 0.8rem;
-        }
-        .preset-value {
-            font-size: 1.1rem;
-            font-weight: 700;
-            color: #4dabf7;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            margin-bottom: 0.3rem;
+            letter-spacing: 0.03em;
         }
-        .preset-bar-container {
+        .adaptive-value {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: #fff;
+            text-transform: uppercase;
             margin-bottom: 0.5rem;
         }
-        .preset-bar {
+        .adaptive-bar {
+            height: 10px;
+            border-radius: 5px;
             position: relative;
-            height: 8px;
-            background: linear-gradient(to right, #51cf66, #ffd43b, #ff6b6b);
-            border-radius: 4px;
-            margin-bottom: 0.4rem;
+            margin-bottom: 0.3rem;
         }
-        .preset-marker {
+        /* Preset bar: left=fast(orange) → right=slow(blue/quality) */
+        .adaptive-bar.preset-bar {
+            background: linear-gradient(to right, #ff922b, #ffd43b 30%, #51cf66 60%, #4dabf7);
+        }
+        /* CRF bar: left=0(green/best) → right=+7(red/fast) */
+        .adaptive-bar.crf-bar {
+            background: linear-gradient(to right, #51cf66, #ffd43b 40%, #ff922b 70%, #ff6b6b);
+        }
+        .adaptive-bar-fill {
             position: absolute;
-            top: -4px;
-            width: 16px;
-            height: 16px;
+            top: -2px;
+            height: 14px;
+            width: 6px;
             background: #fff;
-            border-radius: 50%;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
-            transform: translateX(-50%);
+            border-radius: 3px;
+            box-shadow: 0 0 6px rgba(0,0,0,0.5), 0 0 3px rgba(255,255,255,0.8);
             transition: left 0.3s ease;
+            transform: translateX(-50%);
         }
-        .preset-labels {
+        .adaptive-range {
             display: flex;
             justify-content: space-between;
             font-size: 0.6rem;
             color: #666;
+            margin-top: 0.15rem;
         }
-        .preset-stats {
+        .adaptive-range .range-good {
+            color: #51cf66;
+        }
+        .adaptive-range .range-fast {
+            color: #ff922b;
+        }
+        .adaptive-stats {
             display: flex;
-            gap: 1rem;
+            gap: 0.75rem;
             justify-content: center;
             margin-top: 0.5rem;
         }
-        .preset-stat {
-            padding: 0.25rem 0.5rem;
+        .adaptive-stats span {
+            padding: 0.2rem 0.5rem;
             background: rgba(0,0,0,0.3);
             border-radius: 4px;
             font-size: 0.75rem;
             font-weight: 600;
         }
-        .preset-stat:first-child {
-            color: #51cf66;
-        }
-        .preset-stat:last-child {
-            color: #ff6b6b;
-        }
+        .stat-up { color: #51cf66; }
+        .stat-down { color: #ff6b6b; }
 
         /* Ratio Gauge */
         .ratio-gauge {
@@ -671,27 +681,37 @@
 
                     <div class="metrics-panel" id="metricsPanel">
                         <div class="metrics-section">
-                            <h3>Adaptive Preset</h3>
-                            <div class="preset-display">
-                                <div class="preset-current">
-                                    <span class="preset-label">Current:</span>
-                                    <span class="preset-value" id="metricPreset">fast</span>
-                                </div>
-                                <div class="preset-bar-container">
-                                    <div class="preset-bar">
-                                        <div class="preset-marker" id="presetMarker"></div>
-                                        <div class="preset-labels">
-                                            <span>ultrafast</span>
-                                            <span>fast</span>
-                                            <span>medium</span>
-                                            <span>slow</span>
-                                            <span>veryslow</span>
-                                        </div>
+                            <h3>Adaptive Quality</h3>
+                            <div class="adaptive-grid">
+                                <div class="adaptive-item">
+                                    <div class="adaptive-label">Encoder Preset</div>
+                                    <div class="adaptive-value" id="metricPreset">fast</div>
+                                    <div class="adaptive-bar preset-bar">
+                                        <div class="adaptive-bar-fill" id="presetBar"></div>
+                                    </div>
+                                    <div class="adaptive-range">
+                                        <span class="range-fast">ultrafast</span>
+                                        <span class="range-good">veryslow</span>
+                                    </div>
+                                    <div class="adaptive-stats">
+                                        <span class="stat-up" id="presetAdjustUp" title="Quality increases">&#9650; 0</span>
+                                        <span class="stat-down" id="presetAdjustDown" title="Quality decreases">&#9660; 0</span>
                                     </div>
                                 </div>
-                                <div class="preset-stats">
-                                    <span class="preset-stat" id="presetAdjustUp" title="Quality increased">+0</span>
-                                    <span class="preset-stat" id="presetAdjustDown" title="Quality decreased">-0</span>
+                                <div class="adaptive-item">
+                                    <div class="adaptive-label">CRF Offset</div>
+                                    <div class="adaptive-value" id="metricCRF">+0</div>
+                                    <div class="adaptive-bar crf-bar">
+                                        <div class="adaptive-bar-fill" id="crfBar"></div>
+                                    </div>
+                                    <div class="adaptive-range">
+                                        <span class="range-good">+0 best</span>
+                                        <span class="range-fast">+7 fast</span>
+                                    </div>
+                                    <div class="adaptive-stats">
+                                        <span class="stat-up" id="crfAdjustDown" title="Quality increases">&#9650; 0</span>
+                                        <span class="stat-down" id="crfAdjustUp" title="Quality decreases">&#9660; 0</span>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -1558,11 +1578,25 @@
                     // Position marker on preset bar (0-100%)
                     const presetIndex = PRESETS.indexOf(preset.current_preset);
                     const presetPosition = presetIndex >= 0 ? (presetIndex / (PRESETS.length - 1)) * 100 : 50;
-                    document.getElementById("presetMarker").style.left = presetPosition + "%";
+                    document.getElementById("presetBar").style.left = presetPosition + "%";
 
-                    // Update adjustment counts
-                    document.getElementById("presetAdjustUp").textContent = "+" + (preset.adjustments_up || 0);
-                    document.getElementById("presetAdjustDown").textContent = "-" + (preset.adjustments_down || 0);
+                    // Update adjustment counts (▲ = quality up, ▼ = quality down)
+                    document.getElementById("presetAdjustUp").innerHTML = "&#9650; " + (preset.adjustments_up || 0);
+                    document.getElementById("presetAdjustDown").innerHTML = "&#9660; " + (preset.adjustments_down || 0);
+                }
+
+                // Update adaptive CRF display
+                if (data.adaptive_crf) {
+                    const crf = data.adaptive_crf;
+                    document.getElementById("metricCRF").textContent = "+" + (crf.crf_offset || 0);
+
+                    // Position marker on CRF bar (0-100%, where 0=+0, 100=+7)
+                    const crfPosition = ((crf.crf_offset || 0) / 7) * 100;
+                    document.getElementById("crfBar").style.left = crfPosition + "%";
+
+                    // Update adjustment counts (▲ = quality up = CRF decreased, ▼ = quality down = CRF increased)
+                    document.getElementById("crfAdjustDown").innerHTML = "&#9650; " + (crf.decreases || 0);
+                    document.getElementById("crfAdjustUp").innerHTML = "&#9660; " + (crf.increases || 0);
                 }
 
                 // Update ratio gauge
