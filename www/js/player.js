@@ -288,19 +288,44 @@ async function playTranscoded(url, fileName, isLive) {
             SP.state.actualResolution = null;
             updateModeDisplay();
 
-            // Set HLS.js to auto (ABR)
-            SP.state.hls.currentLevel = -1;
+            // For multi-audio content, we can't use ABR because it might pick a different audio track
+            // Instead, find the highest quality level for audio track 0
+            var hasMultipleAudioTracks = SP.state.transcodedAudioTracks && SP.state.transcodedAudioTracks.length > 1;
+            if (hasMultipleAudioTracks) {
+                // Find levels for audio track 0 and pick the highest quality
+                var a0Levels = SP.state.hls.levels
+                    .map(function(level, idx) { return { level: level, idx: idx }; })
+                    .filter(function(item) {
+                        var url = item.level.url && item.level.url[0];
+                        return url && url.match(/stream_a0_/);
+                    })
+                    .sort(function(a, b) { return b.level.height - a.level.height; });
+
+                if (a0Levels.length > 0) {
+                    SP.state.hls.currentLevel = a0Levels[0].idx;
+                } else {
+                    SP.state.hls.currentLevel = -1;
+                }
+            } else {
+                // Single audio track - safe to use ABR
+                SP.state.hls.currentLevel = -1;
+            }
         }
 
-        // Populate audio dropdown from HLS.js audio tracks
-        if (SP.state.hls.audioTracks && SP.state.hls.audioTracks.length > 0) {
-            SP.elements.audioSelect.innerHTML = SP.state.hls.audioTracks.map(function(track, i) {
-                var label = track.name || track.lang || "Audio " + (i + 1);
-                return '<option value="' + i + '">' + label + '</option>';
-            }).join("");
-            SP.elements.audioSelect.disabled = false;
-            SP.elements.audioSelect.value = SP.state.hls.audioTrack.toString();
-            SP.state.currentAudioIdx = SP.state.hls.audioTrack;
+        // For transcoded mode with muxed audio, keep the dropdown from parseAndPopulateTracks()
+        // since HLS.js audioTracks only shows tracks from the current audio group (1 track per group)
+        // Skip this block if we already have transcodedAudioTracks parsed from manifest
+        if (!SP.state.transcodedAudioTracks || SP.state.transcodedAudioTracks.length === 0) {
+            // Populate audio dropdown from HLS.js audio tracks (for non-muxed audio)
+            if (SP.state.hls.audioTracks && SP.state.hls.audioTracks.length > 0) {
+                SP.elements.audioSelect.innerHTML = SP.state.hls.audioTracks.map(function(track, i) {
+                    var label = track.name || track.lang || "Audio " + (i + 1);
+                    return '<option value="' + i + '">' + label + '</option>';
+                }).join("");
+                SP.elements.audioSelect.disabled = false;
+                SP.elements.audioSelect.value = SP.state.hls.audioTrack.toString();
+                SP.state.currentAudioIdx = SP.state.hls.audioTrack;
+            }
         }
 
         SP.elements.video.play().catch(function() {});

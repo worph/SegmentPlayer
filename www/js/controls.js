@@ -48,17 +48,17 @@ function initAudioControl() {
 
                 SP.state.currentAudioIdx = newAudioIdx;
 
-                // Lock to this level (disable ABR to prevent switching back to old audio)
-                SP.state.hls.currentLevel = targetLevelIdx;
-
-                // Update resolution dropdown to match
+                // Update resolution state BEFORE changing dropdown to avoid triggering resolution handler
                 var targetLevel = SP.state.hls.levels[targetLevelIdx];
                 if (targetLevel) {
-                    SP.elements.resolutionSelect.value = targetLevel.height.toString();
                     SP.state.currentResolution = targetLevel.height.toString();
                     SP.state.actualResolution = targetLevel.height;
+                    SP.elements.resolutionSelect.value = targetLevel.height.toString();
                     updateModeDisplay();
                 }
+
+                // Lock to this level (disable ABR to prevent switching back to old audio)
+                SP.state.hls.currentLevel = targetLevelIdx;
 
                 // Force buffer flush and seek to apply change immediately
                 setTimeout(function() {

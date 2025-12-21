@@ -843,6 +843,9 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
         for track in audio_tracks if audio_tracks else [None]:
             audio_idx = track['index'] if track else 0
             audio_ref = f',AUDIO="{track["group_id"]}"' if track else ''
+            # Add small bandwidth offset per audio track to prevent HLS.js deduplication
+            # HLS.js merges variants with identical bandwidth+resolution, so we need unique values
+            audio_bw_offset = audio_idx * 1000  # 1kbps per track
 
             for res_key, target_h, bw in quality_order:
                 # Skip resolutions higher than source
@@ -855,7 +858,7 @@ def generate_master_playlist(info: dict, resolution_filter: str = None) -> str:
                 width = w or src_w
                 height = h or src_h
                 label = f"{height}p (Original)" if res_key == 'original' else f"{height}p"
-                lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw},RESOLUTION={width}x{height}{audio_ref}{subs_ref},NAME="{label}"')
+                lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bw + audio_bw_offset},RESOLUTION={width}x{height}{audio_ref}{subs_ref},NAME="{label}"')
                 lines.append(f"stream_a{audio_idx}_{res_key}.m3u8")
 
     return "\n".join(lines) + "\n"
