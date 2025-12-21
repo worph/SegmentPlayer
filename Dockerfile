@@ -34,8 +34,10 @@ COPY nginx/nginx.conf /usr/local/nginx/conf/nginx.conf.template
 COPY www/ /data/www/
 COPY transcoder/ /app/
 
-# Ensure readable permissions
-RUN chmod -R 644 /data/www/* && chmod -R 644 /app/*
+# Ensure readable permissions (directories need 755, files need 644)
+RUN find /data/www -type f -exec chmod 644 {} \; && \
+    find /data/www -type d -exec chmod 755 {} \; && \
+    find /app -type f -exec chmod 644 {} \;
 
 # Create supervisord config for process management
 RUN cat > /etc/supervisord.conf <<'EOF'

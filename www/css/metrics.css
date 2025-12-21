@@ -1,0 +1,242 @@
+/* Metrics panel - adaptive quality display, ratio gauge, performance stats */
+
+.metrics-panel {
+    padding: 1rem;
+    background: var(--color-surface);
+    border-radius: var(--radius-lg);
+    font-size: 0.85rem;
+    display: none;
+}
+
+.metrics-panel.active {
+    display: block;
+}
+
+.metrics-section {
+    margin-bottom: 1.25rem;
+}
+
+.metrics-section:last-child {
+    margin-bottom: 0;
+}
+
+.metrics-panel h3 {
+    color: var(--color-cyan);
+    margin-bottom: 0.75rem;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+    gap: 0.5rem;
+}
+
+.metric-item {
+    background: rgba(0, 0, 0, 0.2);
+    padding: 0.6rem;
+    border-radius: var(--radius-md);
+    text-align: center;
+}
+
+.metric-value {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--color-text);
+}
+
+.metric-value.good {
+    color: var(--color-success);
+}
+
+.metric-value.warning {
+    color: var(--color-warning);
+}
+
+.metric-value.bad {
+    color: var(--color-danger);
+}
+
+.metric-label {
+    font-size: 0.65rem;
+    color: var(--color-text-muted);
+    margin-top: 0.2rem;
+    text-transform: uppercase;
+}
+
+/* Adaptive Quality Display */
+.adaptive-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+}
+
+.adaptive-item {
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: var(--radius-lg);
+    padding: 0.75rem;
+    text-align: center;
+}
+
+.adaptive-label {
+    font-size: 0.7rem;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    margin-bottom: 0.3rem;
+    letter-spacing: 0.03em;
+}
+
+.adaptive-value {
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: var(--color-text);
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+}
+
+.adaptive-bar {
+    height: 10px;
+    border-radius: 5px;
+    position: relative;
+    margin-bottom: 0.3rem;
+}
+
+/* Preset bar: left=fast(orange) -> right=slow(blue/quality) */
+.adaptive-bar.preset-bar {
+    background: linear-gradient(to right, var(--color-orange), var(--color-warning) 30%, var(--color-success) 60%, var(--color-primary));
+}
+
+/* CRF bar: left=0(green/best) -> right=+7(red/fast) */
+.adaptive-bar.crf-bar {
+    background: linear-gradient(to right, var(--color-success), var(--color-warning) 40%, var(--color-orange) 70%, var(--color-danger));
+}
+
+.adaptive-bar-fill {
+    position: absolute;
+    top: -2px;
+    height: 14px;
+    width: 6px;
+    background: var(--color-text);
+    border-radius: 3px;
+    box-shadow: 0 0 6px rgba(0, 0, 0, 0.5), 0 0 3px rgba(255, 255, 255, 0.8);
+    transition: left 0.3s ease;
+    transform: translateX(-50%);
+}
+
+.adaptive-range {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.6rem;
+    color: var(--color-text-dim);
+    margin-top: 0.15rem;
+}
+
+.adaptive-range .range-good {
+    color: var(--color-success);
+}
+
+.adaptive-range .range-fast {
+    color: var(--color-orange);
+}
+
+.adaptive-stats {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+    margin-top: 0.5rem;
+}
+
+.adaptive-stats span {
+    padding: 0.2rem 0.5rem;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.stat-up {
+    color: var(--color-success);
+}
+
+.stat-down {
+    color: var(--color-danger);
+}
+
+/* Ratio Gauge */
+.ratio-gauge {
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: var(--radius-lg);
+    padding: 0.75rem;
+}
+
+.ratio-bar {
+    position: relative;
+    height: 24px;
+    background: linear-gradient(to right,
+        var(--color-success) 0%, var(--color-success) 50%,
+        var(--color-warning) 50%, var(--color-warning) 70%,
+        var(--color-success) 70%, var(--color-success) 80%,
+        var(--color-warning) 80%, var(--color-warning) 90%,
+        var(--color-danger) 90%, var(--color-danger) 100%
+    );
+    border-radius: var(--radius-sm);
+    margin-bottom: 0.4rem;
+    overflow: visible;
+}
+
+.ratio-target {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.15);
+    border: 2px solid rgba(255, 255, 255, 0.4);
+    border-radius: var(--radius-sm);
+    box-sizing: border-box;
+}
+
+.ratio-needle {
+    position: absolute;
+    top: -6px;
+    width: 4px;
+    height: 36px;
+    background: var(--color-text);
+    border-radius: 2px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+    transform: translateX(-50%);
+    transition: left 0.3s ease;
+    left: 0%;
+}
+
+.ratio-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.65rem;
+    color: var(--color-text-dim);
+    padding: 0 0.25rem;
+}
+
+.ratio-labels .target-label {
+    color: var(--color-success);
+    font-weight: 600;
+}
+
+.ratio-value {
+    text-align: center;
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-top: 0.5rem;
+}
+
+.ratio-value.good {
+    color: var(--color-success);
+}
+
+.ratio-value.warning {
+    color: var(--color-warning);
+}
+
+.ratio-value.bad {
+    color: var(--color-danger);
+}
