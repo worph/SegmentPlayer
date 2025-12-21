@@ -854,12 +854,18 @@ class SubtitleManager:
             # Write to temp file first, then rename atomically to avoid partial reads
             temp_file = vtt_file + '.tmp'
 
+            # Speed optimizations:
+            # - probesize/analyzeduration: limit initial file scanning (5MB should find all streams)
+            # - vn/an: completely skip video/audio processing
             result = subprocess.run(
                 ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                 '-i', filepath, '-map', f'0:s:{sub_index}', '-c:s', 'webvtt',
-                 '-f', 'webvtt', temp_file],  # Explicit format for temp file
+                 '-probesize', '5M', '-analyzeduration', '5M',
+                 '-i', filepath,
+                 '-map', f'0:s:{sub_index}',
+                 '-vn', '-an',  # Skip video and audio entirely
+                 '-c:s', 'webvtt', '-f', 'webvtt', temp_file],
                 capture_output=True,
-                timeout=600  # Allow long extraction since it runs in background
+                timeout=600
             )
 
             if result.returncode == 0 and os.path.exists(temp_file):
@@ -1056,7 +1062,40 @@ class Handler(BaseHTTPRequestHandler):
         full_path, file_hash, info = self.get_file_info(filepath)
         if not info:
             return
+
+        # Pre-extract subtitles in background (speeds up playback)
+        self._preextract_subtitles(full_path, file_hash, info)
+
         self.send_data(generate_master_playlist(info, resolution).encode(), 'application/vnd.apple.mpegurl')
+
+    def _preextract_subtitles(self, filepath: str, file_hash: str, info: dict):
+        """Start background extraction for all supported subtitle tracks."""
+        subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
+        to_extract = []
+
+        for i, sub in enumerate(subtitle_streams):
+            codec = sub.get('codec_name', '')
+            if codec in UNSUPPORTED_SUBTITLE_CODECS:
+                continue
+
+            cache_dir = os.path.join(CACHE_DIR, file_hash)
+            vtt_file = os.path.join(cache_dir, f"subtitle_{i}.vtt")
+            error_file = os.path.join(cache_dir, f"subtitle_{i}.error")
+
+            # Skip if already cached
+            if os.path.exists(vtt_file) or os.path.exists(error_file):
+                continue
+
+            to_extract.append(i)
+
+        if to_extract:
+            print(f"[Pre-extract] Starting background extraction for {len(to_extract)} subtitle track(s)")
+            for i in to_extract:
+                key = f"{file_hash}:sub:{i}"
+                # Start extraction in background (fire and forget)
+                def extract(k=key, fp=filepath, fh=file_hash, idx=i, inf=info):
+                    subtitle_manager.get_subtitle(k, fp, fh, idx, inf, timeout=600)
+                threading.Thread(target=extract, daemon=True).start()
 
     def handle_stream(self, filepath: str, audio: int, resolution: str):
         full_path, file_hash, info = self.get_file_info(filepath)
