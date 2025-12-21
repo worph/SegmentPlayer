@@ -48,10 +48,13 @@ class AdaptivePreset:
     Automatically adjusts x264 preset based on segment transcode time.
 
     Target: 70-80% of segment duration (transcode ratio)
-    - If ratio < 70%: we have headroom, increase quality (slower preset)
-    - If ratio > 80%: too slow, decrease quality (faster preset)
+    - If last ratio > 100%: EMERGENCY - drop to ultrafast immediately
+    - If last ratio > 80%: decrease quality (fast reaction to slowdowns)
+    - If avg ratio < 70%: increase quality (stable, uses average)
 
-    Uses hysteresis (consecutive signals) to avoid oscillation.
+    Uses asymmetric logic:
+    - Decrease: based on LAST ratio (react fast to problems)
+    - Increase: based on AVERAGE ratio (stable, avoid oscillation)
     """
 
     def __init__(self, initial_preset: str = 'fast', target_min: float = 70.0, target_max: float = 80.0):
@@ -60,11 +63,11 @@ class AdaptivePreset:
         self._target_min = target_min  # Minimum target ratio (%)
         self._target_max = target_max  # Maximum target ratio (%)
         self._recent_ratios: list[float] = []  # Rolling window of recent ratios
-        self._window_size = 5  # Number of segments to consider
-        self._consecutive_signals = 0  # Positive = need faster, negative = need slower
-        self._hysteresis_threshold = 3  # Consecutive signals needed to change preset
+        self._window_size = 5  # Number of segments to consider for average
+        self._consecutive_up_signals = 0  # Consecutive signals to increase quality
+        self._hysteresis_threshold = 3  # Consecutive signals needed to increase quality
         self._last_change_time = 0.0
-        self._min_change_interval = 10.0  # Minimum seconds between preset changes
+        self._min_change_interval = 5.0  # Minimum seconds between normal preset changes
         self._total_adjustments_up = 0  # Times we increased quality
         self._total_adjustments_down = 0  # Times we decreased quality
 
@@ -79,80 +82,71 @@ class AdaptivePreset:
 
         Returns the new preset name if changed, None if unchanged.
         """
-        ratio = (elapsed / SEGMENT_DURATION) * 100  # Transcode ratio as percentage
+        last_ratio = (elapsed / SEGMENT_DURATION) * 100  # Transcode ratio as percentage
 
         with self._lock:
             # Add to rolling window
-            self._recent_ratios.append(ratio)
+            self._recent_ratios.append(last_ratio)
             if len(self._recent_ratios) > self._window_size:
                 self._recent_ratios.pop(0)
 
-            # Need enough samples
-            if len(self._recent_ratios) < self._window_size:
-                return None
-
-            avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios)
+            avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios) if self._recent_ratios else last_ratio
             current_time = time.time()
-
-            # Determine signal direction
-            if avg_ratio > self._target_max:
-                # Too slow, need faster preset
-                if self._consecutive_signals >= 0:
-                    self._consecutive_signals += 1
-                else:
-                    self._consecutive_signals = 1
-            elif avg_ratio < self._target_min:
-                # Too fast, can afford slower (higher quality) preset
-                if self._consecutive_signals <= 0:
-                    self._consecutive_signals -= 1
-                else:
-                    self._consecutive_signals = -1
-            else:
-                # In target range, reset signals
-                self._consecutive_signals = 0
-                return None
-
-            # Check if we should adjust
-            if abs(self._consecutive_signals) < self._hysteresis_threshold:
-                return None
-
-            # Respect minimum change interval
-            if current_time - self._last_change_time < self._min_change_interval:
-                return None
-
-            # Make adjustment
             old_preset = X264_PRESETS[self._preset_index]
-            if self._consecutive_signals > 0 and self._preset_index > 0:
-                # Need faster preset (lower index)
+
+            # EMERGENCY: If last ratio > 100%, drop to ultrafast immediately
+            if last_ratio > 100 and self._preset_index > 0:
+                self._preset_index = 0  # ultrafast
+                self._total_adjustments_down += 1
+                self._consecutive_up_signals = 0
+                self._last_change_time = current_time
+                self._recent_ratios.clear()
+                print(f"[AdaptivePreset] EMERGENCY {last_ratio:.1f}% > 100% → {old_preset} → ultrafast")
+                return 'ultrafast'
+
+            # DECREASE QUALITY: Based on LAST ratio (fast reaction)
+            if last_ratio > self._target_max and self._preset_index > 0:
+                # React immediately to slowdowns
                 self._preset_index -= 1
                 self._total_adjustments_down += 1
+                self._consecutive_up_signals = 0
+                self._last_change_time = current_time
                 new_preset = X264_PRESETS[self._preset_index]
-                print(f"[AdaptivePreset] Ratio {avg_ratio:.1f}% > {self._target_max}% → {old_preset} → {new_preset}")
-            elif self._consecutive_signals < 0 and self._preset_index < len(X264_PRESETS) - 1:
-                # Can afford slower preset (higher index)
-                self._preset_index += 1
-                self._total_adjustments_up += 1
-                new_preset = X264_PRESETS[self._preset_index]
-                print(f"[AdaptivePreset] Ratio {avg_ratio:.1f}% < {self._target_min}% → {old_preset} → {new_preset}")
-            else:
-                # Already at limit
-                return None
+                print(f"[AdaptivePreset] Last {last_ratio:.1f}% > {self._target_max}% → {old_preset} → {new_preset}")
+                return new_preset
 
-            self._consecutive_signals = 0
-            self._last_change_time = current_time
-            self._recent_ratios.clear()  # Reset window after change
-            return new_preset
+            # INCREASE QUALITY: Based on AVERAGE ratio (stable)
+            if avg_ratio < self._target_min:
+                self._consecutive_up_signals += 1
+            else:
+                self._consecutive_up_signals = 0
+
+            # Need enough consecutive signals and minimum interval
+            if self._consecutive_up_signals >= self._hysteresis_threshold:
+                if current_time - self._last_change_time >= self._min_change_interval:
+                    if self._preset_index < len(X264_PRESETS) - 1:
+                        self._preset_index += 1
+                        self._total_adjustments_up += 1
+                        self._consecutive_up_signals = 0
+                        self._last_change_time = current_time
+                        new_preset = X264_PRESETS[self._preset_index]
+                        print(f"[AdaptivePreset] Avg {avg_ratio:.1f}% < {self._target_min}% → {old_preset} → {new_preset}")
+                        return new_preset
+
+            return None
 
     def get_stats(self) -> dict:
         """Get adaptive preset statistics."""
         with self._lock:
             avg_ratio = sum(self._recent_ratios) / len(self._recent_ratios) if self._recent_ratios else 0
+            last_ratio = self._recent_ratios[-1] if self._recent_ratios else 0
             return {
                 'current_preset': X264_PRESETS[self._preset_index],
                 'preset_index': self._preset_index,
                 'target_range': f"{self._target_min:.0f}-{self._target_max:.0f}%",
                 'recent_avg_ratio': round(avg_ratio, 1),
-                'consecutive_signals': self._consecutive_signals,
+                'last_ratio': round(last_ratio, 1),
+                'consecutive_up_signals': self._consecutive_up_signals,
                 'adjustments_up': self._total_adjustments_up,
                 'adjustments_down': self._total_adjustments_down,
             }
