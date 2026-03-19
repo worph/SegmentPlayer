@@ -18,6 +18,10 @@ Thumbs.db
 
 # Local testing
 docker-compose.local.yml
+
+# Local media files (keep media/README.md)
+media/*
+!media/README.md
 CLAUDE.md
 .claude/settings.local.json
 benchmarks/tomato.md

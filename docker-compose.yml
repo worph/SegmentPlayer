@@ -1,0 +1,14 @@
+services:
+  segmentplayer:
+    build: .
+    ports:
+      - "9090:80"
+    volumes:
+      - ${MEDIA_DIR:-./media}:/data/media:ro
+      - segment-cache:/data/cache
+      # Dev: live-reload static files without rebuilding
+      - ./www:/data/www:ro
+    restart: unless-stopped
+
+volumes:
+  segment-cache:

@@ -34,7 +34,8 @@
             subtitleProgressText: document.getElementById("subtitleProgressText"),
 
             // Controls
-            downloadBtn: document.getElementById("downloadBtn")
+            downloadBtn: document.getElementById("downloadBtn"),
+            modeSelect: document.getElementById("modeSelect")
         };
     }
 

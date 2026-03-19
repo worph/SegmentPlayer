@@ -208,44 +208,63 @@ Tested on 16-core CPU with 4-second segments using FFmpeg 7.0.2 (libdav1d 1.4.x)
 
 **Key Finding**: The biggest improvement came from upgrading FFmpeg/libdav1d. The old libdav1d 0.8.x was the bottleneck for AV1 content (85-100% ratio). FFmpeg 7.0.2 with libdav1d 1.4.x achieves ~20-25% ratio.
 
-## Building from Source
+## Development
+
+A `docker-compose.yml` is included for local development. It mounts `./www` as a read-only volume so you can edit frontend files (HTML, CSS, JS) and refresh the browser without rebuilding the image.
 
 ```bash
-# Clone the repository
+# Clone and start
 git clone https://github.com/Worph/SegmentPlayer.git
 cd SegmentPlayer
 
+# Download test media (see media/README.md for details)
+curl -L -o media/BigBuckBunny.mp4 "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4"
+curl -L -o media/Sintel.mkv "https://ftp.nluug.nl/pub/graphics/blender/demo/movies/Sintel.2010.720p.mkv"
+
+# Build and start (defaults to ./media for video files)
+docker compose up --build
+
+# Or point to your own media library
+MEDIA_DIR=/path/to/your/videos docker compose up --build
+
+# Open http://localhost:8080 in your browser
+```
+
+Frontend changes (files in `www/`) take effect on browser refresh. Backend changes (`transcoder/server.py`, `nginx/nginx.conf`) require a rebuild:
+
+```bash
+docker compose up --build
+```
+
+### Container Management
+
+```bash
+# Stop
+docker compose down
+
+# View logs
+docker compose logs -f
+
+# Rebuild and restart
+docker compose up --build -d
+
+# Clear transcoded segment cache
+docker compose exec segmentplayer rm -rf /data/cache/*
+```
+
+## Building from Source
+
+```bash
 # Build the Docker image
 docker build -t segment-player .
 
-# Run locally
+# Run directly with docker run
 docker run -d \
   --name segment-player \
   -p 8080:80 \
   -v /path/to/videos:/data/media:ro \
   -v segment-cache:/data/cache \
   segment-player
-
-# Open http://localhost:8080 in your browser
-```
-
-### Container Management
-
-```bash
-# Stop the container
-docker stop segment-player
-
-# Start it again (faster - no rebuild needed)
-docker start segment-player
-
-# View logs
-docker logs -f segment-player
-
-# Remove container (to recreate with different settings)
-docker rm -f segment-player
-
-# Rebuild after code changes
-docker build -t segment-player . && docker rm -f segment-player && docker run -d --name segment-player -p 8080:80 -v /path/to/videos:/data/media:ro -v segment-cache:/data/cache segment-player
 ```
 
 ## License

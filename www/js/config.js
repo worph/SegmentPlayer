@@ -15,7 +15,10 @@ var SP = {
         currentTranscodeBase: "",
         transcodedAudioTracks: [],
         transcodedSubtitleTracks: [],
-        metricsInterval: null
+        metricsInterval: null,
+        playbackMode: localStorage.getItem('sp_playback_mode') || "auto",
+        activePlaybackMode: null,
+        probeData: null
     },
 
     // Configuration

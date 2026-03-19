@@ -955,6 +955,36 @@ class SubtitleManager:
 subtitle_manager = SubtitleManager()
 
 
+def _preextract_subtitles(filepath: str, file_hash: str, info: dict):
+    """Start background extraction for all supported subtitle tracks."""
+    subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
+    to_extract = []
+
+    for i, sub in enumerate(subtitle_streams):
+        codec = sub.get('codec_name', '')
+        if codec in UNSUPPORTED_SUBTITLE_CODECS:
+            continue
+
+        cache_dir = os.path.join(CACHE_DIR, file_hash)
+        vtt_file = os.path.join(cache_dir, f"subtitle_{i}.vtt")
+        error_file = os.path.join(cache_dir, f"subtitle_{i}.error")
+
+        # Skip if already cached
+        if os.path.exists(vtt_file) or os.path.exists(error_file):
+            continue
+
+        to_extract.append(i)
+
+    if to_extract:
+        print(f"[Pre-extract] Starting background extraction for {len(to_extract)} subtitle track(s)")
+        for i in to_extract:
+            key = f"{file_hash}:sub:{i}"
+            # Start extraction in background (fire and forget)
+            def extract(k=key, fp=filepath, fh=file_hash, idx=i, inf=info):
+                subtitle_manager.get_subtitle(k, fp, fh, idx, inf, timeout=600)
+            threading.Thread(target=extract, daemon=True).start()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # Quiet logging
@@ -1015,6 +1045,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/transcode/reset-metrics':
             segment_manager.reset_metrics()
             return self.send_json({'status': 'ok'})
+
+        # Probe file metadata
+        m = re.match(r'^/api/probe/(.+)$', path)
+        if m:
+            return self.handle_probe(m.group(1))
+
+        # Subtitle VTT for direct mode (embedded subtitles)
+        m = re.match(r'^/api/subtitle/(.+?)/track/(\d+)\.vtt$', path)
+        if m:
+            return self.handle_subtitle_vtt(m.group(1), int(m.group(2)))
 
         # Direct file serving
         m = re.match(r'^/direct/(.+)$', path)
@@ -1088,32 +1128,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _preextract_subtitles(self, filepath: str, file_hash: str, info: dict):
         """Start background extraction for all supported subtitle tracks."""
-        subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
-        to_extract = []
-
-        for i, sub in enumerate(subtitle_streams):
-            codec = sub.get('codec_name', '')
-            if codec in UNSUPPORTED_SUBTITLE_CODECS:
-                continue
-
-            cache_dir = os.path.join(CACHE_DIR, file_hash)
-            vtt_file = os.path.join(cache_dir, f"subtitle_{i}.vtt")
-            error_file = os.path.join(cache_dir, f"subtitle_{i}.error")
-
-            # Skip if already cached
-            if os.path.exists(vtt_file) or os.path.exists(error_file):
-                continue
-
-            to_extract.append(i)
-
-        if to_extract:
-            print(f"[Pre-extract] Starting background extraction for {len(to_extract)} subtitle track(s)")
-            for i in to_extract:
-                key = f"{file_hash}:sub:{i}"
-                # Start extraction in background (fire and forget)
-                def extract(k=key, fp=filepath, fh=file_hash, idx=i, inf=info):
-                    subtitle_manager.get_subtitle(k, fp, fh, idx, inf, timeout=600)
-                threading.Thread(target=extract, daemon=True).start()
+        _preextract_subtitles(filepath, file_hash, info)
 
     def handle_stream(self, filepath: str, audio: int, resolution: str):
         full_path, file_hash, info = self.get_file_info(filepath)
@@ -1159,6 +1174,69 @@ class Handler(BaseHTTPRequestHandler):
             # This prevents breaking the HLS stream when subtitles fail
             error_vtt = f"WEBVTT\n\nNOTE Subtitle extraction failed: {error or 'Unknown error'}\n"
             self.send_data(error_vtt.encode('utf-8'), 'text/vtt')
+
+    def handle_probe(self, filepath: str):
+        """Return file metadata for client-side playback mode detection."""
+        full_path = os.path.join(MEDIA_DIR, filepath)
+        if not os.path.exists(full_path):
+            self.send_error(404, f"File not found: {filepath}")
+            return
+
+        info = get_video_info(full_path)
+        if not info:
+            self.send_error(500, "Could not probe file")
+            return
+
+        streams = info.get('streams', [])
+        video_codec, audio_codec = extract_codecs(info)
+
+        # Get video stream details
+        video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
+        width = video_stream.get('width', 0) if video_stream else 0
+        height = video_stream.get('height', 0) if video_stream else 0
+
+        # Count tracks
+        audio_tracks = sum(1 for s in streams if s.get('codec_type') == 'audio')
+        subtitle_tracks = sum(1 for s in streams if s.get('codec_type') == 'subtitle')
+
+        # Duration
+        duration = float(info.get('format', {}).get('duration', 0))
+
+        # Container from extension
+        ext = os.path.splitext(filepath)[1].lower().lstrip('.')
+        container = ext if ext else 'unknown'
+
+        # Build subtitle list with per-track metadata
+        subtitle_streams = [s for s in streams if s.get('codec_type') == 'subtitle']
+        subtitle_list = []
+        for i, sub in enumerate(subtitle_streams):
+            codec = sub.get('codec_name', '')
+            if codec in UNSUPPORTED_SUBTITLE_CODECS:
+                continue
+            subtitle_list.append({
+                'index': i,
+                'language': sub.get('tags', {}).get('language', 'und'),
+                'title': sub.get('tags', {}).get('title', ''),
+                'codec': codec,
+            })
+
+        # Pre-extract subtitles in background so VTTs are cached before playback
+        if subtitle_list:
+            file_hash = get_file_hash(filepath)
+            full_path = os.path.join(MEDIA_DIR, filepath)
+            _preextract_subtitles(full_path, file_hash, info)
+
+        self.send_json({
+            'container': container,
+            'video_codec': video_codec,
+            'audio_codec': audio_codec,
+            'width': width,
+            'height': height,
+            'duration': duration,
+            'audio_tracks': audio_tracks,
+            'subtitle_tracks': subtitle_tracks,
+            'subtitle_list': subtitle_list,
+        })
 
     def handle_direct_file(self, filepath: str):
         """Serve raw video file with range request support for seeking."""

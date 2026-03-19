@@ -1,4 +1,4 @@
-/* Player - HLS playback, transcoding fallback */
+/* Player - Direct, HLS remux, and transcoding playback */
 
 async function resetMetrics() {
     try {
@@ -25,19 +25,147 @@ async function playFile(filePath, fileName) {
     SP.elements.downloadBtn.disabled = false;
     SP.elements.downloadBtn.title = "Download: " + fileName;
 
+    // Cleanup existing playback
     if (SP.state.hls) {
         SP.state.hls.destroy();
         SP.state.hls = null;
     }
+    SP.elements.video.removeAttribute('src');
+    SP.elements.video.load();
 
     SP.elements.audioSelect.innerHTML = '<option value="">Loading...</option>';
     SP.elements.audioSelect.disabled = true;
     SP.elements.subtitleSelect.innerHTML = '<option value="">Off</option>';
     SP.elements.subtitleSelect.disabled = true;
     SP.state.currentAudioIdx = 0;
+    SP.state.isTranscoding = false;
 
     SP.elements.video.querySelectorAll("track").forEach(function(t) { t.remove(); });
 
+    // Probe the file for codec info
+    SP.state.probeData = await getProbeData(filePath);
+
+    // Determine playback mode
+    var mode;
+    if (SP.state.playbackMode === "auto") {
+        mode = SP.state.probeData ? detectPlaybackMode(SP.state.probeData) : "remux";
+    } else if (SP.state.playbackMode === "direct") {
+        mode = "direct";
+    } else if (SP.state.playbackMode === "transcode") {
+        mode = "transcode";
+    } else {
+        mode = "remux";
+    }
+
+    SP.state.activePlaybackMode = mode;
+
+    // Route to appropriate handler
+    switch (mode) {
+        case "direct":
+            playDirect(filePath, fileName);
+            break;
+        case "remux":
+            playRemux(filePath, fileName);
+            break;
+        case "transcode":
+            var transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
+            SP.state.isTranscoding = true;
+            updateQualityDisplay();
+            playTranscoded(transcodedSrc, fileName, true);
+            break;
+    }
+}
+
+function playDirect(filePath, fileName) {
+    var videoSrc = "/direct/" + encodeFilePath(filePath);
+
+    setStatus("Direct", "#51cf66");
+
+    // Disable resolution select — no quality options in direct mode
+    SP.elements.resolutionSelect.innerHTML = '<option value="original">Original</option>';
+    SP.elements.resolutionSelect.disabled = true;
+
+    // Audio tracks — in direct mode, browser handles audio natively
+    if (SP.state.probeData && SP.state.probeData.audio_tracks > 1) {
+        // Multiple audio tracks — browser support is inconsistent
+        // Show count but note that track switching may not work
+        var opts = '';
+        for (var i = 0; i < SP.state.probeData.audio_tracks; i++) {
+            opts += '<option value="' + i + '">Track ' + (i + 1) + '</option>';
+        }
+        SP.elements.audioSelect.innerHTML = opts;
+        SP.elements.audioSelect.disabled = false;
+    } else {
+        SP.elements.audioSelect.innerHTML = '<option value="">Default</option>';
+        SP.elements.audioSelect.disabled = true;
+    }
+
+    // Set video source — native <video> element handles playback
+    SP.elements.video.src = videoSrc;
+
+    SP.elements.video.onloadedmetadata = function() {
+        setStatus("Direct", "#51cf66");
+
+        // Try to use native audioTracks API if available
+        if (SP.elements.video.audioTracks && SP.elements.video.audioTracks.length > 1) {
+            var opts = '';
+            for (var i = 0; i < SP.elements.video.audioTracks.length; i++) {
+                var track = SP.elements.video.audioTracks[i];
+                var label = track.label || track.language || 'Track ' + (i + 1);
+                opts += '<option value="' + i + '">' + label + '</option>';
+            }
+            SP.elements.audioSelect.innerHTML = opts;
+            SP.elements.audioSelect.disabled = false;
+        }
+
+        SP.elements.video.play().catch(function() {});
+    };
+
+    SP.elements.video.onerror = function() {
+        // Auto-fallback: try remux, then transcode
+        console.log("Direct playback failed, falling back...");
+        if (SP.state.probeData) {
+            var vcodec = SP.state.probeData.video_codec;
+            var acodec = SP.state.probeData.audio_codec;
+            if ((vcodec === 'h264' || vcodec === 'avc1') && (acodec === 'aac' || acodec === 'mp3')) {
+                SP.state.activePlaybackMode = "remux";
+                playRemux(filePath, fileName);
+                return;
+            }
+        }
+        SP.state.activePlaybackMode = "transcode";
+        SP.state.isTranscoding = true;
+        updateQualityDisplay();
+        tryTranscodedFallback(filePath, fileName);
+    };
+
+    // Load external subtitles, then merge with embedded subtitles from probe
+    loadExternalSubtitles(filePath).then(function() {
+        if (SP.state.probeData && SP.state.probeData.subtitle_list && SP.state.probeData.subtitle_list.length > 0) {
+            var embeddedOpts = SP.state.probeData.subtitle_list.map(function(sub) {
+                var label = sub.title || (sub.language !== 'und' ? sub.language.toUpperCase() : 'Track ' + (sub.index + 1));
+                return '<option value="embedded:' + sub.index + '">' + label + ' (embedded)</option>';
+            }).join('');
+
+            // Append embedded subs to whatever external subs are already in the dropdown
+            SP.elements.subtitleSelect.innerHTML += embeddedOpts;
+            SP.elements.subtitleSelect.disabled = false;
+        }
+    });
+}
+
+async function loadExternalSubtitles(filePath) {
+    var subs = await findSubtitles(filePath);
+    if (subs.length > 0) {
+        SP.elements.subtitleSelect.innerHTML = '<option value="">Off</option>' +
+            subs.map(function(sub) {
+                return '<option value="' + sub.path + '">' + sub.lang + '</option>';
+            }).join("");
+        SP.elements.subtitleSelect.disabled = false;
+    }
+}
+
+function playRemux(filePath, fileName) {
     var videoSrc = "/hls/" + encodeURIComponent(filePath) + "/master.m3u8";
 
     if (Hls.isSupported()) {
@@ -100,12 +228,11 @@ async function playFile(filePath, fileName) {
             setStatus("", "#51cf66");
         });
 
-        // Track actual resolution when level changes (for auto mode display)
+        // Track actual resolution when level changes
         SP.state.hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {
             if (SP.state.hls.levels && SP.state.hls.levels[data.level]) {
                 SP.state.actualResolution = SP.state.hls.levels[data.level].height;
                 updateQualityDisplay();
-                // Update Auto option in dropdown
                 var autoOption = SP.elements.resolutionSelect.querySelector('option[value="auto"]');
                 if (autoOption) {
                     autoOption.textContent = "Auto (" + SP.state.actualResolution + "p)";
@@ -127,8 +254,8 @@ async function playFile(filePath, fileName) {
 async function tryTranscodedFallback(filePath, fileName) {
     setStatus("Transcoding...", "#ffd43b", true);
 
-    // Mark as transcode mode
     SP.state.isTranscoding = true;
+    SP.state.activePlaybackMode = "transcode";
     updateQualityDisplay();
 
     var transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
@@ -152,13 +279,11 @@ function parseAndPopulateTracks(manifest) {
     var lines = manifest.split('\n');
     for (var i = 0; i < lines.length; i++) {
         var line = lines[i];
-        // Parse audio tracks from EXT-X-MEDIA declarations
         if (line.startsWith('#EXT-X-MEDIA:TYPE=AUDIO')) {
             var name = (line.match(/NAME="([^"]+)"/) || [])[1] || 'Audio';
             var uri = (line.match(/URI="([^"]+)"/) || [])[1] || '';
             SP.state.transcodedAudioTracks.push({ name: name, uri: uri });
         }
-        // Parse subtitles from EXT-X-MEDIA declarations
         else if (line.startsWith('#EXT-X-MEDIA:TYPE=SUBTITLES')) {
             var subName = (line.match(/NAME="([^"]+)"/) || [])[1] || 'Subtitle';
             var subUri = (line.match(/URI="([^"]+)"/) || [])[1] || '';
@@ -210,16 +335,13 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
         maxMaxBufferLength: SP.config.MAX_BUFFER_LENGTH * 2
     });
 
-    // Load the master playlist - HLS.js will handle audio track switching
     SP.state.hls.loadSource(url);
     SP.state.hls.attachMedia(SP.elements.video);
 
     SP.state.hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
         setStatus("", "#51cf66");
 
-        // Populate resolution dropdown from HLS.js levels
         if (SP.state.hls.levels && SP.state.hls.levels.length > 0) {
-            // Get unique heights (avoid duplicates from multiple audio tracks)
             var heightSet = {};
             SP.state.hls.levels.forEach(function(level) {
                 if (!heightSet[level.height]) {
@@ -228,7 +350,6 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
             });
             var uniqueHeights = Object.keys(heightSet).map(Number).sort(function(a, b) { return b - a; });
 
-            // First option is "Original" (highest quality)
             var originalHeight = uniqueHeights[0];
             SP.elements.resolutionSelect.innerHTML =
                 '<option value="auto">Auto</option>' +
@@ -242,11 +363,8 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
             SP.state.actualResolution = null;
             updateQualityDisplay();
 
-            // For multi-audio content, we can't use ABR because it might pick a different audio track
-            // Instead, find the highest quality level for audio track 0
             var hasMultipleAudioTracks = SP.state.transcodedAudioTracks && SP.state.transcodedAudioTracks.length > 1;
             if (hasMultipleAudioTracks) {
-                // Find levels for audio track 0 and pick the highest quality
                 var a0Levels = SP.state.hls.levels
                     .map(function(level, idx) { return { level: level, idx: idx }; })
                     .filter(function(item) {
@@ -261,16 +379,11 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
                     SP.state.hls.currentLevel = -1;
                 }
             } else {
-                // Single audio track - safe to use ABR
                 SP.state.hls.currentLevel = -1;
             }
         }
 
-        // For transcoded mode with muxed audio, keep the dropdown from parseAndPopulateTracks()
-        // since HLS.js audioTracks only shows tracks from the current audio group (1 track per group)
-        // Skip this block if we already have transcodedAudioTracks parsed from manifest
         if (!SP.state.transcodedAudioTracks || SP.state.transcodedAudioTracks.length === 0) {
-            // Populate audio dropdown from HLS.js audio tracks (for non-muxed audio)
             if (SP.state.hls.audioTracks && SP.state.hls.audioTracks.length > 0) {
                 SP.elements.audioSelect.innerHTML = SP.state.hls.audioTracks.map(function(track, i) {
                     var label = track.name || track.lang || "Audio " + (i + 1);
@@ -301,12 +414,10 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
         }
     });
 
-    // Track actual resolution when level changes (for auto mode display)
     SP.state.hls.on(Hls.Events.LEVEL_SWITCHED, function(event, data) {
         if (SP.state.hls.levels && SP.state.hls.levels[data.level]) {
             SP.state.actualResolution = SP.state.hls.levels[data.level].height;
             updateQualityDisplay();
-            // Update Auto option in dropdown
             var autoOption = SP.elements.resolutionSelect.querySelector('option[value="auto"]');
             if (autoOption) {
                 autoOption.textContent = "Auto (" + SP.state.actualResolution + "p)";

@@ -14,6 +14,41 @@ function getRatioClass(ratio) {
 
 async function fetchMetrics() {
     try {
+        var isDirect = SP.state.activePlaybackMode === "direct";
+
+        // In direct mode, show probe data instead of transcode metrics
+        if (isDirect && SP.state.probeData) {
+            var probe = SP.state.probeData;
+            document.getElementById("metricVideoCodec").textContent = probe.video_codec ? probe.video_codec.toUpperCase() : "-";
+            document.getElementById("metricAudioCodec").textContent = probe.audio_codec ? probe.audio_codec.toUpperCase() : "-";
+
+            // Hide transcode-specific metrics
+            document.getElementById("metricPreset").textContent = "-";
+            document.getElementById("metricCRF").textContent = "-";
+            document.getElementById("ratioValue").textContent = "Direct";
+            document.getElementById("ratioValue").className = "ratio-value good";
+            document.getElementById("ratioNeedle").style.left = "0%";
+
+            document.getElementById("metricRatioAvg").textContent = "-";
+            document.getElementById("metricRatioAvg").className = "metric-value";
+            document.getElementById("metricRatioLast").textContent = "-";
+            document.getElementById("metricRatioLast").className = "metric-value";
+            document.getElementById("metricRatioMin").textContent = "-";
+            document.getElementById("metricRatioMin").className = "metric-value";
+            document.getElementById("metricRatioMax").textContent = "-";
+            document.getElementById("metricRatioMax").className = "metric-value";
+            document.getElementById("metricCacheHit").textContent = "-";
+            document.getElementById("metricCacheHit").className = "metric-value";
+            document.getElementById("metricSegments").textContent = "-";
+
+            // Show resolution from probe
+            var resEl = document.getElementById("adaptiveQualityRes");
+            if (resEl) {
+                resEl.textContent = "Direct — " + probe.width + "x" + probe.height;
+            }
+            return;
+        }
+
         var response = await fetch("/transcode/metrics");
         if (!response.ok) return;
 

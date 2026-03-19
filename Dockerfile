@@ -67,6 +67,9 @@ stderr_logfile_maxbytes=0
 environment=PYTHONUNBUFFERED="1",MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080"
 EOF
 
+# Fix CRLF from Windows/WSL git checkout
+RUN sed -i 's/\r$//' /etc/supervisord.conf
+
 # Create entrypoint script to substitute env vars and start supervisord
 RUN cat > /entrypoint.sh <<'EOF'
 #!/bin/sh
@@ -75,7 +78,7 @@ envsubst '${NGINX_PORT}' < /usr/local/nginx/conf/nginx.conf.template > /usr/loca
 # Start supervisord
 exec /usr/bin/supervisord -c /etc/supervisord.conf
 EOF
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Environment variables
 ENV MEDIA_DIR=/data/media \

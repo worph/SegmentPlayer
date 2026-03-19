@@ -82,7 +82,8 @@ function initAudioControl() {
 
 function initSubtitleControl() {
     SP.elements.subtitleSelect.addEventListener("change", function() {
-        var val = parseInt(this.value);
+        var rawVal = this.value;
+        var val = parseInt(rawVal);
         SP.elements.video.querySelectorAll("track").forEach(function(t) { t.remove(); });
         for (var i = 0; i < SP.elements.video.textTracks.length; i++) {
             SP.elements.video.textTracks[i].mode = "hidden";
@@ -90,10 +91,38 @@ function initSubtitleControl() {
         SP.elements.subtitleLoading.classList.remove("active");
         hideSubtitleProgress(false);
 
-        if (val === -1 || this.value === "" || this.value === "-1") return;
+        if (val === -1 || rawVal === "" || rawVal === "-1") return;
 
         if (SP.state.hls && SP.state.hls.subtitleTracks && SP.state.hls.subtitleTracks.length > 0) {
             SP.state.hls.subtitleTrack = val;
+            return;
+        }
+
+        // Embedded subtitle track (direct mode)
+        if (rawVal.indexOf("embedded:") === 0) {
+            var subIndex = parseInt(rawVal.split(":")[1]);
+            var trackName = this.options[this.selectedIndex].text || "Track " + (subIndex + 1);
+            SP.elements.subtitleLoading.classList.add("active");
+            showSubtitleProgress(trackName);
+
+            var vttUrl = "/api/subtitle/" + encodeFilePath(SP.state.currentFile) + "/track/" + subIndex + ".vtt";
+            var track = document.createElement("track");
+            track.kind = "subtitles";
+            track.src = vttUrl;
+            track.default = true;
+            track.label = trackName;
+            SP.elements.video.appendChild(track);
+            track.addEventListener("load", function() {
+                SP.elements.subtitleLoading.classList.remove("active");
+                hideSubtitleProgress(true);
+                if (SP.elements.video.textTracks.length > 0) {
+                    SP.elements.video.textTracks[0].mode = "showing";
+                }
+            });
+            track.addEventListener("error", function() {
+                SP.elements.subtitleLoading.classList.remove("active");
+                hideSubtitleProgress(false);
+            });
             return;
         }
 
@@ -125,7 +154,7 @@ function initSubtitleControl() {
             return;
         }
 
-        if (this.value) {
+        if (rawVal) {
             var subTrackName = this.options[this.selectedIndex].text || "Subtitle";
             showSubtitleProgress(subTrackName);
 
@@ -224,9 +253,27 @@ function initDownloadControl() {
     });
 }
 
+function initModeControl() {
+    // Restore persisted mode
+    SP.elements.modeSelect.value = SP.state.playbackMode;
+
+    SP.elements.modeSelect.addEventListener("change", function() {
+        var newMode = this.value;
+        SP.state.playbackMode = newMode;
+        localStorage.setItem('sp_playback_mode', newMode);
+
+        // Re-trigger playback if a file is currently playing
+        if (SP.state.currentFile) {
+            var fileName = SP.state.currentFile.split("/").pop();
+            playFile(SP.state.currentFile, fileName);
+        }
+    });
+}
+
 function initControls() {
     initAudioControl();
     initSubtitleControl();
     initResolutionControl();
     initDownloadControl();
+    initModeControl();
 }
