@@ -220,6 +220,7 @@ cd SegmentPlayer
 # Download test media (see media/README.md for details)
 curl -L -o media/BigBuckBunny.mp4 "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4"
 curl -L -o media/Sintel.mkv "https://ftp.nluug.nl/pub/graphics/blender/demo/movies/Sintel.2010.720p.mkv"
+curl -L -o media/test5.mkv "https://github.com/ietf-wg-cellar/matroska-test-files/raw/master/test_files/test5.mkv"
 
 # Build and start (defaults to ./media for video files)
 docker compose up --build

@@ -16,10 +16,21 @@ function getLevelsForAudioTrack(audioIdx) {
 
 function initAudioControl() {
     SP.elements.audioSelect.addEventListener("change", function() {
-        if (!SP.state.hls || this.value === "") return;
+        if (this.value === "") return;
 
         var newAudioIdx = parseInt(this.value);
         if (newAudioIdx === SP.state.currentAudioIdx) return;
+
+        // Direct mode: use native audioTracks API
+        if (!SP.state.hls) {
+            if (SP.elements.video.audioTracks && SP.elements.video.audioTracks.length > 1) {
+                for (var i = 0; i < SP.elements.video.audioTracks.length; i++) {
+                    SP.elements.video.audioTracks[i].enabled = (i === newAudioIdx);
+                }
+                SP.state.currentAudioIdx = newAudioIdx;
+            }
+            return;
+        }
 
         var currentTime = SP.elements.video.currentTime;
         var wasPlaying = !SP.elements.video.paused;

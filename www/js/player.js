@@ -85,20 +85,9 @@ function playDirect(filePath, fileName) {
     SP.elements.resolutionSelect.innerHTML = '<option value="original">Original</option>';
     SP.elements.resolutionSelect.disabled = true;
 
-    // Audio tracks — in direct mode, browser handles audio natively
-    if (SP.state.probeData && SP.state.probeData.audio_tracks > 1) {
-        // Multiple audio tracks — browser support is inconsistent
-        // Show count but note that track switching may not work
-        var opts = '';
-        for (var i = 0; i < SP.state.probeData.audio_tracks; i++) {
-            opts += '<option value="' + i + '">Track ' + (i + 1) + '</option>';
-        }
-        SP.elements.audioSelect.innerHTML = opts;
-        SP.elements.audioSelect.disabled = false;
-    } else {
-        SP.elements.audioSelect.innerHTML = '<option value="">Default</option>';
-        SP.elements.audioSelect.disabled = true;
-    }
+    // Audio tracks — only show selector if native audioTracks API is available
+    SP.elements.audioSelect.innerHTML = '<option value="">Default</option>';
+    SP.elements.audioSelect.disabled = true;
 
     // Set video source — native <video> element handles playback
     SP.elements.video.src = videoSrc;
@@ -106,7 +95,7 @@ function playDirect(filePath, fileName) {
     SP.elements.video.onloadedmetadata = function() {
         setStatus("Direct", "#51cf66");
 
-        // Try to use native audioTracks API if available
+        // Only expose audio switching if browser supports the audioTracks API
         if (SP.elements.video.audioTracks && SP.elements.video.audioTracks.length > 1) {
             var opts = '';
             for (var i = 0; i < SP.elements.video.audioTracks.length; i++) {
