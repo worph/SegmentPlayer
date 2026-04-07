@@ -26,6 +26,16 @@ RUN apk add --no-cache \
     && echo "=== Checking libdav1d ===" \
     && /usr/local/bin/ffmpeg -decoders 2>&1 | grep -i dav1d
 
+# Download client-side demux/decode libraries (libav.js + WebCodecs bridge)
+RUN mkdir -p /data/www/vendor \
+    && cd /data/www/vendor \
+    && curl -sL "https://unpkg.com/@libav.js/variant-webcodecs@6/dist/libav-webcodecs.js" -o libav-webcodecs.js \
+    && curl -sL "https://unpkg.com/@libav.js/variant-webcodecs@6/dist/libav-6.8.8.0-webcodecs.wasm.js" -o libav-6.8.8.0-webcodecs.wasm.js \
+    && curl -sL "https://unpkg.com/@libav.js/variant-webcodecs@6/dist/libav-6.8.8.0-webcodecs.wasm.wasm" -o libav-6.8.8.0-webcodecs.wasm.wasm \
+    && curl -sL "https://unpkg.com/libavjs-webcodecs-bridge@0/dist/libavjs-webcodecs-bridge.js" -o libavjs-webcodecs-bridge.js \
+    && curl -sL "https://unpkg.com/libavjs-webcodecs-polyfill@0/dist/libavjs-webcodecs-polyfill.js" -o libavjs-webcodecs-polyfill.js \
+    && curl -sL "https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js" -o hls.min.js
+
 # Create directory structure
 RUN mkdir -p /data/www /data/media /data/cache /app /var/log/supervisor
 

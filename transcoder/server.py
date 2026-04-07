@@ -30,6 +30,18 @@ PREFETCH_SEGMENTS = int(os.environ.get('PREFETCH_SEGMENTS', '4'))  # How many se
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+_REAL_MEDIA_DIR = os.path.realpath(MEDIA_DIR)
+
+def validate_media_path(filepath):
+    """Resolve path and ensure it stays within MEDIA_DIR. Returns full path or None."""
+    full_path = os.path.realpath(os.path.join(MEDIA_DIR, filepath))
+    if not (full_path.startswith(_REAL_MEDIA_DIR + os.sep) or full_path == _REAL_MEDIA_DIR):
+        return None
+    return full_path
+
+# Probe cache: file_hash -> probe result dict
+_probe_cache: dict[str, dict] = {}
+
 # Resolution presets: (width, height, crf)
 RESOLUTIONS = {
     'original': (None, None, 23),
@@ -517,6 +529,13 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
 
 def get_or_transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str, segment: int, info: dict) -> bytes | None:
     """Get segment data, transcoding if necessary."""
+    # Validate segment is within file duration
+    duration = float(info.get('format', {}).get('duration', 0))
+    start_offset = segment * SEGMENT_DURATION
+    if duration > 0 and start_offset >= duration:
+        print(f"[Segment] Requested segment {segment} (offset {start_offset}s) beyond file duration ({duration:.1f}s)")
+        return None
+
     output = get_segment_path(file_hash, audio, resolution, segment)
     key = f"{file_hash}:{audio}:{resolution}:{segment}"
 
@@ -1055,7 +1074,6 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r'^/api/subtitle/(.+?)/track/(\d+)\.vtt$', path)
         if m:
             return self.handle_subtitle_vtt(m.group(1), int(m.group(2)))
-
         # Direct file serving
         m = re.match(r'^/direct/(.+)$', path)
         if m:
@@ -1104,7 +1122,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def get_file_info(self, filepath: str):
         """Get file path and info, or send error."""
-        full_path = os.path.join(MEDIA_DIR, filepath)
+        full_path = validate_media_path(filepath)
+        if full_path is None:
+            self.send_error(403, "Access denied")
+            return None, None, None
         if not os.path.exists(full_path):
             self.send_error(404, f"File not found: {filepath}")
             return None, None, None
@@ -1176,8 +1197,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_data(error_vtt.encode('utf-8'), 'text/vtt')
 
     def handle_probe(self, filepath: str):
-        """Return file metadata for client-side playback mode detection."""
-        full_path = os.path.join(MEDIA_DIR, filepath)
+        """Return file metadata for playback mode detection and client-side demux."""
+        full_path = validate_media_path(filepath)
+        if full_path is None:
+            self.send_error(403, "Access denied")
+            return
+
+        file_hash = get_file_hash(filepath)
+
+        # Check cache first
+        if file_hash in _probe_cache:
+            return self.send_json(_probe_cache[file_hash])
+
         if not os.path.exists(full_path):
             self.send_error(404, f"File not found: {filepath}")
             return
@@ -1187,60 +1218,104 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(500, "Could not probe file")
             return
 
+        fmt = info.get('format', {})
         streams = info.get('streams', [])
         video_codec, audio_codec = extract_codecs(info)
 
-        # Get video stream details
-        video_stream = next((s for s in streams if s.get('codec_type') == 'video'), None)
-        width = video_stream.get('width', 0) if video_stream else 0
-        height = video_stream.get('height', 0) if video_stream else 0
-
-        # Count tracks
-        audio_tracks = sum(1 for s in streams if s.get('codec_type') == 'audio')
-        subtitle_tracks = sum(1 for s in streams if s.get('codec_type') == 'subtitle')
-
-        # Duration
-        duration = float(info.get('format', {}).get('duration', 0))
-
-        # Container from extension
+        # Container from extension (for detectPlaybackMode compatibility)
         ext = os.path.splitext(filepath)[1].lower().lstrip('.')
         container = ext if ext else 'unknown'
 
-        # Build subtitle list with per-track metadata
-        subtitle_streams = [s for s in streams if s.get('codec_type') == 'subtitle']
-        subtitle_list = []
-        for i, sub in enumerate(subtitle_streams):
-            codec = sub.get('codec_name', '')
-            if codec in UNSUPPORTED_SUBTITLE_CODECS:
-                continue
-            subtitle_list.append({
-                'index': i,
-                'language': sub.get('tags', {}).get('language', 'und'),
-                'title': sub.get('tags', {}).get('title', ''),
-                'codec': codec,
-            })
+        # Duration
+        duration = 0.0
+        try:
+            duration = float(fmt.get('duration', 0))
+        except (ValueError, TypeError):
+            pass
 
-        # Pre-extract subtitles in background so VTTs are cached before playback
+        # Build detailed stream info
+        video_info = None
+        audio_list = []
+        subtitle_list = []
+
+        for stream in streams:
+            codec_type = stream.get('codec_type')
+            if codec_type == 'video' and video_info is None:
+                pix_fmt = stream.get('pix_fmt', '')
+                bit_depth = 10 if '10' in pix_fmt else 8
+
+                fps = 0.0
+                r_frame_rate = stream.get('r_frame_rate', '0/1')
+                try:
+                    num, den = r_frame_rate.split('/')
+                    fps = round(int(num) / int(den), 3) if int(den) != 0 else 0.0
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+                video_info = {
+                    'codec': stream.get('codec_name'),
+                    'profile': stream.get('profile'),
+                    'width': stream.get('width', 0),
+                    'height': stream.get('height', 0),
+                    'bit_depth': bit_depth,
+                    'fps': fps,
+                    'bitrate': int(stream.get('bit_rate', 0) or 0),
+                }
+
+            elif codec_type == 'audio':
+                tags = stream.get('tags', {})
+                audio_list.append({
+                    'index': len(audio_list),
+                    'codec': stream.get('codec_name'),
+                    'channels': stream.get('channels', 0),
+                    'sample_rate': int(stream.get('sample_rate', 0) or 0),
+                    'language': tags.get('language', ''),
+                    'title': tags.get('title', ''),
+                })
+
+            elif codec_type == 'subtitle':
+                codec = stream.get('codec_name', '')
+                if codec in UNSUPPORTED_SUBTITLE_CODECS:
+                    continue
+                tags = stream.get('tags', {})
+                subtitle_list.append({
+                    'index': len(subtitle_list),
+                    'codec': codec,
+                    'language': tags.get('language', 'und'),
+                    'title': tags.get('title', ''),
+                })
+
+        # Pre-extract subtitles in background
         if subtitle_list:
-            file_hash = get_file_hash(filepath)
-            full_path = os.path.join(MEDIA_DIR, filepath)
             _preextract_subtitles(full_path, file_hash, info)
 
-        self.send_json({
+        probe_result = {
+            # Flat fields (used by detectPlaybackMode / direct mode)
             'container': container,
             'video_codec': video_codec,
             'audio_codec': audio_codec,
-            'width': width,
-            'height': height,
+            'width': video_info['width'] if video_info else 0,
+            'height': video_info['height'] if video_info else 0,
             'duration': duration,
-            'audio_tracks': audio_tracks,
-            'subtitle_tracks': subtitle_tracks,
+            'audio_tracks': len(audio_list),
+            'subtitle_tracks': len(subtitle_list),
             'subtitle_list': subtitle_list,
-        })
+            # Nested fields (used by client-side demux)
+            'file_size': int(fmt.get('size', 0) or 0),
+            'video': video_info,
+            'audio': audio_list,
+            'subtitles': subtitle_list,
+        }
+
+        _probe_cache[file_hash] = probe_result
+        self.send_json(probe_result)
 
     def handle_direct_file(self, filepath: str):
         """Serve raw video file with range request support for seeking."""
-        full_path = os.path.join(MEDIA_DIR, filepath)
+        full_path = validate_media_path(filepath)
+        if full_path is None:
+            self.send_error(403, "Access denied")
+            return
         if not os.path.exists(full_path):
             self.send_error(404, f"File not found: {filepath}")
             return

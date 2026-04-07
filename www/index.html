@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SegmentPlayer - Media Browser</title>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="vendor/hls.min.js"></script>
     <link rel="stylesheet" href="css/base.css">
     <link rel="stylesheet" href="css/layout.css">
     <link rel="stylesheet" href="css/browse.css">
@@ -84,6 +84,7 @@
                                 <select id="modeSelect">
                                     <option value="auto">Auto</option>
                                     <option value="direct">Direct</option>
+                                    <option value="client">Client</option>
                                     <option value="transcode">Transcode</option>
                                 </select>
                             </div>
@@ -214,6 +215,12 @@
     <script src="js/config.js"></script>
     <script src="js/utils.js"></script>
     <script src="js/ui.js"></script>
+    <script src="js/codec-detect.js"></script>
+    <script src="js/client-demuxer.js"></script>
+    <script src="js/client-muxer.js"></script>
+    <script src="js/audio-reencode.js"></script>
+    <script src="js/client-subtitles.js"></script>
+    <script src="js/client-player.js"></script>
     <script src="js/router.js"></script>
     <script src="js/browser.js"></script>
     <script src="js/player.js"></script>

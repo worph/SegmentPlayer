@@ -18,6 +18,11 @@ function switchToBrowseMode() {
         SP.state.hls.destroy();
         SP.state.hls = null;
     }
+    if (SP.state.clientPlayer) {
+        SP.state.clientPlayer.cleanup();
+        SP.state.clientPlayer = null;
+    }
+    SP.state.isClientSide = false;
     SP.elements.video.src = "";
     SP.state.currentFile = null;
 

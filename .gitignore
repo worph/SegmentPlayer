@@ -22,6 +22,9 @@ docker-compose.local.yml
 # Local media files (keep media/README.md)
 media/*
 !media/README.md
+
+# Vendor libs (downloaded during docker build / dev setup)
+www/vendor/
 CLAUDE.md
 .claude/settings.local.json
 benchmarks/tomato.md

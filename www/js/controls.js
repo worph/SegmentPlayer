@@ -19,7 +19,14 @@ function initAudioControl() {
         if (this.value === "") return;
 
         var newAudioIdx = parseInt(this.value);
-        if (newAudioIdx === SP.state.currentAudioIdx) return;
+        if (isNaN(newAudioIdx) || newAudioIdx === SP.state.currentAudioIdx) return;
+
+        // Client-side playback: switch audio track via ClientPlayer
+        if (SP.state.isClientSide && SP.state.clientPlayer) {
+            SP.state.clientPlayer.switchAudioTrack(newAudioIdx, SP.elements.video.currentTime);
+            SP.state.currentAudioIdx = newAudioIdx;
+            return;
+        }
 
         // Direct mode: use native audioTracks API
         if (!SP.state.hls) {
@@ -95,7 +102,7 @@ function initSubtitleControl() {
     SP.elements.subtitleSelect.addEventListener("change", function() {
         var rawVal = this.value;
         var val = parseInt(rawVal);
-        SP.elements.video.querySelectorAll("track").forEach(function(t) { t.remove(); });
+        removeAllTracks(SP.elements.video);
         for (var i = 0; i < SP.elements.video.textTracks.length; i++) {
             SP.elements.video.textTracks[i].mode = "hidden";
         }
@@ -109,10 +116,26 @@ function initSubtitleControl() {
             return;
         }
 
-        // Embedded subtitle track (direct mode)
+        // Embedded subtitle track
         if (rawVal.indexOf("embedded:") === 0) {
             var subIndex = parseInt(rawVal.split(":")[1]);
             var trackName = this.options[this.selectedIndex].text || "Track " + (subIndex + 1);
+
+            // Client-side mode: extract subtitles via libav.js
+            if (SP.state.isClientSide && SP.state.clientPlayer) {
+                SP.elements.subtitleLoading.classList.add("active");
+                showSubtitleProgress(trackName);
+                SP.state.clientPlayer.loadSubtitleTrack(subIndex).then(function() {
+                    SP.elements.subtitleLoading.classList.remove("active");
+                    hideSubtitleProgress(true);
+                }).catch(function() {
+                    SP.elements.subtitleLoading.classList.remove("active");
+                    hideSubtitleProgress(false);
+                });
+                return;
+            }
+
+            // Direct/other modes: extract via server API
             SP.elements.subtitleLoading.classList.add("active");
             showSubtitleProgress(trackName);
 
@@ -264,6 +287,16 @@ function initDownloadControl() {
     });
 }
 
+function updateAutoModeLabel() {
+    var autoOption = SP.elements.modeSelect.querySelector('option[value="auto"]');
+    if (!autoOption) return;
+    if (SP.state.activePlaybackMode && SP.state.playbackMode === "auto") {
+        autoOption.textContent = "Auto (" + SP.state.activePlaybackMode + ")";
+    } else {
+        autoOption.textContent = "Auto";
+    }
+}
+
 function initModeControl() {
     // Restore persisted mode
     SP.elements.modeSelect.value = SP.state.playbackMode;
@@ -272,6 +305,7 @@ function initModeControl() {
         var newMode = this.value;
         SP.state.playbackMode = newMode;
         localStorage.setItem('sp_playback_mode', newMode);
+        updateAutoModeLabel();
 
         // Re-trigger playback if a file is currently playing
         if (SP.state.currentFile) {

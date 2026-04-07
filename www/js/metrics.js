@@ -1,5 +1,12 @@
 /* Metrics panel - transcode stats and adaptive quality display */
 
+function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
+    if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + " MB";
+    return (bytes / 1073741824).toFixed(2) + " GB";
+}
+
 function formatRatio(ratio) {
     return ratio ? ratio.toFixed(1) + "%" : "-";
 }
@@ -15,36 +22,61 @@ function getRatioClass(ratio) {
 async function fetchMetrics() {
     try {
         var isDirect = SP.state.activePlaybackMode === "direct";
+        var isClient = SP.state.isClientSide;
 
-        // In direct mode, show probe data instead of transcode metrics
-        if (isDirect && SP.state.probeData) {
+        // In direct or client-side mode, show probe data instead of transcode metrics
+        if ((isDirect || isClient) && SP.state.probeData) {
             var probe = SP.state.probeData;
-            document.getElementById("metricVideoCodec").textContent = probe.video_codec ? probe.video_codec.toUpperCase() : "-";
-            document.getElementById("metricAudioCodec").textContent = probe.audio_codec ? probe.audio_codec.toUpperCase() : "-";
+            var videoCodec = (probe.video && probe.video.codec) || "-";
+            var audioCodec = (probe.audio && probe.audio[0] && probe.audio[0].codec) || "-";
+
+            document.getElementById("metricVideoCodec").textContent = videoCodec.toUpperCase() +
+                (isClient ? " (transmux)" : "");
+            document.getElementById("metricAudioCodec").textContent = audioCodec.toUpperCase() +
+                (isClient && SP.state.clientPlayer && SP.state.clientPlayer._needsAudioReencode ? " → OPUS" : "");
 
             // Hide transcode-specific metrics
             document.getElementById("metricPreset").textContent = "-";
             document.getElementById("metricCRF").textContent = "-";
-            document.getElementById("ratioValue").textContent = "Direct";
+
+            var modeLabel = isClient ? "Client" : "Direct";
+            document.getElementById("ratioValue").textContent = modeLabel;
             document.getElementById("ratioValue").className = "ratio-value good";
             document.getElementById("ratioNeedle").style.left = "0%";
 
-            document.getElementById("metricRatioAvg").textContent = "-";
-            document.getElementById("metricRatioAvg").className = "metric-value";
-            document.getElementById("metricRatioLast").textContent = "-";
-            document.getElementById("metricRatioLast").className = "metric-value";
-            document.getElementById("metricRatioMin").textContent = "-";
-            document.getElementById("metricRatioMin").className = "metric-value";
-            document.getElementById("metricRatioMax").textContent = "-";
-            document.getElementById("metricRatioMax").className = "metric-value";
+            // Client-side stats
+            if (isClient && SP.state.clientPlayer && SP.state.clientPlayer.stats) {
+                var stats = SP.state.clientPlayer.stats;
+                var elapsed = (Date.now() - stats.startTime) / 1000;
+                var speed = elapsed > 0 ? stats.bytesRead / elapsed : 0;
+                var bufferAhead = getBufferedAhead(SP.elements.video);
+
+                document.getElementById("metricRatioAvg").textContent = formatBytes(stats.bytesRead);
+                document.getElementById("metricRatioAvg").className = "metric-value";
+                document.getElementById("metricRatioLast").textContent = formatBytes(speed) + "/s";
+                document.getElementById("metricRatioLast").className = "metric-value";
+                document.getElementById("metricRatioMin").textContent = bufferAhead.toFixed(1) + "s";
+                document.getElementById("metricRatioMin").className = "metric-value good";
+                document.getElementById("metricRatioMax").textContent = stats.packetsRead + " pkts";
+                document.getElementById("metricRatioMax").className = "metric-value";
+            } else {
+                document.getElementById("metricRatioAvg").textContent = "-";
+                document.getElementById("metricRatioAvg").className = "metric-value";
+                document.getElementById("metricRatioLast").textContent = "-";
+                document.getElementById("metricRatioLast").className = "metric-value";
+                document.getElementById("metricRatioMin").textContent = "-";
+                document.getElementById("metricRatioMin").className = "metric-value";
+                document.getElementById("metricRatioMax").textContent = "-";
+                document.getElementById("metricRatioMax").className = "metric-value";
+            }
+
             document.getElementById("metricCacheHit").textContent = "-";
             document.getElementById("metricCacheHit").className = "metric-value";
             document.getElementById("metricSegments").textContent = "-";
 
-            // Show resolution from probe
             var resEl = document.getElementById("adaptiveQualityRes");
             if (resEl) {
-                resEl.textContent = "Direct — " + probe.width + "x" + probe.height;
+                resEl.textContent = modeLabel + " — " + (probe.video ? probe.video.width : "?") + "x" + (probe.video ? probe.video.height : "?");
             }
             return;
         }
