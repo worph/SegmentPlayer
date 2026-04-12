@@ -109,7 +109,14 @@ function initSubtitleControl() {
         SP.elements.subtitleLoading.classList.remove("active");
         hideSubtitleProgress(false);
 
-        if (val === -1 || rawVal === "" || rawVal === "-1") return;
+        if (val === -1 || rawVal === "" || rawVal === "-1") {
+            // Clear active subtitle track in client mode
+            if (SP.state.isClientSide && SP.state.clientPlayer) {
+                SP.state.clientPlayer._activeSubtitleTrack = -1;
+                SP.state.clientPlayer._activeSubtitleAbsIdx = -1;
+            }
+            return;
+        }
 
         if (SP.state.hls && SP.state.hls.subtitleTracks && SP.state.hls.subtitleTracks.length > 0) {
             SP.state.hls.subtitleTrack = val;
@@ -121,16 +128,10 @@ function initSubtitleControl() {
             var subIndex = parseInt(rawVal.split(":")[1]);
             var trackName = this.options[this.selectedIndex].text || "Track " + (subIndex + 1);
 
-            // Client-side mode: extract subtitles via libav.js
+            // Client-side mode: use piggybacked subtitle packets (no server needed)
             if (SP.state.isClientSide && SP.state.clientPlayer) {
-                SP.elements.subtitleLoading.classList.add("active");
-                showSubtitleProgress(trackName);
-                SP.state.clientPlayer.loadSubtitleTrack(subIndex).then(function() {
-                    SP.elements.subtitleLoading.classList.remove("active");
-                    hideSubtitleProgress(true);
-                }).catch(function() {
-                    SP.elements.subtitleLoading.classList.remove("active");
-                    hideSubtitleProgress(false);
+                SP.state.clientPlayer.loadSubtitleTrack(subIndex).catch(function(err) {
+                    console.error("[Subtitles] Client extraction error:", err);
                 });
                 return;
             }

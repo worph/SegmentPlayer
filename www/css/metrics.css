@@ -20,6 +20,52 @@
     margin-bottom: 0;
 }
 
+/* Mode banner — shows active playback tier */
+.metrics-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: var(--radius-md);
+    margin-bottom: 1rem;
+}
+
+.mode-badge {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.25rem 0.6rem;
+    border-radius: var(--radius-sm);
+    background: var(--color-primary);
+    color: white;
+}
+
+.metrics-panel.mode-client .mode-badge { background: var(--color-success); }
+.metrics-panel.mode-transcode .mode-badge { background: var(--color-warning); color: #000; }
+.metrics-panel.mode-direct .mode-badge { background: var(--color-primary); }
+.metrics-panel.mode-remux .mode-badge { background: var(--color-cyan); color: #000; }
+
+.mode-detail {
+    font-size: 0.8rem;
+    color: var(--color-text-muted);
+}
+
+/* Per-mode section visibility — panel gets a `mode-{name}` class, sections
+   with mismatched `.metric-section--{name}` class stay hidden. Common
+   sections don't have a mode modifier so they're always visible. */
+.metric-section--client,
+.metric-section--hls,
+.metric-section--transcode {
+    display: none;
+}
+
+.metrics-panel.mode-client .metric-section--client { display: block; }
+.metrics-panel.mode-remux .metric-section--hls { display: block; }
+.metrics-panel.mode-transcode .metric-section--hls,
+.metrics-panel.mode-transcode .metric-section--transcode { display: block; }
+
 .metrics-panel h3 {
     color: var(--color-cyan);
     margin-bottom: 0.75rem;

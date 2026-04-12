@@ -49,24 +49,42 @@ ClientSubtitleExtractor.prototype.extract = async function(subStreamIndex, codec
         return "WEBVTT\n\n";
     }
 
-    // Get stream time base for timestamp conversion
     var stream = this.demuxer.streams[subStreamIndex];
     var timeBase = 1;
     if (stream && stream.time_base_num && stream.time_base_den) {
         timeBase = stream.time_base_num / stream.time_base_den;
     }
 
-    // Convert packets to WebVTT
+    return buildVTTFromPackets(subtitlePackets, timeBase, codec);
+};
+
+// Build a WebVTT string from an array of subtitle packets.
+// Reusable by both the full-file extractor and piggyback collection.
+function buildVTTFromPackets(packets, timeBase, codec) {
+    if (!packets || packets.length === 0) return "WEBVTT\n\n";
+
+    // Sort by PTS so packets collected out-of-order (e.g. after seeks) are correct
+    var sorted = packets.slice().sort(function(a, b) {
+        return (a.pts || 0) - (b.pts || 0);
+    });
+
+    // Deduplicate by PTS (same subtitle collected from overlapping reads)
+    var deduped = [sorted[0]];
+    for (var i = 1; i < sorted.length; i++) {
+        if (sorted[i].pts !== sorted[i - 1].pts) {
+            deduped.push(sorted[i]);
+        }
+    }
+
     var vtt = "WEBVTT\n\n";
     var decoder = new TextDecoder("utf-8");
 
-    for (var i = 0; i < subtitlePackets.length; i++) {
-        var pkt = subtitlePackets[i];
+    for (var i = 0; i < deduped.length; i++) {
+        var pkt = deduped[i];
         var startTime = (pkt.pts || 0) * timeBase;
         var duration = (pkt.duration || 0) * timeBase;
         var endTime = startTime + duration;
 
-        // Skip packets with no duration or negative times
         if (duration <= 0 || startTime < 0) continue;
 
         var text = decoder.decode(pkt.data);
@@ -79,7 +97,7 @@ ClientSubtitleExtractor.prototype.extract = async function(subStreamIndex, codec
     }
 
     return vtt;
-};
+}
 
 // Decode subtitle text based on codec format
 function decodeSubtitleText(raw, codec) {
@@ -108,12 +126,24 @@ function stripSRTFormatting(text) {
 
 // Parse ASS/SSA Dialogue line to plain text
 function parseASSDialogue(text) {
-    // ASS format: Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-    // The text we get from libav.js is usually just the Text field
-    // But sometimes the full line is included
+    // Full Dialogue line: Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     var match = text.match(/^Dialogue:\s*\d+,[^,]*,[^,]*,[^,]*,[^,]*,\d+,\d+,\d+,[^,]*,(.*)$/);
     if (match) {
         text = match[1];
+    } else {
+        // libav.js packet data: ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+        // (no Dialogue: prefix, no timestamps — those are in packet metadata)
+        // Skip 8 comma-separated fields to get the actual text
+        var commaCount = 0;
+        for (var i = 0; i < text.length; i++) {
+            if (text[i] === ",") {
+                commaCount++;
+                if (commaCount === 8) {
+                    text = text.substring(i + 1);
+                    break;
+                }
+            }
+        }
     }
 
     return text

@@ -4,6 +4,38 @@ async function resetMetrics() {
     try {
         await fetch("/transcode/reset-metrics");
     } catch (e) {}
+    // Reset local per-session HLS stats so level-switch counts don't leak
+    // across file loads.
+    SP.state.hlsStats = { levelSwitches: 0, lastFragMs: 0, lastFragBytes: 0, fragLoadedAt: 0 };
+}
+
+// Install HLS telemetry hooks on a newly-created hls.js instance. Shared by
+// playRemux and playTranscoded.
+function attachHlsStatsHooks(hls) {
+    if (!hls) return;
+    SP.state.hlsStats = SP.state.hlsStats || { levelSwitches: 0, lastFragMs: 0, lastFragBytes: 0, fragLoadedAt: 0 };
+    var fragStartMap = {};
+    hls.on(Hls.Events.FRAG_LOADING, function(event, data) {
+        var url = data && data.frag && data.frag.url;
+        if (url) fragStartMap[url] = performance.now();
+    });
+    hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
+        var url = data && data.frag && data.frag.url;
+        var startedAt = url ? fragStartMap[url] : undefined;
+        if (startedAt) {
+            SP.state.hlsStats.lastFragMs = Math.round(performance.now() - startedAt);
+            delete fragStartMap[url];
+        }
+        if (data && data.payload) {
+            SP.state.hlsStats.lastFragBytes = data.payload.byteLength || 0;
+        } else if (data && data.frag && data.frag.stats && data.frag.stats.total) {
+            SP.state.hlsStats.lastFragBytes = data.frag.stats.total;
+        }
+        SP.state.hlsStats.fragLoadedAt = performance.now();
+    });
+    hls.on(Hls.Events.LEVEL_SWITCHED, function() {
+        SP.state.hlsStats.levelSwitches = (SP.state.hlsStats.levelSwitches || 0) + 1;
+    });
 }
 
 // Common setup shared by all playback tiers
@@ -332,6 +364,7 @@ function playRemux(filePath, fileName) {
 
         SP.state.hls.loadSource(videoSrc);
         SP.state.hls.attachMedia(SP.elements.video);
+        attachHlsStatsHooks(SP.state.hls);
 
         SP.state.hls.on(Hls.Events.MANIFEST_PARSED, async function(event, data) {
             setStatus("Ready", "#51cf66");
@@ -511,6 +544,7 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
 
     SP.state.hls.loadSource(url);
     SP.state.hls.attachMedia(SP.elements.video);
+    attachHlsStatsHooks(SP.state.hls);
 
     SP.state.hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
         setStatus("", "#51cf66");

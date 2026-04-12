@@ -974,6 +974,196 @@ class SubtitleManager:
 subtitle_manager = SubtitleManager()
 
 
+# Audio codecs that can be packed into an mp4 container via `-c copy`.
+# For anything else we fall back to `-c:a aac` re-encode.
+_MP4_COMPATIBLE_AUDIO_CODECS = {
+    'aac', 'ac3', 'eac3', 'mp3', 'alac', 'opus',
+}
+
+
+def get_audio_stream_info(info: dict, track_index: int) -> dict | None:
+    """Get audio stream metadata by audio-track index (0-based, among audio streams only)."""
+    audio_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'audio']
+    if track_index < len(audio_streams):
+        return audio_streams[track_index]
+    return None
+
+
+class AudioManager:
+    """
+    Extracts and caches audio-only .m4a streams from source files.
+
+    Same concurrency model as SubtitleManager: background extraction dedup'd
+    per (file_hash, track_index), disk cache survives restarts, concurrent
+    requests share a single extraction.
+
+    Purpose: the client-side player plays the main video via MediaSource but
+    needs audio separately. Pointing a <audio> element at the raw source
+    container (e.g. MKV) makes Chrome allocate a D3D11VideoDecoder for the
+    video track inside it (visible in chrome://media-internals), which
+    contends with the main MSE decode pipeline. Serving an audio-only mp4
+    fragment eliminates that duplicate decoder.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # key -> (event, result_holder) where result_holder[0] is (path, error)
+        self._extractions: dict[str, tuple[threading.Event, list]] = {}
+
+    def get_audio_path(self, key: str, filepath: str, file_hash: str,
+                        track_index: int, info: dict = None,
+                        timeout: float = 300) -> tuple[str | None, str | None]:
+        """
+        Return a path to the cached audio-only .m4a file, extracting if needed.
+
+        Returns: (path, error_message) — exactly one is non-None.
+        """
+        cache_dir = os.path.join(CACHE_DIR, file_hash)
+        m4a_file = os.path.join(cache_dir, f"audio_{track_index}.m4a")
+        error_file = os.path.join(cache_dir, f"audio_{track_index}.error")
+
+        # Fast path: already cached
+        if os.path.exists(m4a_file):
+            return m4a_file, None
+        if os.path.exists(error_file):
+            with open(error_file, 'r', encoding='utf-8') as f:
+                return None, f.read()
+
+        with self._lock:
+            # Re-check after lock — another thread may have finished.
+            if os.path.exists(m4a_file):
+                return m4a_file, None
+            if os.path.exists(error_file):
+                with open(error_file, 'r', encoding='utf-8') as f:
+                    return None, f.read()
+
+            if key in self._extractions:
+                event, result_holder = self._extractions[key]
+                print(f"[Audio {track_index}] Waiting for in-progress extraction...")
+            else:
+                event = threading.Event()
+                result_holder = [None]
+                self._extractions[key] = (event, result_holder)
+                thread = threading.Thread(
+                    target=self._extract_background,
+                    args=(key, filepath, file_hash, track_index, info, event, result_holder),
+                    daemon=True,
+                )
+                thread.start()
+
+        completed = event.wait(timeout=timeout)
+        if completed:
+            if result_holder[0] is not None:
+                return result_holder[0]
+            # Fall back to disk
+            if os.path.exists(m4a_file):
+                return m4a_file, None
+            if os.path.exists(error_file):
+                with open(error_file, 'r', encoding='utf-8') as f:
+                    return None, f.read()
+            return None, "Extraction completed but result not found"
+        return None, f"Audio extraction timed out after {timeout}s"
+
+    def _extract_background(self, key, filepath, file_hash, track_index, info,
+                            event, result_holder):
+        try:
+            result = self._do_extract(filepath, file_hash, track_index, info)
+            result_holder[0] = result
+        except Exception as e:
+            result_holder[0] = (None, f"Extraction thread error: {e}")
+        finally:
+            event.set()
+            def cleanup():
+                time.sleep(30)
+                with self._lock:
+                    self._extractions.pop(key, None)
+            threading.Thread(target=cleanup, daemon=True).start()
+
+    def _do_extract(self, filepath: str, file_hash: str, track_index: int,
+                    info: dict) -> tuple[str | None, str | None]:
+        cache_dir = os.path.join(CACHE_DIR, file_hash)
+        os.makedirs(cache_dir, exist_ok=True)
+        m4a_file = os.path.join(cache_dir, f"audio_{track_index}.m4a")
+        temp_file = m4a_file + '.tmp'
+        error_file = os.path.join(cache_dir, f"audio_{track_index}.error")
+
+        # Double-check cache (raced through lock)
+        if os.path.exists(m4a_file):
+            return m4a_file, None
+        if os.path.exists(error_file):
+            with open(error_file, 'r', encoding='utf-8') as f:
+                return None, f.read()
+
+        # Choose between -c copy and -c:a aac based on the audio codec.
+        audio_info = get_audio_stream_info(info, track_index) if info else None
+        source_codec = (audio_info or {}).get('codec_name', '').lower()
+        use_copy = source_codec in _MP4_COMPATIBLE_AUDIO_CODECS
+
+        # Try -c copy first if compatible; fall back to re-encode if it fails.
+        attempts = []
+        if use_copy:
+            attempts.append(('copy', ['-c:a', 'copy']))
+        attempts.append(('aac', ['-c:a', 'aac', '-b:a', '192k']))
+
+        filename = os.path.basename(filepath)
+        last_error = None
+
+        for mode, codec_args in attempts:
+            print(f"[Audio {track_index}] Extracting from {filename} (mode={mode})...")
+            try:
+                # -vn: drop video entirely. -sn: drop subtitles.
+                # -movflags +empty_moov: produce a fragmented mp4 suitable for
+                #   progressive download. The <audio> element doesn't need
+                #   frag_keyframe — audio-only mp4 without index at end is
+                #   fine because browsers demux audio linearly anyway.
+                result = subprocess.run(
+                    ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                     '-probesize', '5M', '-analyzeduration', '5M',
+                     '-i', filepath,
+                     '-map', f'0:a:{track_index}',
+                     '-vn', '-sn',
+                     *codec_args,
+                     '-movflags', '+empty_moov',
+                     '-f', 'mp4', temp_file],
+                    capture_output=True,
+                    timeout=600,
+                )
+                if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 1024:
+                    os.rename(temp_file, m4a_file)
+                    print(f"[Audio {track_index}] Extraction complete "
+                          f"({os.path.getsize(m4a_file)} bytes, mode={mode})")
+                    return m4a_file, None
+                # Cleanup partial file and record error
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else 'Unknown error'
+                last_error = f"ffmpeg exit {result.returncode} (mode={mode}): {stderr[:200]}"
+                print(f"[Audio {track_index}] Attempt failed: {last_error}")
+                # Continue to next attempt if any
+            except subprocess.TimeoutExpired:
+                last_error = f"Extraction timed out (>600s, mode={mode})"
+                print(f"[Audio {track_index}] {last_error}")
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                # Don't try other modes on timeout — the source is likely too slow
+                break
+            except Exception as e:
+                last_error = f"Unexpected error (mode={mode}): {e}"
+                print(f"[Audio {track_index}] {last_error}")
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+
+        # All attempts failed
+        error_msg = last_error or "Unknown extraction failure"
+        with open(error_file, 'w', encoding='utf-8') as f:
+            f.write(error_msg)
+        return None, error_msg
+
+
+# Global audio manager
+audio_manager = AudioManager()
+
+
 def _preextract_subtitles(filepath: str, file_hash: str, info: dict):
     """Start background extraction for all supported subtitle tracks."""
     subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
@@ -1074,6 +1264,12 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r'^/api/subtitle/(.+?)/track/(\d+)\.vtt$', path)
         if m:
             return self.handle_subtitle_vtt(m.group(1), int(m.group(2)))
+        # Audio-only mp4 extraction (for client-mode <audio> playback —
+        # avoids duplicate video decoder allocation when pointing <audio>
+        # at a video container)
+        m = re.match(r'^/api/audio/(.+?)/track/(\d+)\.m4a$', path)
+        if m:
+            return self.handle_audio_track(m.group(1), int(m.group(2)))
         # Direct file serving
         m = re.match(r'^/direct/(.+)$', path)
         if m:
@@ -1310,6 +1506,76 @@ class Handler(BaseHTTPRequestHandler):
         _probe_cache[file_hash] = probe_result
         self.send_json(probe_result)
 
+    def _serve_file_with_range(self, full_path: str, content_type: str):
+        """Send a local file to the client honoring HTTP Range requests."""
+        file_size = os.path.getsize(full_path)
+        range_header = self.headers.get('Range')
+
+        if range_header:
+            range_match = re.match(r'bytes=(\d*)-(\d*)', range_header)
+            if range_match:
+                start = int(range_match.group(1)) if range_match.group(1) else 0
+                end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
+                end = min(end, file_size - 1)
+                length = end - start + 1
+
+                self.send_response(206)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', length)
+                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+
+                with open(full_path, 'rb') as f:
+                    f.seek(start)
+                    remaining = length
+                    chunk_size = 64 * 1024
+                    while remaining > 0:
+                        chunk = f.read(min(chunk_size, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', file_size)
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        with open(full_path, 'rb') as f:
+            chunk_size = 64 * 1024
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+    def handle_audio_track(self, filepath: str, track_index: int):
+        """Extract and serve an audio-only mp4 for the given track index."""
+        full_path, file_hash, info = self.get_file_info(filepath)
+        if not info:
+            return
+
+        # Verify the track exists (helpful error if caller is off by one)
+        if get_audio_stream_info(info, track_index) is None:
+            self.send_error(404, f"Audio track {track_index} not found")
+            return
+
+        key = f"{file_hash}:audio:{track_index}"
+        m4a_path, error = audio_manager.get_audio_path(key, full_path, file_hash, track_index, info)
+
+        if not m4a_path:
+            # Return an informative error; the <audio> element will fire an
+            # `error` event which the client can fall back from.
+            self.send_error(500, f"Audio extraction failed: {error or 'unknown'}")
+            return
+
+        self._serve_file_with_range(m4a_path, 'audio/mp4')
+
     def handle_direct_file(self, filepath: str):
         """Serve raw video file with range request support for seeking."""
         full_path = validate_media_path(filepath)
@@ -1334,55 +1600,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         content_type = content_types.get(ext, 'application/octet-stream')
 
-        file_size = os.path.getsize(full_path)
-        range_header = self.headers.get('Range')
-
-        if range_header:
-            # Parse range request (e.g., "bytes=0-1023")
-            range_match = re.match(r'bytes=(\d*)-(\d*)', range_header)
-            if range_match:
-                start = int(range_match.group(1)) if range_match.group(1) else 0
-                end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
-
-                # Clamp to file size
-                end = min(end, file_size - 1)
-                length = end - start + 1
-
-                self.send_response(206)  # Partial Content
-                self.send_header('Content-Type', content_type)
-                self.send_header('Content-Length', length)
-                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
-                self.send_header('Accept-Ranges', 'bytes')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-
-                with open(full_path, 'rb') as f:
-                    f.seek(start)
-                    remaining = length
-                    chunk_size = 64 * 1024  # 64KB chunks
-                    while remaining > 0:
-                        chunk = f.read(min(chunk_size, remaining))
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        remaining -= len(chunk)
-                return
-
-        # No range request - serve entire file
-        self.send_response(200)
-        self.send_header('Content-Type', content_type)
-        self.send_header('Content-Length', file_size)
-        self.send_header('Accept-Ranges', 'bytes')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-
-        with open(full_path, 'rb') as f:
-            chunk_size = 64 * 1024  # 64KB chunks
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+        self._serve_file_with_range(full_path, content_type)
 
 
 class ThreadedServer(HTTPServer):

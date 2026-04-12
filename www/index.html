@@ -112,9 +112,16 @@
                     </div>
 
                     <div class="metrics-panel" id="metricsPanel">
-                        <div class="metrics-section">
-                            <h3>Source Codecs</h3>
-                            <div class="metrics-grid" style="grid-template-columns: 1fr 1fr;">
+                        <!-- Mode banner: always visible, shows the active playback tier -->
+                        <div class="metrics-banner" id="metricsBanner">
+                            <span class="mode-badge" id="metricsModeBadge">—</span>
+                            <span class="mode-detail" id="metricsModeDetail"></span>
+                        </div>
+
+                        <!-- Source section: always visible -->
+                        <div class="metrics-section metric-section--common">
+                            <h3>Source</h3>
+                            <div class="metrics-grid" style="grid-template-columns: repeat(4, 1fr);">
                                 <div class="metric-item">
                                     <div class="metric-value" id="metricVideoCodec">-</div>
                                     <div class="metric-label">Video</div>
@@ -123,9 +130,104 @@
                                     <div class="metric-value" id="metricAudioCodec">-</div>
                                     <div class="metric-label">Audio</div>
                                 </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricResolution">-</div>
+                                    <div class="metric-label">Resolution</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricContainer">-</div>
+                                    <div class="metric-label">Container</div>
+                                </div>
                             </div>
                         </div>
-                        <div class="metrics-section">
+
+                        <!-- Playback section: always visible (FPS/dropped/buffer from <video>) -->
+                        <div class="metrics-section metric-section--common">
+                            <h3>Playback</h3>
+                            <div class="metrics-grid" style="grid-template-columns: repeat(4, 1fr);">
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricFps">-</div>
+                                    <div class="metric-label">FPS</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricDropped">-</div>
+                                    <div class="metric-label">Dropped</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricBuffer">-</div>
+                                    <div class="metric-label">Buffer Ahead</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricProgress">-</div>
+                                    <div class="metric-label">Progress</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Client-mode pipeline internals -->
+                        <div class="metrics-section metric-section--client">
+                            <h3>Client Pipeline</h3>
+                            <div class="metrics-grid" style="grid-template-columns: repeat(4, 1fr);">
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientDepth">-</div>
+                                    <div class="metric-label">Reorder Depth</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientModal">-</div>
+                                    <div class="metric-label">Frame Duration</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientBytes">-</div>
+                                    <div class="metric-label">Demuxer Read</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientPackets">-</div>
+                                    <div class="metric-label">Packets Muxed</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientWarmup">-</div>
+                                    <div class="metric-label">Warmup</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientClamps">-</div>
+                                    <div class="metric-label">Clamp Events</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientDurRel">-</div>
+                                    <div class="metric-label">Dur. Source</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricClientRate">-</div>
+                                    <div class="metric-label">Ingest Rate</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- HLS-level info, shared by remux + transcode modes -->
+                        <div class="metrics-section metric-section--hls">
+                            <h3>HLS</h3>
+                            <div class="metrics-grid" style="grid-template-columns: repeat(4, 1fr);">
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricHlsLevel">-</div>
+                                    <div class="metric-label">Current Level</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricHlsBitrate">-</div>
+                                    <div class="metric-label">Bitrate</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricHlsSwitches">-</div>
+                                    <div class="metric-label">Level Switches</div>
+                                </div>
+                                <div class="metric-item">
+                                    <div class="metric-value" id="metricHlsFrag">-</div>
+                                    <div class="metric-label">Last Fragment</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Transcode engine: only visible in transcode mode -->
+                        <div class="metrics-section metric-section--transcode">
                             <h3>Adaptive Quality <span id="adaptiveQualityRes" style="font-weight: normal; color: #888;"></span></h3>
                             <div class="adaptive-grid">
                                 <div class="adaptive-item">
@@ -160,7 +262,7 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="metrics-section">
+                        <div class="metrics-section metric-section--transcode">
                             <h3>Transcode Ratio</h3>
                             <div class="ratio-gauge">
                                 <div class="ratio-bar">
@@ -176,8 +278,8 @@
                                 <div class="ratio-value" id="ratioValue">-</div>
                             </div>
                         </div>
-                        <div class="metrics-section">
-                            <h3>Performance</h3>
+                        <div class="metrics-section metric-section--transcode">
+                            <h3>Segments</h3>
                             <div class="metrics-grid">
                                 <div class="metric-item">
                                     <div class="metric-value" id="metricRatioAvg">-</div>

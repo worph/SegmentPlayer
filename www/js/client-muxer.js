@@ -1,30 +1,66 @@
 /* Client Muxer - libav.js wrapper for muxing packets into fragmented MP4 */
 
+var _muxerInstanceId = 0;
+
 function ClientMuxer(libav) {
     this.libav = libav;
+    this._deviceName = "mux_" + (++_muxerInstanceId) + ".mp4";
     this.oc = 0;      // output format context
     this.fmt = 0;     // output format
     this.pb = 0;      // IO context
     this.pkt = 0;     // reusable packet
     this.outputChunks = [];
-    this.outputPos = 0;
     this.initialized = false;
-    this.streamMap = {}; // input stream index -> output stream index
+    this.streamMap = {};        // input stream index -> output stream index
+    this.lastStreamDts = {};    // last DTS written per output stream (cross-batch monotonicity)
+
+    // Per-stream DTS-synthesis state (keyed by outputIdx).
+    //
+    // MKV demuxers set DTS = PTS, which breaks B-frame content: fMP4 needs
+    // monotonic DTS in decode order with PTS reordered via signed CTS offsets.
+    // For video streams we measure reorder depth adaptively during a warmup
+    // phase, then use a bounded lookahead queue of that depth to synthesize
+    // correct DTS values. For audio/other, we pass DTS = PTS through unchanged.
+    this._streamKind = {};                // "video" | "audio" | "other"
+    this._timeBase = {};                  // { num, den } per output stream
+    this._reorderDepth = {};              // integer reorder depth (null until measured for video)
+    this._depthMeasured = {};             // true once reorderDepth is finalized
+    this._warmupBuf = {};                 // packets held during reorder-depth measurement
+    this._warmupPtsHistory = {};          // PTS values observed during warmup (decode order)
+    this._runningMaxDisplacement = {};    // current max displacement during warmup
+    this._stableCount = {};               // packets since last displacement change
+    this._warmupKeyframes = {};           // count of keyframes seen during warmup
+    this._lookahead = {};                 // bounded queue of packets awaiting DTS emission
+    this._ptsSorted = {};                 // ascending PTS values parallel to _lookahead
+    this._packetDurationSeen = {};        // demuxer populated pkt.duration > 0 at least once
+    this._packetDurationReliable = {};    // Tier A trustworthy (cross-checked against modal)
+    this._durationFallback = {};          // cached modal/fallback duration (ticks)
+    this._lastEmittedPts = {};            // previous emitted packet's PTS
+    this._clampCount = {};                // monotonicity clamp trigger count
+    this._synthesisFallback = {};         // revert to DTS = PTS if clamp count exceeds threshold
+    this._isHevc = {};                    // true for HEVC video streams (enables CRA flag filtering)
 }
+
+// Tunables
+ClientMuxer.WARMUP_MIN_PACKETS = 16;
+ClientMuxer.WARMUP_MIN_PACKETS_NO_B = 32;
+ClientMuxer.WARMUP_MAX_PACKETS = 64;
+ClientMuxer.REORDER_DEPTH_CAP = 16;
+ClientMuxer.CLAMP_FALLBACK_THRESHOLD = 5;
 
 // Initialize muxer with stream configurations from demuxer
 // streamInfos: array of { inputIndex, codecpar, time_base_num, time_base_den }
 ClientMuxer.prototype.init = async function(streamInfos) {
-    // Create streaming writer device (no seeking back — required for fMP4)
-    await this.libav.mkstreamwriterdev("output.mp4");
+    // Create streaming writer device for fMP4 output
+    var deviceName = this._deviceName;
+    await this.libav.mkstreamwriterdev(deviceName);
 
-    // Capture output bytes
+    // Capture output bytes via onwrite callback
     var self = this;
     this.libav.onwrite = function(name, position, buffer) {
-        if (name === "output.mp4") {
+        if (name === deviceName) {
             // Must copy the buffer — it may be a subarray of WASM memory
             self.outputChunks.push(new Uint8Array(buffer));
-            self.outputPos += buffer.length;
         }
     };
 
@@ -35,12 +71,19 @@ ClientMuxer.prototype.init = async function(streamInfos) {
         var info = streamInfos[i];
         streamCtxs.push([info.codecpar, info.time_base_num, info.time_base_den]);
         this.streamMap[info.inputIndex] = i;
+        this._timeBase[i] = { num: info.time_base_num, den: info.time_base_den };
+        this._resetStreamState(i);
+        // HEVC detection comes from probe-data codec name (libav.js doesn't
+        // export AV_CODEC_ID_HEVC directly). We use this to gate CRA-flag
+        // filtering in the mux loop — see the "HEVC open-GOP filter" block.
+        var cname = (info.codecName || "").toLowerCase();
+        this._isHevc[i] = (cname === "hevc" || cname === "h265");
     }
 
     // Initialize muxer
     var ret = await this.libav.ff_init_muxer({
         format_name: "mp4",
-        filename: "output.mp4",
+        filename: deviceName,
         open: true,
         codecpars: true
     }, streamCtxs);
@@ -53,12 +96,76 @@ ClientMuxer.prototype.init = async function(streamInfos) {
     // frag_keyframe: new fragment at each keyframe
     // empty_moov: no data in initial moov atom (streaming compatible)
     // default_base_moof: required for MSE compatibility
+    // negative_cts_offsets: allows B-frame CTS (PTS-DTS) to be negative.
+    //   Still useful as a safety net even with correct DTS synthesis — some
+    //   B-pyramid patterns produce legitimately negative CTS offsets.
     await this.libav.av_opt_set(this.oc, "movflags",
-        "frag_keyframe+empty_moov+default_base_moof",
+        "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
         this.libav.AV_OPT_SEARCH_CHILDREN);
+
+    // Note on open-GOP handling: HEVC content uses CRA random-access points
+    // whose leading B-pictures have PTS earlier than the CRA itself. Chrome's
+    // MSE flags "sync sample with later PTS than dependent non-sync sample"
+    // and halves playback pacing. We handle this at the packet level by
+    // clearing AV_PKT_FLAG_KEY on CRA / BLA packets in the mux loop below —
+    // see the "HEVC open-GOP filter" block. That also has the side effect
+    // that only real IDR frames trigger frag_keyframe fragment boundaries,
+    // which is exactly what we want. No min_frag_duration is set here
+    // because buffering 10s of samples before the first fragment emit would
+    // exceed the pump-loop watchdog timeout.
+
+    // Inspect each output stream's codec_type to drive the DTS-synthesis
+    // branch (video needs full synthesis; audio/other pass through).
+    // Also fix audio codec frame_size (MKV demuxer omits it, which causes
+    // Chrome MSE to reject the audio track).
+    try {
+        var nbStreams = await this.libav.AVFormatContext_nb_streams(this.oc);
+        for (var si = 0; si < nbStreams; si++) {
+            var streamPtr = await this.libav.AVFormatContext_streams_a(this.oc, si);
+            var codecparPtr = await this.libav.AVStream_codecpar(streamPtr);
+            var codecType = await this.libav.AVCodecParameters_codec_type(codecparPtr);
+
+            if (codecType === this.libav.AVMEDIA_TYPE_VIDEO) {
+                this._streamKind[si] = "video";
+                // _isHevc[si] is already set from probe data above. Kept here
+                // because the HEVC-specific filter in the mux loop gates on it;
+                // see the "HEVC open-GOP filter" block near pkt processing.
+            } else if (codecType === this.libav.AVMEDIA_TYPE_AUDIO) {
+                this._streamKind[si] = "audio";
+                this._reorderDepth[si] = 0;
+                this._depthMeasured[si] = true;
+            } else {
+                this._streamKind[si] = "other";
+                this._reorderDepth[si] = 0;
+                this._depthMeasured[si] = true;
+            }
+
+            if (codecType === this.libav.AVMEDIA_TYPE_AUDIO) {
+                var codecId = await this.libav.AVCodecParameters_codec_id(codecparPtr);
+                var decoder = await this.libav.avcodec_find_decoder(codecId);
+                var tmpCtx = await this.libav.avcodec_alloc_context3(decoder);
+                await this.libav.avcodec_parameters_to_context(tmpCtx, codecparPtr);
+                var currentFrameSize = await this.libav.AVCodecContext_frame_size(tmpCtx);
+                if (!currentFrameSize || currentFrameSize <= 0) {
+                    await this.libav.AVCodecContext_frame_size_s(tmpCtx, 1024);
+                    await this.libav.avcodec_parameters_from_context(codecparPtr, tmpCtx);
+                }
+                await this.libav.avcodec_free_context_js(tmpCtx);
+            }
+        }
+    } catch (e) {
+        console.warn("[Muxer] Could not inspect stream kinds / fix audio frame_size:", e.message || e);
+    }
 
     // Write header
     await this.libav.avformat_write_header(this.oc, 0);
+
+    // Flush to ensure ftyp data reaches onwrite callback
+    await this.libav.avio_flush(this.pb);
+
+    // Collect init segment (ftyp) written by avformat_write_header.
+    // The moov box is written lazily by the mp4 muxer on the first fragment.
+    this._initSegment = this._collectOutput();
 
     // Allocate packet for writing
     this.pkt = await this.libav.av_packet_alloc();
@@ -66,44 +173,465 @@ ClientMuxer.prototype.init = async function(streamInfos) {
     this.initialized = true;
 };
 
+// Reset all per-stream DTS-synthesis state for a given output index.
+// Called from init() once per stream, and implicitly by constructing a new
+// ClientMuxer on seek (which destroys the old one and makes a fresh instance).
+ClientMuxer.prototype._resetStreamState = function(outputIdx) {
+    this._streamKind[outputIdx] = "video"; // default; set precisely after init_muxer
+    this._reorderDepth[outputIdx] = null;
+    this._depthMeasured[outputIdx] = false;
+    this._warmupBuf[outputIdx] = [];
+    this._warmupPtsHistory[outputIdx] = [];
+    this._runningMaxDisplacement[outputIdx] = 0;
+    this._stableCount[outputIdx] = 0;
+    this._warmupKeyframes[outputIdx] = 0;
+    this._lookahead[outputIdx] = [];
+    this._ptsSorted[outputIdx] = [];
+    this._packetDurationSeen[outputIdx] = false;
+    this._packetDurationReliable[outputIdx] = true;
+    this._durationFallback[outputIdx] = 0;
+    this._lastEmittedPts[outputIdx] = null;
+    this._clampCount[outputIdx] = 0;
+    this._synthesisFallback[outputIdx] = false;
+    this._isHevc[outputIdx] = false;
+};
+
+// True if any video stream is still measuring reorder depth (i.e. may return
+// null from mux() without that indicating a pipeline stall).
+ClientMuxer.prototype.isWarmingUp = function() {
+    for (var k in this._depthMeasured) {
+        if (this._streamKind[k] === "video" && !this._depthMeasured[k]) return true;
+    }
+    return false;
+};
+
+// Read-only snapshot of per-stream DTS-synthesis state for the first video
+// stream, for the metrics UI. Returns null if no video stream is registered.
+ClientMuxer.prototype.getVideoStats = function() {
+    for (var k in this._streamKind) {
+        if (this._streamKind[k] !== "video") continue;
+        return {
+            reorderDepth: this._reorderDepth[k],
+            depthMeasured: !!this._depthMeasured[k],
+            modalDuration: this._durationFallback[k] || 0,
+            warmingUp: !this._depthMeasured[k],
+            clampCount: this._clampCount[k] || 0,
+            pktDurationReliable: !!this._packetDurationReliable[k],
+            pktDurationSeen: !!this._packetDurationSeen[k],
+            synthesisFallback: !!this._synthesisFallback[k],
+            timeBase: this._timeBase[k] || null
+        };
+    }
+    return null;
+};
+
+// Inspect the first VCL NAL unit of a length-prefixed HEVC packet and return
+// its nal_unit_type (0-31 for VCL/picture NALs). Returns -1 if no VCL NAL is
+// found in the packet (e.g. the packet contains only parameter sets).
+//
+// HEVC packets in mp4 format are a concatenation of [4-byte length][NAL]
+// chunks. Non-VCL NALs (VPS=32, SPS=33, PPS=34, SEI=39/40, ...) can precede
+// the picture NAL inside a single packet, so we iterate.
+//
+// HEVC NAL header is 2 bytes: [0_bit][nal_unit_type:6][nuh_layer_id:6][nuh_temporal_id_plus1:3]
+// which spans a 16-bit big-endian word. The type lives in bits 1-6 of byte 0.
+function _hevcFirstVclNalType(data) {
+    if (!data || data.length < 5) return -1;
+    var offset = 0;
+    while (offset + 5 <= data.length) {
+        var len = (data[offset] << 24 >>> 0) |
+                  (data[offset + 1] << 16) |
+                  (data[offset + 2] << 8) |
+                  data[offset + 3];
+        if (len <= 0 || offset + 4 + len > data.length) return -1;
+        var nalType = (data[offset + 4] >> 1) & 0x3F;
+        if (nalType <= 31) return nalType;   // VCL / picture NAL
+        offset += 4 + len;
+    }
+    return -1;
+}
+
+// Binary insert `val` into ascending `arr`.
+function _sortedInsert(arr, val) {
+    var lo = 0, hi = arr.length;
+    while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+        if (arr[mid] < val) lo = mid + 1;
+        else hi = mid;
+    }
+    arr.splice(lo, 0, val);
+}
+
+// Remove the first occurrence of `val` from ascending `arr`.
+function _sortedRemove(arr, val) {
+    var lo = 0, hi = arr.length;
+    while (lo < hi) {
+        var mid = (lo + hi) >> 1;
+        if (arr[mid] < val) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo < arr.length && arr[lo] === val) arr.splice(lo, 1);
+}
+
 // Mux a batch of packets and return the fMP4 fragment data
 // packets: Record<inputStreamIndex, Packet[]> (as returned by ff_read_frame_multi)
-// Returns: Uint8Array of fMP4 data, or null if no data
+// Returns: Uint8Array of fMP4 data, or null if no data (warmup in progress)
 ClientMuxer.prototype.mux = async function(packets) {
     if (!this.initialized) return null;
 
     // Clear output buffer
     this.outputChunks = [];
 
-    // Remap stream indices and flatten into a single packet array
-    // ff_write_multi expects a flat Packet[] — each packet's stream_index tells
-    // the muxer which output stream it belongs to
+    // Accumulate packets ready for ff_write_multi. Cross-stream interleaving
+    // by DTS happens at the end after all streams have been processed.
     var flatPackets = [];
+
     for (var inputIdx in packets) {
         var outputIdx = this.streamMap[inputIdx];
         if (outputIdx === undefined) continue;
         var pkts = packets[inputIdx];
+        if (!pkts || pkts.length === 0) continue;
+
         for (var i = 0; i < pkts.length; i++) {
-            pkts[i].stream_index = outputIdx;
-            flatPackets.push(pkts[i]);
+            var pkt = pkts[i];
+
+            // Clamp negative PTS (rare container quirk)
+            if (pkt.pts < 0) { pkt.pts = 0; pkt.ptshi = 0; }
+
+            // Track whether the demuxer ever populates pkt.duration — drives
+            // Tier A duration selection after warmup.
+            if (pkt.duration > 0) this._packetDurationSeen[outputIdx] = true;
+
+            pkt.stream_index = outputIdx;
+
+            // HEVC open-GOP filter: on HEVC streams, clear AV_PKT_FLAG_KEY for
+            // CRA / BLA keyframes so only true IDR frames get written as sync
+            // samples in the fMP4 trun. Without this, Chrome's MSE flags the
+            // "RAP with later PTS than dependent non-key sample" pattern and
+            // halves playback pacing. See client-muxer.js:init() for the
+            // rationale block.
+            if (this._isHevc[outputIdx] && (pkt.flags & 1) && pkt.data) {
+                var nt = _hevcFirstVclNalType(pkt.data);
+                //  19 = IDR_W_RADL, 20 = IDR_N_LP → keep as sync sample.
+                //  All other VCL types (including 21=CRA_NUT, 16/17/18=BLA_*)
+                //  are non-IDR random-access points; clear KEY for MSE sanity.
+                if (nt >= 0 && nt !== 19 && nt !== 20) {
+                    pkt.flags &= ~1;
+                    this._craFiltered = (this._craFiltered || 0) + 1;
+                    if (this._craFiltered === 1 || this._craFiltered % 100 === 0) {
+                        console.log("[Muxer] Cleared KEY flag on HEVC non-IDR RAP",
+                            "(nal_type=" + nt + ", cumulative=" + this._craFiltered + ")");
+                    }
+                } else if (nt === 19 || nt === 20) {
+                    this._idrKept = (this._idrKept || 0) + 1;
+                }
+            }
+
+            if (this._streamKind[outputIdx] !== "video" || this._synthesisFallback[outputIdx]) {
+                this._emitPassthrough(outputIdx, pkt, flatPackets);
+            } else if (!this._depthMeasured[outputIdx]) {
+                this._warmupPush(outputIdx, pkt, flatPackets);
+            } else {
+                this._steadyPush(outputIdx, pkt, flatPackets);
+            }
         }
     }
 
-    if (flatPackets.length === 0) return null;
+    if (flatPackets.length === 0) {
+        // No output yet — warmup still filling, or empty input. Keep
+        // _initSegment held so it can be prepended to the first real fragment.
+        return null;
+    }
 
-    // Write packets (interleaved)
-    await this.libav.ff_write_multi(this.oc, this.pkt, flatPackets, true);
+    // Sort across streams by DTS for proper interleaving
+    flatPackets.sort(function(a, b) {
+        return a.dts - b.dts || a.stream_index - b.stream_index;
+    });
 
-    // Collect output
-    return this._collectOutput();
+    // Write packets non-interleaved (DTS is already correct and monotonic)
+    await this.libav.ff_write_multi(this.oc, this.pkt, flatPackets, false);
+
+    // Flush the IO context to ensure all data reaches the onwrite callback.
+    await this.libav.avio_flush(this.pb);
+
+    var output = this._collectOutput();
+
+    // Prepend init segment (ftyp) to first real output. We deliberately hold
+    // _initSegment through any warmup null-returns so MSE only sees "init +
+    // media" together, never init alone.
+    if (this._initSegment && output && output.length > 0) {
+        var combined = new Uint8Array(this._initSegment.length + output.length);
+        combined.set(this._initSegment, 0);
+        combined.set(output, this._initSegment.length);
+        output = combined;
+        this._initSegment = null;
+    }
+
+    return output;
 };
 
-// Flush remaining data and write trailer
+// Passthrough emission for audio/other/synthesis-fallback: DTS = PTS, keep
+// existing duration, enforce per-stream monotonic DTS.
+ClientMuxer.prototype._emitPassthrough = function(outputIdx, pkt, flatPackets) {
+    var dts = pkt.pts;
+    var lastDts = this.lastStreamDts[outputIdx];
+    if (lastDts !== undefined && dts <= lastDts) dts = lastDts + 1;
+    pkt.dts = dts;
+    pkt.dtshi = 0;
+    this.lastStreamDts[outputIdx] = dts;
+    flatPackets.push(pkt);
+};
+
+// Warmup: accumulate a video packet, update running max displacement, and
+// freeze + drain if a trigger fires.
+//
+// Displacement of packet i = count of prior packets j < i with PTS_j > PTS_i.
+// The max displacement observed over the warmup window equals the stream's
+// B-frame reorder depth.
+ClientMuxer.prototype._warmupPush = function(outputIdx, pkt, flatPackets) {
+    var buf = this._warmupBuf[outputIdx];
+    var history = this._warmupPtsHistory[outputIdx];
+    var pts = pkt.pts;
+
+    var displacement = 0;
+    for (var i = 0; i < history.length; i++) {
+        if (history[i] > pts) displacement++;
+    }
+
+    var prevMax = this._runningMaxDisplacement[outputIdx];
+    if (displacement > prevMax) {
+        this._runningMaxDisplacement[outputIdx] = displacement;
+        this._stableCount[outputIdx] = 0;
+    } else {
+        this._stableCount[outputIdx] += 1;
+    }
+
+    history.push(pts);
+    buf.push(pkt);
+    if (pkt.flags & 1 /* AV_PKT_FLAG_KEY */) {
+        this._warmupKeyframes[outputIdx] += 1;
+    }
+
+    // Freeze triggers (first condition that fires wins)
+    var depth = this._runningMaxDisplacement[outputIdx];
+    var n = buf.length;
+    var stable = this._stableCount[outputIdx];
+    var kfs = this._warmupKeyframes[outputIdx];
+    var minPackets = (depth === 0) ? ClientMuxer.WARMUP_MIN_PACKETS_NO_B : ClientMuxer.WARMUP_MIN_PACKETS;
+    var requiredStable = Math.max(depth + 4, 8);
+
+    var shouldFreeze =
+        n >= ClientMuxer.WARMUP_MAX_PACKETS ||
+        (kfs >= 2 && n >= minPackets && stable >= requiredStable);
+
+    if (shouldFreeze) {
+        this._freezeDepthAndDrain(outputIdx, flatPackets);
+    }
+};
+
+// Freeze the measured reorder depth, derive modal frame duration, and drain
+// the warmup buffer through the steady-state pipeline.
+ClientMuxer.prototype._freezeDepthAndDrain = function(outputIdx, flatPackets) {
+    var depth = this._runningMaxDisplacement[outputIdx];
+    this._reorderDepth[outputIdx] = depth;
+    this._depthMeasured[outputIdx] = true;
+
+    // Modal frame duration = most common delta between adjacent *sorted* PTS
+    // values in the warmup window. Sorted ordering gives us presentation-order
+    // gaps, which equal frame duration for CFR content.
+    var history = this._warmupPtsHistory[outputIdx].slice().sort(function(a, b) { return a - b; });
+    var deltaCounts = new Map();
+    var topDelta = 0;
+    var topCount = 0;
+    for (var i = 1; i < history.length; i++) {
+        var d = history[i] - history[i - 1];
+        if (d <= 0) continue;
+        var c = (deltaCounts.get(d) || 0) + 1;
+        deltaCounts.set(d, c);
+        if (c > topCount) { topCount = c; topDelta = d; }
+    }
+    if (topDelta > 0) {
+        this._durationFallback[outputIdx] = topDelta;
+    } else {
+        // Tier C — 24fps in stream timebase
+        var tb = this._timeBase[outputIdx];
+        this._durationFallback[outputIdx] = (tb && tb.num > 0)
+            ? Math.round(tb.den / tb.num / 24)
+            : 1;
+        console.warn("[Muxer] Stream", outputIdx,
+            "warmup yielded no usable PTS deltas; using 24fps fallback duration",
+            this._durationFallback[outputIdx]);
+    }
+
+    // Cross-check Tier A: if any warmup packet.duration disagrees with modal
+    // by >10%, distrust demuxer-provided durations for this stream.
+    var warmupBuf = this._warmupBuf[outputIdx];
+    if (this._packetDurationSeen[outputIdx]) {
+        var modal = this._durationFallback[outputIdx];
+        var tolerance = modal * 0.1;
+        for (var j = 0; j < warmupBuf.length; j++) {
+            var d = warmupBuf[j].duration;
+            if (d > 0 && Math.abs(d - modal) > tolerance) {
+                this._packetDurationReliable[outputIdx] = false;
+                break;
+            }
+        }
+    }
+
+    console.log("[Muxer] Stream", outputIdx,
+        "frozen: reorderDepth=" + depth,
+        "modalDuration=" + this._durationFallback[outputIdx],
+        "pktDurationReliable=" + this._packetDurationReliable[outputIdx]);
+
+    // Drain warmup buffer through the steady-state pipeline
+    this._warmupBuf[outputIdx] = [];
+    this._warmupPtsHistory[outputIdx] = [];
+    for (var k = 0; k < warmupBuf.length; k++) {
+        this._steadyPush(outputIdx, warmupBuf[k], flatPackets);
+    }
+};
+
+// Steady-state: push packet into the lookahead queue, emit head packets while
+// the queue exceeds reorder depth.
+//
+// Invariant: when the queue holds reorderDepth+1 packets, the smallest PTS in
+// the window is the correct DTS for the oldest packet in decode order.
+ClientMuxer.prototype._steadyPush = function(outputIdx, pkt, flatPackets) {
+    var la = this._lookahead[outputIdx];
+    var sorted = this._ptsSorted[outputIdx];
+    var depth = this._reorderDepth[outputIdx];
+
+    la.push(pkt);
+    _sortedInsert(sorted, pkt.pts);
+
+    while (la.length > depth) {
+        var head = la.shift();
+        var dts = sorted[0];
+        _sortedRemove(sorted, dts);
+        this._emitSynthesized(outputIdx, head, dts, flatPackets);
+    }
+};
+
+// Assign DTS + duration to a packet and append it to the write list.
+// Preserves the original packet object reference so pkt.flags (including
+// AV_PKT_FLAG_KEY) survives into ff_write_multi — crucial for frag_keyframe
+// fragment boundaries to land on real I-frames.
+ClientMuxer.prototype._emitSynthesized = function(outputIdx, pkt, dts, flatPackets) {
+    var lastDts = this.lastStreamDts[outputIdx];
+    if (lastDts !== undefined && dts <= lastDts) {
+        // Safety net — this should never fire with correct reorder depth.
+        // When it does, it means the measured depth is too low. Grow it
+        // stickily and, if it keeps firing, give up on synthesis entirely.
+        this._clampCount[outputIdx] += 1;
+        if (this._clampCount[outputIdx] === 1) {
+            console.warn("[Muxer] Stream", outputIdx,
+                "DTS monotonicity clamp fired — reorder depth likely insufficient. Growing.");
+        }
+        if (this._reorderDepth[outputIdx] < ClientMuxer.REORDER_DEPTH_CAP) {
+            this._reorderDepth[outputIdx] += 1;
+        }
+        if (this._clampCount[outputIdx] >= ClientMuxer.CLAMP_FALLBACK_THRESHOLD) {
+            console.error("[Muxer] Stream", outputIdx,
+                "exceeded clamp threshold; disabling DTS synthesis (DTS = PTS fallback).");
+            this._synthesisFallback[outputIdx] = true;
+        }
+        dts = lastDts + 1;
+    }
+
+    pkt.dts = dts;
+    pkt.dtshi = 0;
+    this.lastStreamDts[outputIdx] = dts;
+
+    // Duration: Tier A (trusted demuxer-provided) → Tier B/C (cached modal)
+    var duration = this._computeDuration(outputIdx, pkt);
+    if (duration > 0) {
+        pkt.duration = duration;
+        pkt.durationhi = 0;
+    }
+
+    this._lastEmittedPts[outputIdx] = pkt.pts;
+    flatPackets.push(pkt);
+};
+
+// Pick a duration for this packet. Tier A uses the demuxer's own duration if
+// cross-check found it reliable; otherwise falls back to the modal duration
+// derived at warmup freeze (or a 24fps fallback if warmup couldn't measure).
+ClientMuxer.prototype._computeDuration = function(outputIdx, pkt) {
+    if (this._packetDurationSeen[outputIdx]
+            && this._packetDurationReliable[outputIdx]
+            && pkt.duration > 0) {
+        return pkt.duration;
+    }
+    return this._durationFallback[outputIdx] || 0;
+};
+
+// Drain all packets still buffered in warmup / lookahead into flatPackets.
+// Called from flush() to recover up to reorderDepth tail packets that would
+// otherwise be lost at EOF.
+ClientMuxer.prototype._drainLookahead = function(flatPackets) {
+    // Force-freeze any video stream still in warmup.
+    for (var ka in this._streamKind) {
+        if (this._streamKind[ka] !== "video") continue;
+        if (!this._depthMeasured[ka]) {
+            if (this._warmupBuf[ka].length > 0) {
+                this._freezeDepthAndDrain(ka, flatPackets);
+            } else {
+                this._reorderDepth[ka] = 0;
+                this._depthMeasured[ka] = true;
+            }
+        }
+    }
+    // Drain each stream's lookahead queue.
+    for (var kb in this._streamKind) {
+        var la = this._lookahead[kb];
+        var sorted = this._ptsSorted[kb];
+        if (!la) continue;
+        while (la.length > 0) {
+            var head = la.shift();
+            var dts = sorted.length > 0 ? sorted[0] : head.pts;
+            _sortedRemove(sorted, dts);
+            this._emitSynthesized(kb, head, dts, flatPackets);
+        }
+    }
+};
+
+// Flush remaining buffered packets and write the trailer. Call from the
+// pump loop on EOF, append the returned bytes to the SourceBuffer, then
+// endOfStream().
 ClientMuxer.prototype.flush = async function() {
     if (!this.initialized) return null;
     this.outputChunks = [];
+
+    // Drain warmup + lookahead tails so the last reorderDepth frames don't
+    // disappear from the end of playback.
+    var tailPackets = [];
+    this._drainLookahead(tailPackets);
+
+    if (tailPackets.length > 0) {
+        tailPackets.sort(function(a, b) {
+            return a.dts - b.dts || a.stream_index - b.stream_index;
+        });
+        await this.libav.ff_write_multi(this.oc, this.pkt, tailPackets, false);
+    }
+
     await this.libav.av_write_trailer(this.oc);
-    return this._collectOutput();
+    await this.libav.avio_flush(this.pb);
+    var output = this._collectOutput();
+
+    // Edge case: file was shorter than one mux() batch — init segment never
+    // got prepended to a media fragment. Ship it with whatever we have.
+    if (this._initSegment && output && output.length > 0) {
+        var combined = new Uint8Array(this._initSegment.length + output.length);
+        combined.set(this._initSegment, 0);
+        combined.set(output, this._initSegment.length);
+        output = combined;
+        this._initSegment = null;
+    } else if (this._initSegment && (!output || output.length === 0)) {
+        output = this._initSegment;
+        this._initSegment = null;
+    }
+
+    return output;
 };
 
 // Collect accumulated output chunks into a single Uint8Array
@@ -133,6 +661,12 @@ ClientMuxer.prototype.destroy = async function() {
             if (this.oc) await this.libav.ff_free_muxer(this.oc, this.pb);
         } catch (e) {
             console.warn("[Muxer] Cleanup error:", e);
+        }
+        // Remove the virtual stream-writer device to free Emscripten FS memory
+        try {
+            await this.libav.unlink(this._deviceName);
+        } catch (e) {
+            // May already be gone — ignore
         }
     }
     this.initialized = false;
