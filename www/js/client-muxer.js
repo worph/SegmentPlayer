@@ -36,6 +36,7 @@ function ClientMuxer(libav) {
     this._packetDurationReliable = {};    // Tier A trustworthy (cross-checked against modal)
     this._durationFallback = {};          // cached modal/fallback duration (ticks)
     this._lastEmittedPts = {};            // previous emitted packet's PTS
+    this._dtsShift = {};                  // per-stream DTS shift (= reorderDepth × modalDuration)
     this._clampCount = {};                // monotonicity clamp trigger count
     this._synthesisFallback = {};         // revert to DTS = PTS if clamp count exceeds threshold
     this._isHevc = {};                    // true for HEVC video streams (enables CRA flag filtering)
@@ -216,6 +217,7 @@ ClientMuxer.prototype._resetStreamState = function(outputIdx) {
     this._clampCount[outputIdx] = 0;
     this._synthesisFallback[outputIdx] = false;
     this._isHevc[outputIdx] = false;
+    this._dtsShift[outputIdx] = 0;
 };
 
 // True if any video stream is still measuring reorder depth (i.e. may return
@@ -444,6 +446,12 @@ ClientMuxer.prototype._warmupPush = function(outputIdx, pkt, flatPackets) {
 // the warmup buffer through the steady-state pipeline.
 ClientMuxer.prototype._freezeDepthAndDrain = function(outputIdx, flatPackets) {
     var depth = this._runningMaxDisplacement[outputIdx];
+    // HEVC floor: real-world HEVC encodes routinely use B-pyramids with
+    // depth 3+, but warmup can freeze at 2 if the first observed GOPs
+    // happen not to expose the deepest pyramid level. Seeding a floor of
+    // 3 covers the common case cheaply; the CTS-sanity peek in
+    // _steadyPush is the correctness backstop for deeper pyramids.
+    if (this._isHevc[outputIdx] && depth < 3) depth = 3;
     this._reorderDepth[outputIdx] = depth;
     this._depthMeasured[outputIdx] = true;
 
@@ -489,9 +497,22 @@ ClientMuxer.prototype._freezeDepthAndDrain = function(outputIdx, flatPackets) {
         }
     }
 
+    // DTS shift: the sort-assign algorithm produces DTS = (i-th smallest PTS)
+    // in decode order. For B-pyramid streams this can emit DTS > PTS on
+    // frames where decode position exceeds presentation rank. FFmpeg's mp4
+    // muxer rewrites pts=dts on any such packet, creating duplicate PTS
+    // values that Chrome MSE dedups — halving effective frame rate.
+    // Shifting all DTS down by reorderDepth × modalDuration guarantees
+    // CTS ≥ 0 in steady state: PTS[i] differs from its sorted rank by at
+    // most reorderDepth positions, so PTS[i] ≥ sortedPTS[rank(i)] - shift.
+    // Initial packets where shifted DTS would go negative are clamped to
+    // monotonic non-negative values by _emitSynthesized.
+    this._dtsShift[outputIdx] = depth * this._durationFallback[outputIdx];
+
     console.log("[Muxer] Stream", outputIdx,
         "frozen: reorderDepth=" + depth,
         "modalDuration=" + this._durationFallback[outputIdx],
+        "dtsShift=" + this._dtsShift[outputIdx],
         "pktDurationReliable=" + this._packetDurationReliable[outputIdx]);
 
     // Drain warmup buffer through the steady-state pipeline
@@ -505,8 +526,17 @@ ClientMuxer.prototype._freezeDepthAndDrain = function(outputIdx, flatPackets) {
 // Steady-state: push packet into the lookahead queue, emit head packets while
 // the queue exceeds reorder depth.
 //
-// Invariant: when the queue holds reorderDepth+1 packets, the smallest PTS in
-// the window is the correct DTS for the oldest packet in decode order.
+// Invariant: when the queue holds reorderDepth+1 packets, the algorithm
+// assigns the oldest decode-order packet a DTS equal to the i-th smallest
+// PTS seen so far (where i advances each pop). That produces a monotonic
+// DTS sequence equal to the sorted PTS values — correct for both flat B and
+// B-pyramid streams when the lookahead is ≥ actual reorder depth.
+//
+// When lookahead is too shallow, the monotonicity clamp in _emitSynthesized
+// catches the breakage reactively and grows reorderDepth. A proactive check
+// is not viable here: legitimate pyramid streams emit negative CTS (DTS >
+// PTS) at pyramid-level depth, so "DTS > PTS" does not discriminate between
+// correct pyramid output and under-measurement.
 ClientMuxer.prototype._steadyPush = function(outputIdx, pkt, flatPackets) {
     var la = this._lookahead[outputIdx];
     var sorted = this._ptsSorted[outputIdx];
@@ -523,29 +553,48 @@ ClientMuxer.prototype._steadyPush = function(outputIdx, pkt, flatPackets) {
     }
 };
 
+// Shared handler for both insufficient-depth signals:
+//   - monotonicity clamp (DTS <= lastDts in _emitSynthesized), and
+//   - CTS-sanity peek (candidate DTS > head.pts + 1.5×modal in _steadyPush).
+// Grows reorder depth stickily and trips the synthesis-off fallback once the
+// clamp count crosses CLAMP_FALLBACK_THRESHOLD. `reason` is a short tag for
+// the log line so we can tell which path fired.
+ClientMuxer.prototype._onDepthInsufficient = function(outputIdx, reason) {
+    this._clampCount[outputIdx] += 1;
+    if (this._clampCount[outputIdx] === 1) {
+        console.warn("[Muxer] Stream", outputIdx,
+            reason + " — reorder depth likely insufficient. Growing.");
+    }
+    if (this._reorderDepth[outputIdx] < ClientMuxer.REORDER_DEPTH_CAP) {
+        this._reorderDepth[outputIdx] += 1;
+    }
+    if (this._clampCount[outputIdx] >= ClientMuxer.CLAMP_FALLBACK_THRESHOLD) {
+        console.error("[Muxer] Stream", outputIdx,
+            "exceeded clamp threshold; disabling DTS synthesis (DTS = PTS fallback).");
+        this._synthesisFallback[outputIdx] = true;
+    }
+};
+
 // Assign DTS + duration to a packet and append it to the write list.
 // Preserves the original packet object reference so pkt.flags (including
 // AV_PKT_FLAG_KEY) survives into ff_write_multi — crucial for frag_keyframe
 // fragment boundaries to land on real I-frames.
 ClientMuxer.prototype._emitSynthesized = function(outputIdx, pkt, dts, flatPackets) {
+    // Apply DTS shift (see _freezeDepthAndDrain). Clamp negatives to 0; the
+    // monotonicity guard below ensures subsequent DTS values advance even if
+    // several initial packets bottom out at 0.
+    var shift = this._dtsShift[outputIdx] || 0;
+    if (shift > 0) {
+        dts -= shift;
+        if (dts < 0) dts = 0;
+    }
+
     var lastDts = this.lastStreamDts[outputIdx];
     if (lastDts !== undefined && dts <= lastDts) {
-        // Safety net — this should never fire with correct reorder depth.
-        // When it does, it means the measured depth is too low. Grow it
-        // stickily and, if it keeps firing, give up on synthesis entirely.
-        this._clampCount[outputIdx] += 1;
-        if (this._clampCount[outputIdx] === 1) {
-            console.warn("[Muxer] Stream", outputIdx,
-                "DTS monotonicity clamp fired — reorder depth likely insufficient. Growing.");
-        }
-        if (this._reorderDepth[outputIdx] < ClientMuxer.REORDER_DEPTH_CAP) {
-            this._reorderDepth[outputIdx] += 1;
-        }
-        if (this._clampCount[outputIdx] >= ClientMuxer.CLAMP_FALLBACK_THRESHOLD) {
-            console.error("[Muxer] Stream", outputIdx,
-                "exceeded clamp threshold; disabling DTS synthesis (DTS = PTS fallback).");
-            this._synthesisFallback[outputIdx] = true;
-        }
+        // Safety net — reached only when the CTS-sanity peek in _steadyPush
+        // didn't catch an under-measured depth (e.g. first packet after
+        // freeze, before the window is primed). Grow depth and clamp DTS.
+        this._onDepthInsufficient(outputIdx, "DTS monotonicity clamp fired");
         dts = lastDts + 1;
     }
 
