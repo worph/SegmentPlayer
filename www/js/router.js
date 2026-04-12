@@ -13,17 +13,9 @@ function switchToBrowseMode() {
     SP.elements.playerView.classList.remove("active");
     SP.elements.browseView.classList.remove("hidden");
 
-    // Stop video and clear
-    if (SP.state.hls) {
-        SP.state.hls.destroy();
-        SP.state.hls = null;
-    }
-    if (SP.state.clientPlayer) {
-        SP.state.clientPlayer.cleanup();
-        SP.state.clientPlayer = null;
-    }
-    SP.state.isClientSide = false;
-    SP.elements.video.src = "";
+    // Tear down playback + reset all UI selection (also bumps loadToken so any
+    // in-flight tier handler bails before touching the dropdowns again).
+    resetPlaybackUIState();
     SP.state.currentFile = null;
 
     // Clear URL hash

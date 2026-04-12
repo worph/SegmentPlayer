@@ -22,7 +22,12 @@ var SP = {
         metricsInterval: null,
         playbackMode: localStorage.getItem('sp_playback_mode') || "auto",
         activePlaybackMode: null,
-        probeData: null
+        probeData: null,
+        // Monotonically incremented at the start of every playFileSetup. Tier
+        // handlers and async callbacks capture this and bail out if it has
+        // moved on, so a slow probe/manifest from a previously-clicked file
+        // can't pollute the currently-loading one.
+        loadToken: 0
     },
 
     // Configuration

@@ -38,8 +38,116 @@ function attachHlsStatsHooks(hls) {
     });
 }
 
-// Common setup shared by all playback tiers
+// Reset all per-file UI selection and playback state to a clean slate.
+// Called by playFileSetup before loading a new file and by switchToBrowseMode
+// when leaving the player. Returns the new loadToken so callers can capture it
+// and bail from stale async work.
+function resetPlaybackUIState() {
+    // Tear down any active streaming pipeline
+    if (SP.state.hls) {
+        SP.state.hls.destroy();
+        SP.state.hls = null;
+    }
+    if (SP.state.clientPlayer) {
+        SP.state.clientPlayer.cleanup();
+        SP.state.clientPlayer = null;
+    }
+
+    // Reset video element
+    SP.elements.video.removeAttribute('src');
+    SP.elements.video.onerror = null;
+    SP.elements.video.onloadedmetadata = null;
+    SP.elements.video.load();
+    removeAllTracks(SP.elements.video);
+
+    // Reset playback flags
+    SP.state.isClientSide = false;
+    SP.state.isTranscoding = false;
+
+    // Reset audio dropdown to a neutral "Loading..." state. .value is reset
+    // explicitly because replacing innerHTML alone leaves the property in
+    // an awkward state where the dropdown can still report a stale numeric
+    // value from the previous file.
+    SP.elements.audioSelect.innerHTML = '<option value="">Loading...</option>';
+    SP.elements.audioSelect.disabled = true;
+    SP.elements.audioSelect.value = "";
+    SP.state.currentAudioIdx = 0;
+
+    // Reset subtitle dropdown to "Off"
+    SP.elements.subtitleSelect.innerHTML = '<option value="">Off</option>';
+    SP.elements.subtitleSelect.disabled = true;
+    SP.elements.subtitleSelect.value = "";
+
+    // Reset resolution dropdown — every tier rebuilds this with its own
+    // options, so collapse to a placeholder for now.
+    SP.elements.resolutionSelect.innerHTML = '<option value="auto">Auto</option>';
+    SP.elements.resolutionSelect.disabled = true;
+    SP.elements.resolutionSelect.value = "auto";
+    SP.state.currentResolution = "auto";
+    SP.state.actualResolution = null;
+
+    // Reset transcoded-track caches (otherwise transcode→remux switch leaves
+    // stale entries that the change handler will misuse).
+    SP.state.transcodedAudioTracks = [];
+    SP.state.transcodedSubtitleTracks = [];
+    SP.state.currentTranscodeBase = "";
+
+    // Reset probe caches for the in-flight file
+    SP.state.currentProbe = null;
+    SP.state.probeData = null;
+
+    // Cancel any in-flight subtitle progress polling
+    if (typeof hideSubtitleProgress === "function") {
+        hideSubtitleProgress(false);
+    }
+    if (SP.elements.subtitleLoading) {
+        SP.elements.subtitleLoading.classList.remove("active");
+    }
+
+    // Bump generation token so stale async work bails out
+    SP.state.loadToken = (SP.state.loadToken || 0) + 1;
+    return SP.state.loadToken;
+}
+
+// Populate the audio dropdown from a list of tracks. Always sets .value and
+// SP.state.currentAudioIdx so the UI and state never drift apart.
+function setAudioTracks(tracks, getLabel, defaultIdx) {
+    if (!tracks || tracks.length === 0) {
+        SP.elements.audioSelect.innerHTML = '<option value="">Default</option>';
+        SP.elements.audioSelect.disabled = true;
+        SP.elements.audioSelect.value = "";
+        SP.state.currentAudioIdx = 0;
+        return;
+    }
+    var idx = (typeof defaultIdx === "number" && defaultIdx >= 0 && defaultIdx < tracks.length) ? defaultIdx : 0;
+    SP.elements.audioSelect.innerHTML = tracks.map(function(t, i) {
+        return '<option value="' + i + '">' + getLabel(t, i) + '</option>';
+    }).join("");
+    SP.elements.audioSelect.disabled = tracks.length <= 1;
+    SP.elements.audioSelect.value = String(idx);
+    SP.state.currentAudioIdx = idx;
+}
+
+// Populate the subtitle dropdown from a list of {value, label} options.
+// Always prepends an "Off" entry and resets .value so the previous video's
+// selection cannot leak.
+function setSubtitleTracks(options) {
+    var html = '<option value="">Off</option>';
+    if (options && options.length > 0) {
+        html += options.map(function(opt) {
+            return '<option value="' + opt.value + '">' + opt.label + '</option>';
+        }).join("");
+    }
+    SP.elements.subtitleSelect.innerHTML = html;
+    SP.elements.subtitleSelect.value = "";
+    SP.elements.subtitleSelect.disabled = !(options && options.length > 0);
+}
+
+// Common setup shared by all playback tiers. Returns the loadToken for this
+// load; tier handlers should capture it and check it across await points.
 function playFileSetup(filePath, fileName) {
+    var token = resetPlaybackUIState();
+
     SP.state.currentFile = filePath;
     updateUrlHash(filePath);
     resetMetrics();
@@ -55,37 +163,21 @@ function playFileSetup(filePath, fileName) {
     SP.elements.downloadBtn.disabled = false;
     SP.elements.downloadBtn.title = "Download: " + fileName;
 
-    // Cleanup existing playback
-    if (SP.state.hls) {
-        SP.state.hls.destroy();
-        SP.state.hls = null;
-    }
-    if (SP.state.clientPlayer) {
-        SP.state.clientPlayer.cleanup();
-        SP.state.clientPlayer = null;
-    }
-    SP.elements.video.removeAttribute('src');
-    SP.elements.video.onerror = null;
-    SP.elements.video.onloadedmetadata = null;
-    SP.elements.video.load();
-    SP.state.isClientSide = false;
-    SP.state.isTranscoding = false;
-
-    SP.elements.audioSelect.innerHTML = '<option value="">Loading...</option>';
-    SP.elements.audioSelect.disabled = true;
-    SP.elements.subtitleSelect.innerHTML = '<option value="">Off</option>';
-    SP.elements.subtitleSelect.disabled = true;
-    SP.state.currentAudioIdx = 0;
-
-    removeAllTracks(SP.elements.video);
+    return token;
 }
 
 async function playFile(filePath, fileName) {
-    playFileSetup(filePath, fileName);
+    var token = playFileSetup(filePath, fileName);
 
     // Probe the file for codec info
-    SP.state.probeData = await getProbeData(filePath);
-    SP.state.currentProbe = SP.state.probeData;
+    var probe = await getProbeData(filePath);
+
+    // If the user clicked another file while the probe was in flight, drop
+    // this one — the new load already reset state and is in progress.
+    if (token !== SP.state.loadToken) return;
+
+    SP.state.probeData = probe;
+    SP.state.currentProbe = probe;
 
     // Determine playback mode
     var mode;
@@ -112,25 +204,26 @@ async function playFile(filePath, fileName) {
     // Route to appropriate handler
     switch (mode) {
         case "direct":
-            playDirect(filePath, fileName);
+            playDirect(filePath, fileName, token);
             break;
         case "client":
-            playFileClient(filePath, fileName, SP.state.probeData);
+            playFileClient(filePath, fileName, SP.state.probeData, token);
             break;
         case "remux":
-            playRemux(filePath, fileName);
+            playRemux(filePath, fileName, token);
             break;
         case "transcode":
             var transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
             SP.state.isTranscoding = true;
             updateQualityDisplay();
-            playTranscoded(transcodedSrc, fileName, true);
+            playTranscoded(transcodedSrc, fileName, true, token);
             break;
     }
 }
 
 // Direct mode: native <video> element plays the raw file
-function playDirect(filePath, fileName) {
+function playDirect(filePath, fileName, token) {
+    if (token === undefined) token = SP.state.loadToken;
     var videoSrc = "/direct/" + encodeFilePath(filePath);
 
     setStatus("Direct", "#51cf66");
@@ -138,33 +231,38 @@ function playDirect(filePath, fileName) {
     // Disable resolution select — no quality options in direct mode
     SP.elements.resolutionSelect.innerHTML = '<option value="original">Original</option>';
     SP.elements.resolutionSelect.disabled = true;
+    SP.elements.resolutionSelect.value = "original";
 
-    // Audio tracks — only show selector if native audioTracks API is available
-    SP.elements.audioSelect.innerHTML = '<option value="">Default</option>';
-    SP.elements.audioSelect.disabled = true;
+    // Audio: setAudioTracks(null,...) renders the neutral "Default" placeholder
+    setAudioTracks(null);
 
     // Set video source — native <video> element handles playback
     SP.elements.video.src = videoSrc;
 
     SP.elements.video.onloadedmetadata = function() {
+        if (token !== SP.state.loadToken) return;
         setStatus("Direct", "#51cf66");
 
         // Only expose audio switching if browser supports the audioTracks API
-        if (SP.elements.video.audioTracks && SP.elements.video.audioTracks.length > 1) {
-            var opts = '';
-            for (var i = 0; i < SP.elements.video.audioTracks.length; i++) {
-                var track = SP.elements.video.audioTracks[i];
-                var label = track.label || track.language || 'Track ' + (i + 1);
-                opts += '<option value="' + i + '">' + label + '</option>';
+        var native = SP.elements.video.audioTracks;
+        if (native && native.length > 1) {
+            var tracks = [];
+            for (var i = 0; i < native.length; i++) tracks.push(native[i]);
+            setAudioTracks(tracks, function(track, i) {
+                return track.label || track.language || 'Track ' + (i + 1);
+            }, 0);
+            // Keep the native enabled flags in sync with the dropdown so the
+            // browser actually plays track 0 from the start.
+            for (var j = 0; j < native.length; j++) {
+                native[j].enabled = (j === 0);
             }
-            SP.elements.audioSelect.innerHTML = opts;
-            SP.elements.audioSelect.disabled = false;
         }
 
         SP.elements.video.play().catch(function() {});
     };
 
     SP.elements.video.onerror = function() {
+        if (token !== SP.state.loadToken) return;
         // Auto-fallback: try remux, then transcode
         console.log("Direct playback failed, falling back...");
         if (SP.state.probeData) {
@@ -173,7 +271,7 @@ function playDirect(filePath, fileName) {
             if ((vcodec === 'h264' || vcodec === 'avc1') && (acodec === 'aac' || acodec === 'mp3')) {
                 SP.state.activePlaybackMode = "remux";
                 updateAutoModeLabel();
-                playRemux(filePath, fileName);
+                playRemux(filePath, fileName, token);
                 return;
             }
         }
@@ -181,43 +279,38 @@ function playDirect(filePath, fileName) {
         updateAutoModeLabel();
         SP.state.isTranscoding = true;
         updateQualityDisplay();
-        tryTranscodedFallback(filePath, fileName);
+        tryTranscodedFallback(filePath, fileName, token);
     };
 
-    // Load external subtitles, then merge with embedded subtitles from probe
-    loadExternalSubtitles(filePath).then(function() {
-        if (SP.state.probeData && SP.state.probeData.subtitles && SP.state.probeData.subtitles.length > 0) {
-            var embeddedOpts = SP.state.probeData.subtitles.map(function(sub) {
+    // Load external subtitles, then merge with embedded subtitles from probe.
+    // Build a single combined option list and assign once via setSubtitleTracks
+    // so we never end up with stale entries from a previous video.
+    findSubtitles(filePath).then(function(externalSubs) {
+        if (token !== SP.state.loadToken) return;
+        var options = [];
+        externalSubs.forEach(function(sub) {
+            options.push({ value: sub.path, label: sub.lang });
+        });
+        if (SP.state.probeData && SP.state.probeData.subtitles) {
+            SP.state.probeData.subtitles.forEach(function(sub) {
                 var label = sub.title || (sub.language !== 'und' ? sub.language.toUpperCase() : 'Track ' + (sub.index + 1));
-                return '<option value="embedded:' + sub.index + '">' + label + ' (embedded)</option>';
-            }).join('');
-
-            // Append embedded subs to whatever external subs are already in the dropdown
-            SP.elements.subtitleSelect.innerHTML += embeddedOpts;
-            SP.elements.subtitleSelect.disabled = false;
+                options.push({ value: 'embedded:' + sub.index, label: label + ' (embedded)' });
+            });
         }
+        setSubtitleTracks(options);
     });
 }
 
-async function loadExternalSubtitles(filePath) {
-    var subs = await findSubtitles(filePath);
-    if (subs.length > 0) {
-        SP.elements.subtitleSelect.innerHTML = '<option value="">Off</option>' +
-            subs.map(function(sub) {
-                return '<option value="' + sub.path + '">' + sub.lang + '</option>';
-            }).join("");
-        SP.elements.subtitleSelect.disabled = false;
-    }
-}
-
 // Client-side demux + transmux via libav.js + MediaSource
-async function playFileClient(filePath, fileName, probeData) {
+async function playFileClient(filePath, fileName, probeData, token) {
+    if (token === undefined) token = SP.state.loadToken;
     setStatus("Analyzing...", "#4dabf7", true);
     SP.state.isClientSide = true;
     SP.state.activePlaybackMode = "client";
     updateQualityDisplay();
 
     function fallback(reason) {
+        if (token !== SP.state.loadToken) return;
         console.warn("[Client] Falling back:", reason);
         SP.state.isClientSide = false;
         if (SP.state.clientPlayer) {
@@ -244,12 +337,15 @@ async function playFileClient(filePath, fileName, probeData) {
                 SP.elements.video.load();
                 SP.state.activePlaybackMode = "direct";
                 updateAutoModeLabel();
-                setTimeout(function() { playDirect(filePath, fileName); }, 100);
+                setTimeout(function() {
+                    if (token !== SP.state.loadToken) return;
+                    playDirect(filePath, fileName, token);
+                }, 100);
                 return;
             }
         }
         console.log("[Client] Falling back to server transcode");
-        tryTranscodedFallback(filePath, fileName);
+        tryTranscodedFallback(filePath, fileName, token);
     }
 
     try {
@@ -277,13 +373,15 @@ async function playFileClient(filePath, fileName, probeData) {
         var player = new ClientPlayer(SP.elements.video);
         SP.state.clientPlayer = player;
         await player.load(filePath, probeData, 0);
+        if (token !== SP.state.loadToken) return;
         populateAudioFromProbe(probeData);
-        populateSubtitlesFromProbe(probeData, filePath);
+        populateSubtitlesFromProbe(probeData, filePath, token);
 
         // Quality dropdown: only Original in client-side mode
         var h = (probeData.video && probeData.video.height) || "?";
         SP.elements.resolutionSelect.innerHTML = '<option value="original">Original (' + h + 'p)</option>';
         SP.elements.resolutionSelect.disabled = true;
+        SP.elements.resolutionSelect.value = "original";
         SP.state.currentResolution = "original";
         SP.state.actualResolution = probeData.video ? probeData.video.height : null;
         updateQualityDisplay();
@@ -291,13 +389,18 @@ async function playFileClient(filePath, fileName, probeData) {
         setStatus("Client-side", "#51cf66");
         SP.elements.video.play().catch(function() {});
 
-        // Watchdog: if no video frames appear within 5s, fallback
+        // Watchdog: if no video frames appear within this window, fallback.
+        // For HEVC open-GOP content, the muxer has to wait for the first IDR
+        // after the opening one to close the initial fragment (CRAs inside the
+        // GOP are deliberately not marked as sync samples to avoid the MSE
+        // "RAP with later PTS than dependent non-key" warning). Anime HEVC
+        // commonly has 10+ second IDR spacing, so 5 s is too tight.
         var watchdog = setTimeout(function() {
             if (SP.state.clientPlayer && SP.elements.video.readyState < 3) {
-                console.warn("[Client] Watchdog: no playable data after 5s");
+                console.warn("[Client] Watchdog: no playable data after 20s");
                 fallback("Watchdog timeout — no playable data");
             }
-        }, 5000);
+        }, 20000);
 
         // Clear watchdog once video starts playing
         SP.elements.video.addEventListener("playing", function clearWatchdog() {
@@ -312,45 +415,37 @@ async function playFileClient(filePath, fileName, probeData) {
 
 // Populate audio dropdown from probe data (for client-side mode)
 function populateAudioFromProbe(probeData) {
-    if (!probeData || !probeData.audio || probeData.audio.length === 0) {
-        SP.elements.audioSelect.innerHTML = '<option value="">Default</option>';
-        SP.elements.audioSelect.disabled = true;
-        return;
-    }
-    SP.elements.audioSelect.innerHTML = probeData.audio.map(function(track, i) {
-        var label = track.title || track.language || "Track " + (i + 1);
-        return '<option value="' + i + '">' + label + '</option>';
-    }).join("");
-    SP.elements.audioSelect.disabled = probeData.audio.length <= 1;
+    var tracks = probeData && probeData.audio;
+    setAudioTracks(tracks, function(track, i) {
+        return track.title || track.language || "Track " + (i + 1);
+    }, 0);
 }
 
 // Populate subtitle dropdown from probe data (for client-side mode)
-async function populateSubtitlesFromProbe(probeData, filePath) {
-    var options = '<option value="">Off</option>';
+async function populateSubtitlesFromProbe(probeData, filePath, token) {
+    var options = [];
 
     // Embedded subtitles from probe
     if (probeData && probeData.subtitles && probeData.subtitles.length > 0) {
-        options += probeData.subtitles.map(function(sub, i) {
+        probeData.subtitles.forEach(function(sub, i) {
             var label = sub.title || sub.language || "Track " + (i + 1);
-            return '<option value="embedded:' + i + '">' + label + '</option>';
-        }).join("");
+            options.push({ value: 'embedded:' + i, label: label });
+        });
     }
 
     // External subtitle files
     var externalSubs = await findSubtitles(filePath);
-    if (externalSubs.length > 0) {
-        options += externalSubs.map(function(sub) {
-            return '<option value="' + sub.path + '">' + sub.lang + ' (ext)</option>';
-        }).join("");
-    }
+    if (token !== undefined && token !== SP.state.loadToken) return;
+    externalSubs.forEach(function(sub) {
+        options.push({ value: sub.path, label: sub.lang + ' (ext)' });
+    });
 
-    SP.elements.subtitleSelect.innerHTML = options;
-    var hasOptions = (probeData && probeData.subtitles && probeData.subtitles.length > 0) || externalSubs.length > 0;
-    SP.elements.subtitleSelect.disabled = !hasOptions;
+    setSubtitleTracks(options);
 }
 
 // HLS remux via nginx-vod-module (H.264+AAC in compatible containers)
-function playRemux(filePath, fileName) {
+function playRemux(filePath, fileName, token) {
+    if (token === undefined) token = SP.state.loadToken;
     var videoSrc = "/hls/" + encodeURIComponent(filePath) + "/master.m3u8";
 
     if (Hls.isSupported()) {
@@ -367,29 +462,24 @@ function playRemux(filePath, fileName) {
         attachHlsStatsHooks(SP.state.hls);
 
         SP.state.hls.on(Hls.Events.MANIFEST_PARSED, async function(event, data) {
+            if (token !== SP.state.loadToken) return;
             setStatus("Ready", "#51cf66");
 
-            if (SP.state.hls.audioTracks && SP.state.hls.audioTracks.length > 0) {
-                SP.elements.audioSelect.innerHTML = buildTrackOptions(SP.state.hls.audioTracks, function(t, i) {
+            var hlsTracks = SP.state.hls.audioTracks;
+            if (hlsTracks && hlsTracks.length > 0) {
+                setAudioTracks(hlsTracks, function(t, i) {
                     return t.name || t.lang || "Track " + (i + 1);
-                });
-                SP.elements.audioSelect.disabled = false;
-                SP.elements.audioSelect.value = SP.state.hls.audioTrack;
-                SP.state.currentAudioIdx = SP.state.hls.audioTrack;
+                }, SP.state.hls.audioTrack);
             } else {
-                SP.elements.audioSelect.innerHTML = '<option value="">Default</option>';
-                SP.elements.audioSelect.disabled = true;
-                SP.state.currentAudioIdx = 0;
+                setAudioTracks(null);
             }
 
             var subs = await findSubtitles(filePath);
-            if (subs.length > 0) {
-                SP.elements.subtitleSelect.innerHTML = '<option value="">Off</option>' +
-                    subs.map(function(sub) {
-                        return '<option value="' + sub.path + '">' + sub.lang + '</option>';
-                    }).join("");
-                SP.elements.subtitleSelect.disabled = false;
-            }
+            if (token !== SP.state.loadToken) return;
+            var subOptions = subs.map(function(sub) {
+                return { value: sub.path, label: sub.lang };
+            });
+            setSubtitleTracks(subOptions);
 
             SP.elements.video.play().catch(function() {});
         });
@@ -402,12 +492,13 @@ function playRemux(filePath, fileName) {
             if (remuxFallingBack) return;
             // Ignore events if this HLS instance was replaced by a fallback
             if (SP.state.hls !== remuxHls) return;
+            if (token !== SP.state.loadToken) return;
 
             if (data.fatal) {
                 switch (data.type) {
                     case Hls.ErrorTypes.NETWORK_ERROR:
                         remuxFallingBack = true;
-                        tryTranscodedFallback(filePath, fileName);
+                        tryTranscodedFallback(filePath, fileName, token);
                         break;
                     case Hls.ErrorTypes.MEDIA_ERROR:
                         SP.state.hls.recoverMediaError();
@@ -424,7 +515,8 @@ function playRemux(filePath, fileName) {
                     if (SP.state.hls === remuxHls) SP.state.hls = null;
                     remuxHls.destroy();
                     setTimeout(function() {
-                        tryTranscodedFallback(filePath, fileName);
+                        if (token !== SP.state.loadToken) return;
+                        tryTranscodedFallback(filePath, fileName, token);
                     }, 0);
                 }
             }
@@ -457,7 +549,8 @@ function playRemux(filePath, fileName) {
     }
 }
 
-async function tryTranscodedFallback(filePath, fileName) {
+async function tryTranscodedFallback(filePath, fileName, token) {
+    if (token === undefined) token = SP.state.loadToken;
     setStatus("Transcoding...", "#ffd43b", true);
 
     SP.state.isTranscoding = true;
@@ -469,12 +562,14 @@ async function tryTranscodedFallback(filePath, fileName) {
 
     try {
         var response = await fetch(transcodedSrc);
+        if (token !== SP.state.loadToken) return;
         if (response.ok) {
-            playTranscoded(transcodedSrc, fileName, true);
+            playTranscoded(transcodedSrc, fileName, true, token);
         } else {
             setStatus("Error", "#ff6b6b");
         }
     } catch (err) {
+        if (token !== SP.state.loadToken) return;
         setStatus("Error", "#ff6b6b");
     }
 }
@@ -499,25 +594,27 @@ function parseAndPopulateTracks(manifest) {
     }
 
     if (SP.state.transcodedAudioTracks.length > 0) {
-        SP.elements.audioSelect.innerHTML = buildTrackOptions(SP.state.transcodedAudioTracks, function(t) {
+        setAudioTracks(SP.state.transcodedAudioTracks, function(t) {
             return t.name;
-        });
-        SP.elements.audioSelect.disabled = false;
-        SP.elements.audioSelect.value = "0";
-        SP.state.currentAudioIdx = 0;
+        }, 0);
     }
 
     if (SP.state.transcodedSubtitleTracks.length > 0) {
+        // Transcoded subtitles use "-1" as the Off sentinel because the change
+        // handler treats that value specially. Build the dropdown directly
+        // here instead of via setSubtitleTracks.
         SP.elements.subtitleSelect.innerHTML = '<option value="-1">Off</option>' +
             SP.state.transcodedSubtitleTracks.map(function(track, i) {
                 return '<option value="' + i + '">' + track.name + '</option>';
             }).join("");
+        SP.elements.subtitleSelect.value = "-1";
         SP.elements.subtitleSelect.disabled = false;
     }
 }
 
-async function playTranscoded(url, fileName, isActiveTranscode) {
+async function playTranscoded(url, fileName, isActiveTranscode, token) {
     if (isActiveTranscode === undefined) isActiveTranscode = false;
+    if (token === undefined) token = SP.state.loadToken;
 
     if (SP.state.hls) {
         SP.state.hls.destroy();
@@ -530,8 +627,11 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
     try {
         var response = await fetch(url);
         var manifest = await response.text();
+        if (token !== SP.state.loadToken) return;
         parseAndPopulateTracks(manifest);
-    } catch (e) {}
+    } catch (e) {
+        if (token !== SP.state.loadToken) return;
+    }
 
     SP.elements.resolutionSelect.disabled = false;
 
@@ -547,6 +647,7 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
     attachHlsStatsHooks(SP.state.hls);
 
     SP.state.hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
+        if (token !== SP.state.loadToken) return;
         setStatus("", "#51cf66");
 
         if (SP.state.hls.levels && SP.state.hls.levels.length > 0) {
@@ -593,12 +694,9 @@ async function playTranscoded(url, fileName, isActiveTranscode) {
 
         if (!SP.state.transcodedAudioTracks || SP.state.transcodedAudioTracks.length === 0) {
             if (SP.state.hls.audioTracks && SP.state.hls.audioTracks.length > 0) {
-                SP.elements.audioSelect.innerHTML = buildTrackOptions(SP.state.hls.audioTracks, function(t, i) {
+                setAudioTracks(SP.state.hls.audioTracks, function(t, i) {
                     return t.name || t.lang || "Audio " + (i + 1);
-                });
-                SP.elements.audioSelect.disabled = false;
-                SP.elements.audioSelect.value = SP.state.hls.audioTrack.toString();
-                SP.state.currentAudioIdx = SP.state.hls.audioTrack;
+                }, SP.state.hls.audioTrack);
             }
         }
 

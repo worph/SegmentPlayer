@@ -573,7 +573,12 @@ ClientPlayer.prototype.cleanup = function() {
     if (this._audioEl) {
         this._audioEl.pause();
         this._audioEl.removeAttribute("src");
+        // Calling .load() after stripping src forces the element to abort any
+        // in-flight network activity for the previous file's audio track.
+        try { this._audioEl.load(); } catch (e) {}
         if (this._audioEl.parentNode) this._audioEl.parentNode.removeChild(this._audioEl);
         this._audioEl = null;
     }
+
+    this.currentAudioTrack = 0;
 };

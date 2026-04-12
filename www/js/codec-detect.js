@@ -51,7 +51,11 @@ function mapVideoCodecToMSE(codec, profile, bitDepth, width, height) {
             else level = "33";                // 5.1 (4K)
             return "avc1." + profileHex + level;
         case "hevc": case "h265":
-            return bitDepth >= 10 ? "hev1.2.4.L153.B0" : "hev1.1.6.L153.B0";
+            // 'hvc1' (parameter sets in sample description box) instead of 'hev1'
+            // (inline parameter sets per fragment). Chrome's D3D11 HEVC path is
+            // substantially faster with hvc1 — our muxer also writes hvc1 sample
+            // entries, so this must match for MediaSource.isTypeSupported.
+            return bitDepth >= 10 ? "hvc1.2.4.L153.B0" : "hvc1.1.6.L153.B0";
         case "vp9":
             return bitDepth >= 10 ? "vp09.02.10.10" : "vp09.00.10.08";
         case "av1":

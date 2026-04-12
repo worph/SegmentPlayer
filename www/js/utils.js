@@ -45,13 +45,6 @@ function removeAllTracks(videoEl) {
     videoEl.querySelectorAll("track").forEach(function(t) { t.remove(); });
 }
 
-function buildTrackOptions(tracks, labelFn) {
-    return tracks.map(function(track, i) {
-        var label = labelFn(track, i);
-        return '<option value="' + i + '">' + label + '</option>';
-    }).join("");
-}
-
 async function getProbeData(filePath) {
     try {
         var response = await fetch("/api/probe/" + encodeFilePath(filePath));

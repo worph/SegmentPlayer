@@ -19,6 +19,11 @@ function initAudioControl() {
         if (this.value === "") return;
 
         var newAudioIdx = parseInt(this.value);
+        // The early-return below relies on resetPlaybackUIState + setAudioTracks
+        // keeping SP.state.currentAudioIdx and the dropdown's .value in lockstep
+        // across file switches. Without that contract, a stale dropdown showing
+        // (say) "1" from the previous file would no-op against a freshly-reset
+        // currentAudioIdx of 0, leaving the user unable to fix the selection.
         if (isNaN(newAudioIdx) || newAudioIdx === SP.state.currentAudioIdx) return;
 
         // Client-side playback: switch audio track via ClientPlayer

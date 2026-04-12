@@ -93,12 +93,16 @@ ClientMuxer.prototype.init = async function(streamInfos) {
     this.pb = ret[2];
 
     // Set fragmented MP4 flags (must be before writing header)
-    // frag_keyframe: new fragment at each keyframe
+    // frag_keyframe: new fragment at each keyframe (IDR + CRA for HEVC)
     // empty_moov: no data in initial moov atom (streaming compatible)
     // default_base_moof: required for MSE compatibility
     // negative_cts_offsets: allows B-frame CTS (PTS-DTS) to be negative.
     //   Still useful as a safety net even with correct DTS synthesis — some
     //   B-pyramid patterns produce legitimately negative CTS offsets.
+    // For HEVC open-GOP content, we don't change fragmentation here — instead
+    // RASL leading pictures (the samples with PTS earlier than their CRA
+    // keyframe) are stripped in the mux loop below. See the "HEVC RASL
+    // stripping" block.
     await this.libav.av_opt_set(this.oc, "movflags",
         "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
         this.libav.AV_OPT_SEARCH_CHILDREN);
@@ -130,6 +134,24 @@ ClientMuxer.prototype.init = async function(streamInfos) {
                 // _isHevc[si] is already set from probe data above. Kept here
                 // because the HEVC-specific filter in the mux loop gates on it;
                 // see the "HEVC open-GOP filter" block near pkt processing.
+
+                // For HEVC, force the sample-entry codec_tag to 'hvc1' (instead
+                // of the default 'hev1'). With 'hev1', VPS/SPS/PPS parameter
+                // sets are inline per fragment, and Chrome's D3D11 hardware
+                // HEVC path re-parses them on every fragment — which caps
+                // decode throughput below real-time. 'hvc1' puts parameter
+                // sets only in the sample description box, letting the hw
+                // decoder init once and stay in its fast path.
+                // FOURCC = MKTAG('h','v','c','1') = 0x31637668 (little-endian).
+                if (this._isHevc[si] &&
+                    typeof this.libav.AVCodecParameters_codec_tag_s === "function") {
+                    try {
+                        await this.libav.AVCodecParameters_codec_tag_s(codecparPtr, 0x31637668);
+                        console.log("[Muxer] Set codec_tag='hvc1' on HEVC output stream", si);
+                    } catch (e) {
+                        console.warn("[Muxer] Failed to set hvc1 tag:", e.message || e);
+                    }
+                }
             } else if (codecType === this.libav.AVMEDIA_TYPE_AUDIO) {
                 this._streamKind[si] = "audio";
                 this._reorderDepth[si] = 0;
@@ -304,28 +326,17 @@ ClientMuxer.prototype.mux = async function(packets) {
 
             pkt.stream_index = outputIdx;
 
-            // HEVC open-GOP filter: on HEVC streams, clear AV_PKT_FLAG_KEY for
-            // CRA / BLA keyframes so only true IDR frames get written as sync
-            // samples in the fMP4 trun. Without this, Chrome's MSE flags the
-            // "RAP with later PTS than dependent non-key sample" pattern and
-            // halves playback pacing. See client-muxer.js:init() for the
-            // rationale block.
-            if (this._isHevc[outputIdx] && (pkt.flags & 1) && pkt.data) {
-                var nt = _hevcFirstVclNalType(pkt.data);
-                //  19 = IDR_W_RADL, 20 = IDR_N_LP → keep as sync sample.
-                //  All other VCL types (including 21=CRA_NUT, 16/17/18=BLA_*)
-                //  are non-IDR random-access points; clear KEY for MSE sanity.
-                if (nt >= 0 && nt !== 19 && nt !== 20) {
-                    pkt.flags &= ~1;
-                    this._craFiltered = (this._craFiltered || 0) + 1;
-                    if (this._craFiltered === 1 || this._craFiltered % 100 === 0) {
-                        console.log("[Muxer] Cleared KEY flag on HEVC non-IDR RAP",
-                            "(nal_type=" + nt + ", cumulative=" + this._craFiltered + ")");
-                    }
-                } else if (nt === 19 || nt === 20) {
-                    this._idrKept = (this._idrKept || 0) + 1;
-                }
-            }
+            // Note: we previously stripped HEVC leading pictures (RADL/RASL,
+            // NAL types 6-9) to avoid Chrome's "RAP with later PTS than
+            // dependent non-key" warning on open-GOP content. That worked
+            // for the warning, but created PTS gaps where the stripped
+            // frames used to be. FFmpeg's mp4 muxer then extended the
+            // preceding sample's duration to span the gap — producing trun
+            // sample_duration entries of 5000+ ticks (≈0.3 s at 16000 Hz
+            // timebase) that Chrome used as the authoritative frame-time,
+            // collapsing playback pacing to ~9 fps. Keeping all packets
+            // in the stream preserves uniform sample durations even though
+            // Chrome may warn about the RAP/PTS mismatch.
 
             if (this._streamKind[outputIdx] !== "video" || this._synthesisFallback[outputIdx]) {
                 this._emitPassthrough(outputIdx, pkt, flatPackets);
@@ -556,6 +567,11 @@ ClientMuxer.prototype._emitSynthesized = function(outputIdx, pkt, dts, flatPacke
 // Pick a duration for this packet. Tier A uses the demuxer's own duration if
 // cross-check found it reliable; otherwise falls back to the modal duration
 // derived at warmup freeze (or a 24fps fallback if warmup couldn't measure).
+//
+// (FFmpeg's fragmented mp4 muxer actually computes per-sample trun durations
+// from DTS deltas of consecutive written packets, overriding pkt.duration
+// for all but the final sample of a fragment. So this value mostly matters
+// for the tail sample. Kept faithful to the demuxer when possible.)
 ClientMuxer.prototype._computeDuration = function(outputIdx, pkt) {
     if (this._packetDurationSeen[outputIdx]
             && this._packetDurationReliable[outputIdx]

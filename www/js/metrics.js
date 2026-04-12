@@ -191,6 +191,11 @@ function renderMetricsLocal() {
             parts.push(vc);
         }
         if (probe && probe.container) parts.push(probe.container.toUpperCase());
+        // Flag the known client-mode HEVC MSE rate cap (see docs/known-issues).
+        if (mode === "client" && probe && probe.video &&
+                (probe.video.codec === "hevc" || probe.video.codec === "h265")) {
+            parts.push("MSE throttled — use Direct for full fps");
+        }
         modeDetail.textContent = parts.join(" · ");
     }
 
