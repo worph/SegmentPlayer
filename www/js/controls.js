@@ -26,10 +26,20 @@ function initAudioControl() {
         // currentAudioIdx of 0, leaving the user unable to fix the selection.
         if (isNaN(newAudioIdx) || newAudioIdx === SP.state.currentAudioIdx) return;
 
-        // Client-side playback: switch audio track via ClientPlayer
+        // Client-side playback: switch audio track via ClientPlayer. The call
+        // is async and may reject (e.g. browser lacks a decoder for the target
+        // codec). Revert the dropdown and state on rejection so the UI keeps
+        // reflecting the actually-playing track.
         if (SP.state.isClientSide && SP.state.clientPlayer) {
-            SP.state.clientPlayer.switchAudioTrack(newAudioIdx, SP.elements.video.currentTime);
+            var self = this;
+            var prevIdx = SP.state.currentAudioIdx;
             SP.state.currentAudioIdx = newAudioIdx;
+            SP.state.clientPlayer.switchAudioTrack(newAudioIdx).then(function(ok) {
+                if (!ok) {
+                    SP.state.currentAudioIdx = prevIdx;
+                    self.value = String(prevIdx);
+                }
+            });
             return;
         }
 
@@ -136,7 +146,7 @@ function initSubtitleControl() {
             // Client-side mode: use piggybacked subtitle packets (no server needed)
             if (SP.state.isClientSide && SP.state.clientPlayer) {
                 SP.state.clientPlayer.loadSubtitleTrack(subIndex).catch(function(err) {
-                    console.error("[Subtitles] Client extraction error:", err);
+                    SP.log.error("Subtitles", "Client extraction error:", err);
                 });
                 return;
             }

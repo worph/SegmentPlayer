@@ -2,6 +2,58 @@
 
 var _muxerInstanceId = 0;
 
+// Build an AVCodecParameters* describing Opus @ sampleRate/channels for use as
+// an output stream in ff_init_muxer. WebCodecs emits raw Opus packets — libav
+// never sees the encode path, so we need a codecpar built from scratch with
+// correct OpusHead extradata (19 bytes: magic, version, channels, pre_skip,
+// input sample rate, output gain, mapping family).
+//
+// Rather than hand-build the extradata (easy to get pre_skip, mapping family,
+// or channel mapping table wrong), we use libav's libopus encoder purely as
+// a codecpar factory: alloc a context, open it (libopus generates OpusHead),
+// copy the resulting codecpar out, free the context. The encoder itself is
+// never fed frames.
+async function buildOpusCodecpar(libav, channels, sampleRate) {
+    channels = channels || 2;
+    sampleRate = sampleRate || 48000;
+    var enc = await libav.avcodec_find_encoder_by_name("libopus");
+    if (!enc) throw new Error("libopus encoder not available in libav build");
+    var ctx = await libav.avcodec_alloc_context3(enc);
+    if (!ctx) throw new Error("avcodec_alloc_context3(libopus) returned null");
+    try {
+        await libav.AVCodecContext_sample_rate_s(ctx, sampleRate);
+        // This libav.js build's libopus accepts flt (packed float) or s16 only,
+        // not the fltp (planar float) that mainline FFmpeg uses. The sample
+        // format here is purely for avcodec_open2 to succeed — actual encoding
+        // runs through WebCodecs, which supplies its own samples to the muxer
+        // as pre-encoded Opus packets.
+        await libav.AVCodecContext_sample_fmt_s(ctx, libav.AV_SAMPLE_FMT_FLT);
+        if (typeof libav.AVCodecContext_ch_layout_nb_channels_s === "function") {
+            await libav.AVCodecContext_ch_layout_nb_channels_s(ctx, channels);
+        }
+        if (typeof libav.AVCodecContext_channels_s === "function") {
+            await libav.AVCodecContext_channels_s(ctx, channels);
+        }
+        if (typeof libav.AVCodecContext_channel_layoutmask_s === "function") {
+            // FL+FR = 0x3, FC = 0x4
+            var mask = (channels === 1) ? 0x4 : 0x3;
+            await libav.AVCodecContext_channel_layoutmask_s(ctx, mask);
+        }
+        await libav.AVCodecContext_bit_rate_s(ctx, 128000);
+        if (typeof libav.AVCodecContext_time_base_s === "function") {
+            await libav.AVCodecContext_time_base_s(ctx, 1, sampleRate);
+        }
+        var ret = await libav.avcodec_open2(ctx, enc, 0);
+        if (ret < 0) throw new Error("avcodec_open2(libopus) failed: " + ret);
+        var codecpar = await libav.avcodec_parameters_alloc();
+        if (!codecpar) throw new Error("avcodec_parameters_alloc returned null");
+        await libav.avcodec_parameters_from_context(codecpar, ctx);
+        return codecpar;
+    } finally {
+        try { await libav.avcodec_free_context_js(ctx); } catch (e) {}
+    }
+}
+
 function ClientMuxer(libav) {
     this.libav = libav;
     this._deviceName = "mux_" + (++_muxerInstanceId) + ".mp4";
@@ -121,8 +173,6 @@ ClientMuxer.prototype.init = async function(streamInfos) {
 
     // Inspect each output stream's codec_type to drive the DTS-synthesis
     // branch (video needs full synthesis; audio/other pass through).
-    // Also fix audio codec frame_size (MKV demuxer omits it, which causes
-    // Chrome MSE to reject the audio track).
     try {
         var nbStreams = await this.libav.AVFormatContext_nb_streams(this.oc);
         for (var si = 0; si < nbStreams; si++) {
@@ -132,10 +182,6 @@ ClientMuxer.prototype.init = async function(streamInfos) {
 
             if (codecType === this.libav.AVMEDIA_TYPE_VIDEO) {
                 this._streamKind[si] = "video";
-                // _isHevc[si] is already set from probe data above. Kept here
-                // because the HEVC-specific filter in the mux loop gates on it;
-                // see the "HEVC open-GOP filter" block near pkt processing.
-
                 // For HEVC, force the sample-entry codec_tag to 'hvc1' (instead
                 // of the default 'hev1'). With 'hev1', VPS/SPS/PPS parameter
                 // sets are inline per fragment, and Chrome's D3D11 hardware
@@ -148,9 +194,9 @@ ClientMuxer.prototype.init = async function(streamInfos) {
                     typeof this.libav.AVCodecParameters_codec_tag_s === "function") {
                     try {
                         await this.libav.AVCodecParameters_codec_tag_s(codecparPtr, 0x31637668);
-                        console.log("[Muxer] Set codec_tag='hvc1' on HEVC output stream", si);
+                        SP.log.debug("Muxer", "Set codec_tag='hvc1' on HEVC output stream", si);
                     } catch (e) {
-                        console.warn("[Muxer] Failed to set hvc1 tag:", e.message || e);
+                        SP.log.warn("Muxer", "Failed to set hvc1 tag:", e.message || e);
                     }
                 }
             } else if (codecType === this.libav.AVMEDIA_TYPE_AUDIO) {
@@ -162,22 +208,9 @@ ClientMuxer.prototype.init = async function(streamInfos) {
                 this._reorderDepth[si] = 0;
                 this._depthMeasured[si] = true;
             }
-
-            if (codecType === this.libav.AVMEDIA_TYPE_AUDIO) {
-                var codecId = await this.libav.AVCodecParameters_codec_id(codecparPtr);
-                var decoder = await this.libav.avcodec_find_decoder(codecId);
-                var tmpCtx = await this.libav.avcodec_alloc_context3(decoder);
-                await this.libav.avcodec_parameters_to_context(tmpCtx, codecparPtr);
-                var currentFrameSize = await this.libav.AVCodecContext_frame_size(tmpCtx);
-                if (!currentFrameSize || currentFrameSize <= 0) {
-                    await this.libav.AVCodecContext_frame_size_s(tmpCtx, 1024);
-                    await this.libav.avcodec_parameters_from_context(codecparPtr, tmpCtx);
-                }
-                await this.libav.avcodec_free_context_js(tmpCtx);
-            }
         }
     } catch (e) {
-        console.warn("[Muxer] Could not inspect stream kinds / fix audio frame_size:", e.message || e);
+        SP.log.warn("Muxer", "Could not inspect stream kinds:", e.message || e);
     }
 
     // Write header
@@ -477,7 +510,7 @@ ClientMuxer.prototype._freezeDepthAndDrain = function(outputIdx, flatPackets) {
         this._durationFallback[outputIdx] = (tb && tb.num > 0)
             ? Math.round(tb.den / tb.num / 24)
             : 1;
-        console.warn("[Muxer] Stream", outputIdx,
+        SP.log.warn("Muxer", "Stream", outputIdx,
             "warmup yielded no usable PTS deltas; using 24fps fallback duration",
             this._durationFallback[outputIdx]);
     }
@@ -509,7 +542,7 @@ ClientMuxer.prototype._freezeDepthAndDrain = function(outputIdx, flatPackets) {
     // monotonic non-negative values by _emitSynthesized.
     this._dtsShift[outputIdx] = depth * this._durationFallback[outputIdx];
 
-    console.log("[Muxer] Stream", outputIdx,
+    SP.log.debug("Muxer", "Stream", outputIdx,
         "frozen: reorderDepth=" + depth,
         "modalDuration=" + this._durationFallback[outputIdx],
         "dtsShift=" + this._dtsShift[outputIdx],
@@ -562,14 +595,14 @@ ClientMuxer.prototype._steadyPush = function(outputIdx, pkt, flatPackets) {
 ClientMuxer.prototype._onDepthInsufficient = function(outputIdx, reason) {
     this._clampCount[outputIdx] += 1;
     if (this._clampCount[outputIdx] === 1) {
-        console.warn("[Muxer] Stream", outputIdx,
+        SP.log.warn("Muxer", "Stream", outputIdx,
             reason + " — reorder depth likely insufficient. Growing.");
     }
     if (this._reorderDepth[outputIdx] < ClientMuxer.REORDER_DEPTH_CAP) {
         this._reorderDepth[outputIdx] += 1;
     }
     if (this._clampCount[outputIdx] >= ClientMuxer.CLAMP_FALLBACK_THRESHOLD) {
-        console.error("[Muxer] Stream", outputIdx,
+        SP.log.error("Muxer", "Stream", outputIdx,
             "exceeded clamp threshold; disabling DTS synthesis (DTS = PTS fallback).");
         this._synthesisFallback[outputIdx] = true;
     }
@@ -725,7 +758,7 @@ ClientMuxer.prototype.destroy = async function() {
             if (this.pkt) await this.libav.av_packet_free(this.pkt);
             if (this.oc) await this.libav.ff_free_muxer(this.oc, this.pb);
         } catch (e) {
-            console.warn("[Muxer] Cleanup error:", e);
+            SP.log.warn("Muxer", "Cleanup error:", e);
         }
         // Remove the virtual stream-writer device to free Emscripten FS memory
         try {

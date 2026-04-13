@@ -105,7 +105,7 @@ async function loadBrowseView(path) {
         });
 
     } catch (err) {
-        console.error("Error loading files:", err);
+        SP.log.error("Browser", "Error loading files:", err);
         SP.elements.mediaGrid.innerHTML =
             '<div class="empty-state" style="grid-column: 1 / -1;">' +
                 '<div class="empty-state-icon">⚠️</div>' +
@@ -177,7 +177,7 @@ async function loadSidebarFiles(path) {
         });
 
     } catch (err) {
-        console.error("Error loading files:", err);
+        SP.log.error("Browser", "Error loading files:", err);
         SP.elements.fileList.innerHTML =
             '<div class="empty-state">' +
                 '<div class="empty-state-icon">⚠️</div>' +

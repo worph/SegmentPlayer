@@ -242,7 +242,19 @@ class SegmentManager:
         self._lock = threading.Lock()
         self._in_progress: dict[str, threading.Event] = {}  # key -> completion event
         self._prefetch_thread: threading.Thread | None = None
-        self._prefetch_queue: list[tuple[str, callable]] = []  # [(key, transcode_fn), ...]
+        # [(stream_key, segment, key, transcode_fn), ...]
+        self._prefetch_queue: list[tuple[str, int, str, callable]] = []
+        # Serializes actual FFmpeg execution so only one runs at a time.
+        self._transcode_lock = threading.Lock()
+        # Handle to the currently running FFmpeg process, so a foreground
+        # request can terminate a stale prefetch mid-run.
+        self._current_process: subprocess.Popen | None = None
+        self._current_is_prefetch: bool = False
+        # Set by preempt_for_foreground if a prefetch is running but Popen
+        # hasn't registered yet; consumed by register_process to abort.
+        self._cancel_pending: bool = False
+        # stream_key ("hash:audio:resolution") -> last foreground segment served.
+        self._last_foreground_segment: dict[str, int] = {}
 
         # Metrics
         self.total_segments = 0
@@ -286,16 +298,19 @@ class SegmentManager:
                 # Timeout
                 return None
 
-        # We're the one transcoding
+        # We're the one transcoding. Serialize with any running prefetch so
+        # only one FFmpeg runs at a time (the prefetch thread may have been
+        # preempted already by preempt_for_foreground, but wait just in case).
         try:
-            result = transcode_fn()
+            with self._transcode_lock:
+                result = transcode_fn()
             return result
         finally:
             with self._lock:
                 self._in_progress.pop(key, None)
             event.set()  # Wake up any waiters
 
-    def schedule_prefetch(self, key: str, transcode_fn):
+    def schedule_prefetch(self, stream_key: str, segment: int, key: str, transcode_fn):
         """Schedule prefetch for a segment (queued, processed sequentially)."""
         with self._lock:
             # Skip if already cached or in progress
@@ -303,11 +318,11 @@ class SegmentManager:
                 return
 
             # Skip if already in queue
-            if any(k == key for k, _ in self._prefetch_queue):
+            if any(k == key for _, _, k, _ in self._prefetch_queue):
                 return
 
             # Add to queue
-            self._prefetch_queue.append((key, transcode_fn))
+            self._prefetch_queue.append((stream_key, segment, key, transcode_fn))
 
             # Start prefetch thread if not running
             if not self._prefetch_thread or not self._prefetch_thread.is_alive():
@@ -324,21 +339,103 @@ class SegmentManager:
                 if not self._prefetch_queue:
                     return  # Queue empty, thread exits
 
-                key, transcode_fn = self._prefetch_queue.pop(0)
+                stream_key, segment, key, transcode_fn = self._prefetch_queue.pop(0)
 
                 # Skip if already in progress
                 if key in self._in_progress:
+                    continue
+
+                # Skip if this prefetch is stale (the foreground playhead has
+                # moved outside its prefetch window, e.g. after a seek).
+                last_fg = self._last_foreground_segment.get(stream_key)
+                if last_fg is not None and not (
+                    last_fg < segment <= last_fg + PREFETCH_SEGMENTS
+                ):
                     continue
 
                 event = threading.Event()
                 self._in_progress[key] = event
 
             try:
-                transcode_fn()
+                # Hold the transcode mutex so we don't fight a foreground FFmpeg.
+                with self._transcode_lock:
+                    # Re-check staleness: a seek may have happened while we
+                    # were queued behind another transcode.
+                    with self._lock:
+                        last_fg = self._last_foreground_segment.get(stream_key)
+                        if last_fg is not None and not (
+                            last_fg < segment <= last_fg + PREFETCH_SEGMENTS
+                        ):
+                            stale = True
+                        else:
+                            stale = False
+                            self._current_is_prefetch = True
+                    if stale:
+                        continue
+                    try:
+                        transcode_fn()
+                    finally:
+                        with self._lock:
+                            self._current_is_prefetch = False
+                            self._cancel_pending = False
             finally:
                 with self._lock:
                     self._in_progress.pop(key, None)
                 event.set()
+
+    def preempt_for_foreground(self, stream_key: str, segment: int):
+        """
+        Called on every foreground segment request. If the request is outside
+        the prefetch window of the last served foreground segment, treat it as
+        a seek: terminate any running prefetch FFmpeg and flush the queue so
+        the new request gets full CPU immediately.
+        """
+        with self._lock:
+            last_fg = self._last_foreground_segment.get(stream_key)
+            is_seek = last_fg is None or not (
+                last_fg <= segment <= last_fg + PREFETCH_SEGMENTS + 2
+            )
+            self._last_foreground_segment[stream_key] = segment
+
+            if is_seek:
+                # Drop queued prefetch work and wake any waiters stuck on them.
+                if self._prefetch_queue:
+                    for _, _, key, _ in self._prefetch_queue:
+                        event = self._in_progress.pop(key, None)
+                        if event is not None:
+                            event.set()
+                    self._prefetch_queue.clear()
+
+                # Terminate a running prefetch FFmpeg. Foreground FFmpegs are
+                # never terminated here — a concurrent foreground is itself
+                # the user's latest intent.
+                if self._current_is_prefetch:
+                    # Cover the race where a prefetch has started but its
+                    # Popen handle is not yet registered.
+                    self._cancel_pending = True
+                    if self._current_process is not None:
+                        try:
+                            self._current_process.terminate()
+                        except Exception:
+                            pass
+
+    def register_process(self, proc: subprocess.Popen) -> bool:
+        """
+        Record the currently-running FFmpeg so it can be terminated on seek.
+        Returns False if a prefetch was cancelled in the race window before
+        the process had been registered — caller must abort.
+        """
+        with self._lock:
+            if self._current_is_prefetch and self._cancel_pending:
+                self._cancel_pending = False
+                return False
+            self._current_process = proc
+            return True
+
+    def unregister_process(self, proc: subprocess.Popen):
+        with self._lock:
+            if self._current_process is proc:
+                self._current_process = None
 
     def is_in_progress(self, key: str) -> bool:
         with self._lock:
@@ -513,16 +610,46 @@ def transcode_segment(filepath: str, file_hash: str, audio: int, resolution: str
     cmd.append(output)
 
     start_time = time.time()
+    proc = None
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if not segment_manager.register_process(proc):
+            # Prefetch was cancelled by a seek during the spawn window.
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            return None
+        try:
+            stdout, stderr = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
         elapsed = time.time() - start_time
-        if result.returncode == 0 and os.path.exists(output):
+        if proc.returncode == 0 and os.path.exists(output):
             segment_manager.record_transcode_time(elapsed)
             adaptive_quality.record_transcode(elapsed)
             return output
-        print(f"FFmpeg error: {result.stderr.decode()[-200:]}")
+
+        # Non-zero exit: either a real error, or we were terminated by a seek.
+        # Treat negative return codes (signal) as cancellation and stay quiet.
+        if proc.returncode is not None and proc.returncode >= 0:
+            print(f"FFmpeg error: {stderr.decode(errors='replace')[-200:]}")
+        # Partial output from a killed process must not be served.
+        try:
+            if os.path.exists(output):
+                os.remove(output)
+        except OSError:
+            pass
     except Exception as e:
         print(f"Transcode error: {e}")
+    finally:
+        if proc is not None:
+            segment_manager.unregister_process(proc)
 
     return None
 
@@ -537,7 +664,12 @@ def get_or_transcode_segment(filepath: str, file_hash: str, audio: int, resoluti
         return None
 
     output = get_segment_path(file_hash, audio, resolution, segment)
-    key = f"{file_hash}:{audio}:{resolution}:{segment}"
+    stream_key = f"{file_hash}:{audio}:{resolution}"
+    key = f"{stream_key}:{segment}"
+
+    # Every foreground request updates the playhead and, on seek, terminates
+    # stale prefetch work so this request gets full CPU.
+    segment_manager.preempt_for_foreground(stream_key, segment)
 
     # Check if a transcode is in progress for this segment
     # If so, we must wait for it rather than trying to read a partial file
@@ -556,7 +688,6 @@ def get_or_transcode_segment(filepath: str, file_hash: str, audio: int, resoluti
     # Fast path: cached (only safe if no transcode in progress)
     if os.path.exists(output):
         segment_manager.record_cache_hit()
-        trigger_prefetch(filepath, file_hash, audio, resolution, segment, info)
         with open(output, 'rb') as f:
             return f.read()
 
@@ -593,10 +724,13 @@ def trigger_prefetch(filepath: str, file_hash: str, audio: int, resolution: str,
         if os.path.exists(output):
             continue  # Already cached
 
-        key = f"{file_hash}:{audio}:{resolution}:{next_seg}"
+        stream_key = f"{file_hash}:{audio}:{resolution}"
+        key = f"{stream_key}:{next_seg}"
         # Use closure to capture segment number correctly
         seg = next_seg
         segment_manager.schedule_prefetch(
+            stream_key,
+            seg,
             key,
             lambda s=seg: transcode_segment(filepath, file_hash, audio, resolution, s)
         )
@@ -974,196 +1108,6 @@ class SubtitleManager:
 subtitle_manager = SubtitleManager()
 
 
-# Audio codecs that can be packed into an mp4 container via `-c copy`.
-# For anything else we fall back to `-c:a aac` re-encode.
-_MP4_COMPATIBLE_AUDIO_CODECS = {
-    'aac', 'ac3', 'eac3', 'mp3', 'alac', 'opus',
-}
-
-
-def get_audio_stream_info(info: dict, track_index: int) -> dict | None:
-    """Get audio stream metadata by audio-track index (0-based, among audio streams only)."""
-    audio_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'audio']
-    if track_index < len(audio_streams):
-        return audio_streams[track_index]
-    return None
-
-
-class AudioManager:
-    """
-    Extracts and caches audio-only .m4a streams from source files.
-
-    Same concurrency model as SubtitleManager: background extraction dedup'd
-    per (file_hash, track_index), disk cache survives restarts, concurrent
-    requests share a single extraction.
-
-    Purpose: the client-side player plays the main video via MediaSource but
-    needs audio separately. Pointing a <audio> element at the raw source
-    container (e.g. MKV) makes Chrome allocate a D3D11VideoDecoder for the
-    video track inside it (visible in chrome://media-internals), which
-    contends with the main MSE decode pipeline. Serving an audio-only mp4
-    fragment eliminates that duplicate decoder.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        # key -> (event, result_holder) where result_holder[0] is (path, error)
-        self._extractions: dict[str, tuple[threading.Event, list]] = {}
-
-    def get_audio_path(self, key: str, filepath: str, file_hash: str,
-                        track_index: int, info: dict = None,
-                        timeout: float = 300) -> tuple[str | None, str | None]:
-        """
-        Return a path to the cached audio-only .m4a file, extracting if needed.
-
-        Returns: (path, error_message) — exactly one is non-None.
-        """
-        cache_dir = os.path.join(CACHE_DIR, file_hash)
-        m4a_file = os.path.join(cache_dir, f"audio_{track_index}.m4a")
-        error_file = os.path.join(cache_dir, f"audio_{track_index}.error")
-
-        # Fast path: already cached
-        if os.path.exists(m4a_file):
-            return m4a_file, None
-        if os.path.exists(error_file):
-            with open(error_file, 'r', encoding='utf-8') as f:
-                return None, f.read()
-
-        with self._lock:
-            # Re-check after lock — another thread may have finished.
-            if os.path.exists(m4a_file):
-                return m4a_file, None
-            if os.path.exists(error_file):
-                with open(error_file, 'r', encoding='utf-8') as f:
-                    return None, f.read()
-
-            if key in self._extractions:
-                event, result_holder = self._extractions[key]
-                print(f"[Audio {track_index}] Waiting for in-progress extraction...")
-            else:
-                event = threading.Event()
-                result_holder = [None]
-                self._extractions[key] = (event, result_holder)
-                thread = threading.Thread(
-                    target=self._extract_background,
-                    args=(key, filepath, file_hash, track_index, info, event, result_holder),
-                    daemon=True,
-                )
-                thread.start()
-
-        completed = event.wait(timeout=timeout)
-        if completed:
-            if result_holder[0] is not None:
-                return result_holder[0]
-            # Fall back to disk
-            if os.path.exists(m4a_file):
-                return m4a_file, None
-            if os.path.exists(error_file):
-                with open(error_file, 'r', encoding='utf-8') as f:
-                    return None, f.read()
-            return None, "Extraction completed but result not found"
-        return None, f"Audio extraction timed out after {timeout}s"
-
-    def _extract_background(self, key, filepath, file_hash, track_index, info,
-                            event, result_holder):
-        try:
-            result = self._do_extract(filepath, file_hash, track_index, info)
-            result_holder[0] = result
-        except Exception as e:
-            result_holder[0] = (None, f"Extraction thread error: {e}")
-        finally:
-            event.set()
-            def cleanup():
-                time.sleep(30)
-                with self._lock:
-                    self._extractions.pop(key, None)
-            threading.Thread(target=cleanup, daemon=True).start()
-
-    def _do_extract(self, filepath: str, file_hash: str, track_index: int,
-                    info: dict) -> tuple[str | None, str | None]:
-        cache_dir = os.path.join(CACHE_DIR, file_hash)
-        os.makedirs(cache_dir, exist_ok=True)
-        m4a_file = os.path.join(cache_dir, f"audio_{track_index}.m4a")
-        temp_file = m4a_file + '.tmp'
-        error_file = os.path.join(cache_dir, f"audio_{track_index}.error")
-
-        # Double-check cache (raced through lock)
-        if os.path.exists(m4a_file):
-            return m4a_file, None
-        if os.path.exists(error_file):
-            with open(error_file, 'r', encoding='utf-8') as f:
-                return None, f.read()
-
-        # Choose between -c copy and -c:a aac based on the audio codec.
-        audio_info = get_audio_stream_info(info, track_index) if info else None
-        source_codec = (audio_info or {}).get('codec_name', '').lower()
-        use_copy = source_codec in _MP4_COMPATIBLE_AUDIO_CODECS
-
-        # Try -c copy first if compatible; fall back to re-encode if it fails.
-        attempts = []
-        if use_copy:
-            attempts.append(('copy', ['-c:a', 'copy']))
-        attempts.append(('aac', ['-c:a', 'aac', '-b:a', '192k']))
-
-        filename = os.path.basename(filepath)
-        last_error = None
-
-        for mode, codec_args in attempts:
-            print(f"[Audio {track_index}] Extracting from {filename} (mode={mode})...")
-            try:
-                # -vn: drop video entirely. -sn: drop subtitles.
-                # -movflags +empty_moov: produce a fragmented mp4 suitable for
-                #   progressive download. The <audio> element doesn't need
-                #   frag_keyframe — audio-only mp4 without index at end is
-                #   fine because browsers demux audio linearly anyway.
-                result = subprocess.run(
-                    ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                     '-probesize', '5M', '-analyzeduration', '5M',
-                     '-i', filepath,
-                     '-map', f'0:a:{track_index}',
-                     '-vn', '-sn',
-                     *codec_args,
-                     '-movflags', '+empty_moov',
-                     '-f', 'mp4', temp_file],
-                    capture_output=True,
-                    timeout=600,
-                )
-                if result.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 1024:
-                    os.rename(temp_file, m4a_file)
-                    print(f"[Audio {track_index}] Extraction complete "
-                          f"({os.path.getsize(m4a_file)} bytes, mode={mode})")
-                    return m4a_file, None
-                # Cleanup partial file and record error
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                stderr = result.stderr.decode('utf-8', errors='replace') if result.stderr else 'Unknown error'
-                last_error = f"ffmpeg exit {result.returncode} (mode={mode}): {stderr[:200]}"
-                print(f"[Audio {track_index}] Attempt failed: {last_error}")
-                # Continue to next attempt if any
-            except subprocess.TimeoutExpired:
-                last_error = f"Extraction timed out (>600s, mode={mode})"
-                print(f"[Audio {track_index}] {last_error}")
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-                # Don't try other modes on timeout — the source is likely too slow
-                break
-            except Exception as e:
-                last_error = f"Unexpected error (mode={mode}): {e}"
-                print(f"[Audio {track_index}] {last_error}")
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-
-        # All attempts failed
-        error_msg = last_error or "Unknown extraction failure"
-        with open(error_file, 'w', encoding='utf-8') as f:
-            f.write(error_msg)
-        return None, error_msg
-
-
-# Global audio manager
-audio_manager = AudioManager()
-
-
 def _preextract_subtitles(filepath: str, file_hash: str, info: dict):
     """Start background extraction for all supported subtitle tracks."""
     subtitle_streams = [s for s in info.get('streams', []) if s.get('codec_type') == 'subtitle']
@@ -1264,12 +1208,6 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r'^/api/subtitle/(.+?)/track/(\d+)\.vtt$', path)
         if m:
             return self.handle_subtitle_vtt(m.group(1), int(m.group(2)))
-        # Audio-only mp4 extraction (for client-mode <audio> playback —
-        # avoids duplicate video decoder allocation when pointing <audio>
-        # at a video container)
-        m = re.match(r'^/api/audio/(.+?)/track/(\d+)\.m4a$', path)
-        if m:
-            return self.handle_audio_track(m.group(1), int(m.group(2)))
         # Direct file serving
         m = re.match(r'^/direct/(.+)$', path)
         if m:
@@ -1553,28 +1491,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
-
-    def handle_audio_track(self, filepath: str, track_index: int):
-        """Extract and serve an audio-only mp4 for the given track index."""
-        full_path, file_hash, info = self.get_file_info(filepath)
-        if not info:
-            return
-
-        # Verify the track exists (helpful error if caller is off by one)
-        if get_audio_stream_info(info, track_index) is None:
-            self.send_error(404, f"Audio track {track_index} not found")
-            return
-
-        key = f"{file_hash}:audio:{track_index}"
-        m4a_path, error = audio_manager.get_audio_path(key, full_path, file_hash, track_index, info)
-
-        if not m4a_path:
-            # Return an informative error; the <audio> element will fire an
-            # `error` event which the client can fall back from.
-            self.send_error(500, f"Audio extraction failed: {error or 'unknown'}")
-            return
-
-        self._serve_file_with_range(m4a_path, 'audio/mp4')
 
     def handle_direct_file(self, filepath: str):
         """Serve raw video file with range request support for seeking."""

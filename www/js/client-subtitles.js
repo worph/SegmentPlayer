@@ -18,7 +18,7 @@ ClientSubtitleExtractor.prototype.extract = async function(subStreamIndex, codec
         return null;
     }
 
-    console.log("[Subtitles] Extracting stream", subStreamIndex, "codec:", codec);
+    SP.log.debug("Subtitles", "Extracting stream", subStreamIndex, "codec:", codec);
 
     // Save current demuxer position (we'll need to seek back)
     var currentTime = 0;
@@ -43,7 +43,7 @@ ClientSubtitleExtractor.prototype.extract = async function(subStreamIndex, codec
         }
     }
 
-    console.log("[Subtitles] Extracted", subtitlePackets.length, "subtitle packets");
+    SP.log.debug("Subtitles", "Extracted", subtitlePackets.length, "subtitle packets");
 
     if (subtitlePackets.length === 0) {
         return "WEBVTT\n\n";

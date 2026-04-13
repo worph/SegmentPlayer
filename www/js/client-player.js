@@ -1,40 +1,48 @@
-/* Client Player - MediaSource pipeline for client-side container transmux */
+/* Client Player - MediaSource pipeline for client-side container transmux.
+ *
+ * Single MediaSource, single SourceBuffer containing muxed video + Opus audio.
+ * Both tracks share one MediaSource timeline — the browser guarantees A/V
+ * sync. Audio is always decoded via WebCodecs AudioDecoder and re-encoded to
+ * Opus via WebCodecs AudioEncoder, then fed as a second input stream to the
+ * ClientMuxer alongside the video. The muxer produces interleaved fMP4 with
+ * both tracks in one init segment + media fragments.
+ */
 
 function ClientPlayer(videoElement) {
     this.video = videoElement;
     this.mediaSource = null;
-    this.sourceBuffer = null; // single muxed video+audio SourceBuffer
+    this.sourceBuffer = null;
     this.demuxer = null;
     this.muxer = null;
-    this.audioReencoder = null; // non-null when audio needs re-encoding
+    this.audioReencoder = null;
     this.running = false;
     this.probeData = null;
     this.currentAudioTrack = 0;
+    this._audioAbsIdx = -1;    // absolute stream index for the active audio track
     this._seekHandler = null;
     this._seekGeneration = 0;
     this._pumpPromise = null;
-    this._needsAudioReencode = false;
     // Piggyback subtitle collection: accumulate subtitle packets during playback
-    this._subtitlePackets = {};    // streamIndex -> Packet[]
+    this._subtitlePackets = {};       // streamIndex -> Packet[]
     this._subtitleStreamIndices = []; // absolute indices of subtitle streams
     this._activeSubtitleTrack = -1;   // subtitle track index currently displayed (-1 = none)
     this._activeSubtitleAbsIdx = -1;  // absolute stream index of active subtitle
     this._subtitleUpdateCounter = 0;  // throttle progressive VTT rebuilds
 }
 
-ClientPlayer.prototype._buildMimeType = function(audioTrackIdx) {
-    var probeData = this.probeData;
-    var videoCodecStr = mapVideoCodecToMSE(probeData.video.codec, probeData.video.profile,
-        probeData.video.bit_depth, probeData.video.width, probeData.video.height);
-
-    // Skip audio in MSE — libav.js range-request I/O often can't fully probe
-    // audio codec parameters (channels, frame_size), producing invalid fMP4 audio.
-    // Video plays via MSE, audio plays via a separate direct <audio> element.
-    var mimeType = 'video/mp4; codecs="' + videoCodecStr + '"';
-    return { mimeType: mimeType, audioTrack: null, needsReencode: false, videoOnly: true };
+// Combined video+audio MIME for the single muxed SourceBuffer. Audio half is
+// always "opus" because we always re-encode to Opus regardless of source.
+ClientPlayer.prototype._buildMimeType = function() {
+    var pd = this.probeData;
+    var v = mapVideoCodecToMSE(pd.video.codec, pd.video.profile,
+        pd.video.bit_depth, pd.video.width, pd.video.height);
+    if (!v) throw new Error("Cannot map video codec: " + pd.video.codec);
+    if (pd.audio && pd.audio.length > 0) {
+        return 'video/mp4; codecs="' + v + ',opus"';
+    }
+    return 'video/mp4; codecs="' + v + '"';
 };
 
-// Helper: wait for a SourceBuffer to finish updating
 function waitForSBUpdate(sb) {
     if (!sb.updating) return Promise.resolve();
     return new Promise(function(resolve) {
@@ -42,7 +50,6 @@ function waitForSBUpdate(sb) {
     });
 }
 
-// Helper: get how many seconds are buffered ahead of currentTime
 function getBufferedAhead(video) {
     if (!video.buffered || video.buffered.length === 0) return 0;
     for (var i = 0; i < video.buffered.length; i++) {
@@ -53,7 +60,6 @@ function getBufferedAhead(video) {
     return 0;
 }
 
-// Helper: sleep for ms
 function sleep(ms) {
     return new Promise(function(resolve) { setTimeout(resolve, ms); });
 }
@@ -80,29 +86,21 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
         }, { once: true });
     }.bind(this));
 
-    // 2. Build MIME type for video-only fMP4
-    var mimeInfo = this._buildMimeType(this.currentAudioTrack);
-    var mimeType = mimeInfo.mimeType;
-    this._needsAudioReencode = false;
-
-    console.log("[ClientPlayer] MSE MIME:", mimeType, "(video-only)");
-
+    // 2. Build combined video+Opus MIME
+    var mimeType = this._buildMimeType();
+    SP.log.debug("ClientPlayer", "MSE MIME:", mimeType);
     if (!MediaSource.isTypeSupported(mimeType)) {
         throw new Error("MediaSource does not support: " + mimeType);
     }
-
     this.sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
     this.sourceBuffer.mode = "segments";
 
-    // 3. Initialize demuxer
+    // 3. Demuxer
     setStatus("Loading decoder...", "#4dabf7", true);
     this.demuxer = new ClientDemuxer(fileUrl, probeData.file_size);
     await this.demuxer.init();
 
-    // Video-only: disable audio stream in demuxer
-    this.demuxer.audioStreamIndex = -1;
-
-    // Discover subtitle stream indices for piggyback collection
+    // Discover subtitle streams (piggyback collection during playback)
     this._subtitleStreamIndices = [];
     this._subtitlePackets = {};
     for (var i = 0; i < this.demuxer.streams.length; i++) {
@@ -112,33 +110,53 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
         }
     }
 
-    // 4. Initialize muxer (video-only)
-    this.muxer = new ClientMuxer(this.demuxer.libav);
-    await this.muxer.init(this._buildStreamInfos());
+    // 4. Resolve active audio stream and init the re-encoder
+    if (probeData.audio && probeData.audio.length > 0) {
+        await this.demuxer.fixAudioParams(probeData);
+        this._audioAbsIdx = this.demuxer.getAudioStreamIndex(this.currentAudioTrack);
+        if (this._audioAbsIdx < 0) {
+            throw new Error("Audio track " + this.currentAudioTrack + " not found in container");
+        }
+        this.demuxer.setAudioStream(this._audioAbsIdx);
+        var audioInfo = probeData.audio[this.currentAudioTrack];
+        var extradata = await this.demuxer.getAudioExtradata(this._audioAbsIdx);
+        var audioStream = this.demuxer.streams[this._audioAbsIdx];
+        this.audioReencoder = new AudioReencoder();
+        await this.audioReencoder.init(
+            audioInfo.codec,
+            audioInfo.sample_rate || 48000,
+            audioInfo.channels || 2,
+            extradata,
+            { num: audioStream.time_base_num, den: audioStream.time_base_den }
+        );
+    } else {
+        this._audioAbsIdx = -1;
+        this.demuxer.audioStreamIndex = -1;
+    }
 
-    // 5. Set duration
+    // 5. Muxer (video + Opus audio if present)
+    this.muxer = new ClientMuxer(this.demuxer.libav);
+    await this.muxer.init(await this._buildStreamInfos());
+
+    // 6. Duration
     if (probeData.duration > 0) {
         this.mediaSource.duration = probeData.duration;
     }
 
-    // 6. Setup seek handler
+    // 7. Seek handler
     this._setupSeekHandler();
 
-    // 7. Start pump loop
+    // 8. Pump
     this.running = true;
     this._pumpPromise = this._pumpLoop();
 
-    // 8. Start direct audio playback alongside MSE video
-    this._startDirectAudio(filepath, probeData);
-
-    console.log("[ClientPlayer] Started video-only pipeline with direct audio");
+    SP.log.debug("ClientPlayer", "Started unified video+audio pipeline");
 };
 
 ClientPlayer.prototype._pumpLoop = async function() {
     var firstData = true;
     while (this.running) {
         try {
-            // Check buffer level — pause if we have enough
             var ahead = getBufferedAhead(this.video);
             if (ahead > SP.config.CLIENT_BUFFER_AHEAD) {
                 setStatus("Client-side", "#51cf66");
@@ -150,19 +168,30 @@ ClientPlayer.prototype._pumpLoop = async function() {
                 setStatus("Buffering...", "#ffd43b", true);
             }
 
-            // Read a batch of packets
-            var result = await this.demuxer.readPackets(4 * 1024 * 1024); // 4MB batch
+            var result = await this.demuxer.readPackets(4 * 1024 * 1024);
 
-            if (!this.running) break; // check again after async read
+            if (!this.running) break;
 
             if (result.eof && Object.keys(result.packets).length === 0) {
-                // End of file
-                console.log("[ClientPlayer] End of stream");
+                SP.log.debug("ClientPlayer", "End of stream");
                 if (this.mediaSource && this.mediaSource.readyState === "open") {
-                    // Drain the muxer's lookahead tail (up to reorderDepth
-                    // trailing frames) and write the trailer. Without this,
-                    // the last fragment of playback would be truncated.
                     try {
+                        // Drain the audio re-encoder first so tail Opus frames
+                        // make it into the final mux call alongside the
+                        // muxer's lookahead tail.
+                        if (this.audioReencoder) {
+                            var tailAudio = await this.audioReencoder.flush();
+                            if (tailAudio.length > 0 && this._audioAbsIdx >= 0) {
+                                var finalBatch = {};
+                                finalBatch[this._audioAbsIdx] = tailAudio;
+                                var finalFrag = await this.muxer.mux(finalBatch);
+                                if (finalFrag && finalFrag.length > 0) {
+                                    await waitForSBUpdate(this.sourceBuffer);
+                                    this.sourceBuffer.appendBuffer(finalFrag);
+                                    await waitForSBUpdate(this.sourceBuffer);
+                                }
+                            }
+                        }
                         var tail = await this.muxer.flush();
                         if (tail && tail.length > 0) {
                             await waitForSBUpdate(this.sourceBuffer);
@@ -170,7 +199,7 @@ ClientPlayer.prototype._pumpLoop = async function() {
                             await waitForSBUpdate(this.sourceBuffer);
                         }
                     } catch (e) {
-                        console.warn("[ClientPlayer] Flush-on-EOF error:", e);
+                        SP.log.warn("ClientPlayer", "Flush-on-EOF error:", e);
                     }
                     await waitForSBUpdate(this.sourceBuffer);
                     this.mediaSource.endOfStream();
@@ -178,26 +207,24 @@ ClientPlayer.prototype._pumpLoop = async function() {
                 break;
             }
 
-            // Collect subtitle packets from this batch (piggyback extraction)
+            // Collect subtitle packets from this batch
             this._collectSubtitlePackets(result.packets);
 
-            // Filter packets to only include our selected video + audio streams
+            // Filter to video + (re-encoded) audio
             var filteredPackets = {};
             var videoIdx = this.demuxer.videoStreamIndex;
-            var audioIdx = this.demuxer.audioStreamIndex;
+            var audioIdx = this._audioAbsIdx;
 
             if (result.packets[videoIdx]) {
                 filteredPackets[videoIdx] = result.packets[videoIdx];
             }
-            if (audioIdx >= 0 && result.packets[audioIdx]) {
-                // Re-encode audio if needed (AC3/DTS → Opus)
-                if (this._needsAudioReencode && this.audioReencoder) {
-                    var reencoded = await this.audioReencoder.processPackets(result.packets[audioIdx]);
-                    if (reencoded.length > 0) {
-                        filteredPackets[audioIdx] = reencoded;
-                    }
-                } else {
-                    filteredPackets[audioIdx] = result.packets[audioIdx];
+            if (audioIdx >= 0 && this.audioReencoder) {
+                if (result.packets[audioIdx] && result.packets[audioIdx].length > 0) {
+                    this.audioReencoder.submitPackets(result.packets[audioIdx]);
+                }
+                var reencoded = this.audioReencoder.drainPackets();
+                if (reencoded.length > 0) {
+                    filteredPackets[audioIdx] = reencoded;
                 }
             }
 
@@ -205,35 +232,28 @@ ClientPlayer.prototype._pumpLoop = async function() {
                 continue;
             }
 
-            // Mux to fMP4
             var fmp4Data = await this.muxer.mux(filteredPackets);
 
             if (!this.running) break;
 
             if (fmp4Data && fmp4Data.length > 0) {
-                // Append to SourceBuffer
                 await waitForSBUpdate(this.sourceBuffer);
                 this.sourceBuffer.appendBuffer(fmp4Data);
                 await waitForSBUpdate(this.sourceBuffer);
 
-                // Track stats
                 this.stats.bytesRead += fmp4Data.length;
                 this.stats.packetsRead++;
 
                 if (firstData) {
                     firstData = false;
                     setStatus("Client-side", "#51cf66");
-                    // Trigger autoplay — the initial play() call in player.js
-                    // may have been rejected because no data was available yet
                     if (this.video.paused) {
                         this.video.play().catch(function() {});
                     }
                 }
 
                 // If first few appends don't produce playable data, fail fast.
-                // Skip this check while the muxer is still measuring reorder
-                // depth — during warmup, the muxer legitimately returns null
-                // for the first few batches, which is not a pipeline stall.
+                // Skip while the muxer is still measuring reorder depth.
                 var stillWarmingUp = this.muxer && typeof this.muxer.isWarmingUp === "function"
                     && this.muxer.isWarmingUp();
                 if (!stillWarmingUp && this.stats.packetsRead <= 3 && this.video.readyState === 0) {
@@ -243,22 +263,19 @@ ClientPlayer.prototype._pumpLoop = async function() {
                     }
                 }
 
-                // Evict old data
                 this._evictOldData();
             }
 
         } catch (err) {
-            if (!this.running) break; // cleanup in progress
+            if (!this.running) break;
             this.stats.errors = (this.stats.errors || 0) + 1;
-            console.error("[ClientPlayer] Pump error (" + this.stats.errors + "):", err);
+            SP.log.error("ClientPlayer", "Pump error (" + this.stats.errors + "):", err);
 
             if (this.stats.errors >= 3) {
-                console.error("[ClientPlayer] Too many errors, stopping pipeline");
+                SP.log.error("ClientPlayer", "Too many errors, stopping pipeline");
                 setStatus("Decode error", "#ff6b6b");
                 break;
             }
-
-            // Brief pause before retry
             await sleep(500);
         }
     }
@@ -266,14 +283,11 @@ ClientPlayer.prototype._pumpLoop = async function() {
 
 ClientPlayer.prototype._evictOldData = function() {
     if (!this.sourceBuffer || this.sourceBuffer.updating) return;
-
     var behind = this.video.currentTime - SP.config.CLIENT_BUFFER_BEHIND;
     if (behind > 1) {
         try {
             this.sourceBuffer.remove(0, behind);
-        } catch (e) {
-            // Ignore — may be updating
-        }
+        } catch (e) { /* may be updating */ }
     }
 };
 
@@ -281,77 +295,88 @@ ClientPlayer.prototype._setupSeekHandler = function() {
     var self = this;
     this._seekGeneration = 0;
     this._seekHandler = function() {
-        // Always accept seeks — use generation counter to handle re-entrancy
-        // instead of dropping seeks when running=false (which loses the user's
-        // final seekbar position during an in-progress seek)
-        self._handleSeek(self.video.currentTime);
+        // Always accept seeks — generation counter handles rapid re-entry.
+        self._restartPipeline(self.video.currentTime);
     };
     this.video.addEventListener("seeking", this._seekHandler);
 };
 
-ClientPlayer.prototype._handleSeek = async function(targetTime) {
-    // Generation counter prevents stale seeks from completing when a newer
-    // seek has been requested (e.g., user dragging the seekbar rapidly)
+// Teardown + rebuild the decode/mux pipeline at the given resume time. Shared
+// between seek (newAudioAbsIdx=null — keep current audio track) and track
+// switch (newAudioAbsIdx=<new abs idx>).
+//
+// Because the output Opus codecpar is deterministic (always 48 kHz stereo),
+// the muxer re-init produces a byte-identical init segment across both flows.
+// MSE treats an identical init segment as a no-op, so the SourceBuffer stays.
+ClientPlayer.prototype._restartPipeline = async function(resumeTime, newAudioAbsIdx) {
     var generation = ++this._seekGeneration;
 
-    console.log("[ClientPlayer] Seeking to", targetTime.toFixed(2) + "s (gen " + generation + ")");
+    SP.log.debug("ClientPlayer", "Restarting pipeline at", resumeTime.toFixed(2) + "s",
+        "(gen " + generation + ")");
     setStatus("Seeking...", "#4dabf7", true);
 
-    // 1. Stop current pump and abort in-flight range requests so the
-    //    pump loop exits immediately instead of waiting for network I/O
+    // 1. Stop the pump and abort any in-flight range requests.
     this.running = false;
-    if (this.demuxer) {
-        this.demuxer.abortReads();
-    }
-    if (this._pumpPromise) {
-        await this._pumpPromise.catch(function() {});
-    }
+    if (this.demuxer) this.demuxer.abortReads();
+    if (this._pumpPromise) await this._pumpPromise.catch(function() {});
 
-    // A newer seek came in while we were waiting — abandon this one
     if (generation !== this._seekGeneration) return;
 
     try {
-        // 2. Abort and clear SourceBuffer safely
+        // 2. Clear the SourceBuffer.
         try {
-            if (this.sourceBuffer.updating) {
-                this.sourceBuffer.abort();
-            }
-        } catch (e) { /* abort may throw if not in correct state */ }
+            if (this.sourceBuffer.updating) this.sourceBuffer.abort();
+        } catch (e) { /* abort may throw in wrong state */ }
 
         try {
             await waitForSBUpdate(this.sourceBuffer);
             this.sourceBuffer.remove(0, Infinity);
             await waitForSBUpdate(this.sourceBuffer);
         } catch (e) {
-            console.warn("[ClientPlayer] SourceBuffer clear error (non-fatal):", e);
+            SP.log.warn("ClientPlayer", "SourceBuffer clear error (non-fatal):", e);
         }
 
         if (generation !== this._seekGeneration) return;
 
-        // 3. Reset timestamp offset
-        try { this.sourceBuffer.timestampOffset = 0; } catch (e) {}
+        // Each new muxer instance emits fMP4 fragments with tfdt
+        // baseMediaDecodeTime starting from 0 (the muxer normalizes to the
+        // start of its internal track). Shift the SourceBuffer's timeline so
+        // those 0-based fragments land at the seek target instead of t=0,
+        // which would otherwise leave Chrome's MSE silently dropping them.
+        try { this.sourceBuffer.timestampOffset = resumeTime; } catch (e) {}
 
-        // 4. Seek demuxer to nearest keyframe before target
-        await this.demuxer.seek(targetTime);
+        // 3. Optionally swap the active audio track on the demuxer side.
+        if (typeof newAudioAbsIdx === "number" && newAudioAbsIdx >= 0
+                && newAudioAbsIdx !== this._audioAbsIdx) {
+            this._audioAbsIdx = newAudioAbsIdx;
+            this.demuxer.setAudioStream(newAudioAbsIdx);
+        }
+
+        // 4. Seek demuxer to nearest keyframe ≤ target.
+        await this.demuxer.seek(resumeTime);
 
         if (generation !== this._seekGeneration) return;
 
-        // 5. Re-init muxer (need fresh fMP4 init segment after seek)
+        // 5. Reset audio re-encoder. Opus state is stateful; a half-filled
+        //    frame from before the seek would corrupt output.
+        if (this.audioReencoder) {
+            await this.audioReencoder.reset();
+        }
+
+        // 6. Re-init muxer with fresh init segment.
         await this.muxer.destroy();
         this.muxer = new ClientMuxer(this.demuxer.libav);
-        await this.muxer.init(this._buildStreamInfos());
+        await this.muxer.init(await this._buildStreamInfos());
 
         if (generation !== this._seekGeneration) return;
 
-        // 6. Restart pump
+        // 7. Restart pump.
         this.running = true;
         this._pumpPromise = this._pumpLoop();
-
     } catch (err) {
         if (generation !== this._seekGeneration) return;
-        console.error("[ClientPlayer] Seek error:", err);
+        SP.log.error("ClientPlayer", "Restart error:", err);
         setStatus("Seek error", "#ff6b6b");
-        // Try to recover by restarting the pump from wherever the demuxer is
         try {
             this.running = true;
             this._pumpPromise = this._pumpLoop();
@@ -359,33 +384,51 @@ ClientPlayer.prototype._handleSeek = async function(targetTime) {
     }
 };
 
-ClientPlayer.prototype.switchAudioTrack = async function(audioTrackIdx, resumeTime) {
-    console.log("[ClientPlayer] Switching to audio track", audioTrackIdx);
+// Returns true if the switch was applied, false if rejected (e.g. browser
+// lacks a decoder for the target codec). The previous pipeline stays intact
+// on rejection so the caller can revert its UI to match actual audio.
+ClientPlayer.prototype.switchAudioTrack = async function(audioTrackIdx) {
+    SP.log.debug("ClientPlayer", "Switching to audio track", audioTrackIdx);
+
+    if (!this.demuxer || !this.probeData.audio || this.probeData.audio.length === 0) {
+        return false;
+    }
+
+    var newAbsIdx = this.demuxer.getAudioStreamIndex(audioTrackIdx);
+    if (newAbsIdx < 0) {
+        SP.log.warn("ClientPlayer", "Audio track not found:", audioTrackIdx);
+        return false;
+    }
+
+    // Swap decoder for the new input codec. Output stays Opus 48 kHz stereo so
+    // the muxer's audio codecpar is unchanged and the re-init segment is
+    // identical across switches. reconfigureInput verifies codec support
+    // before tearing down the existing decoder, so an unsupported track leaves
+    // the previous audio pipeline intact.
+    var audioInfo = this.probeData.audio[audioTrackIdx];
+    var extradata = await this.demuxer.getAudioExtradata(newAbsIdx);
+    var audioStream = this.demuxer.streams[newAbsIdx];
+    try {
+        await this.audioReencoder.reconfigureInput(
+            audioInfo.codec,
+            audioInfo.sample_rate || 48000,
+            audioInfo.channels || 2,
+            extradata,
+            { num: audioStream.time_base_num, den: audioStream.time_base_den }
+        );
+    } catch (err) {
+        SP.log.error("ClientPlayer", "Audio track switch failed:", err.message || err);
+        setStatus("Audio codec not supported: " + audioInfo.codec, "#ff6b6b");
+        return false;
+    }
+
     this.currentAudioTrack = audioTrackIdx;
-
-    if (!this._audioEl) {
-        console.warn("[ClientPlayer] No direct audio element — audio switch not supported");
-        return;
-    }
-
-    // With the /api/audio/ endpoint, each track is a separate extracted mp4.
-    // Rebuild the <audio> src with the new track index and resume playback.
-    var audio = this._audioEl;
-    var filepath = SP.state.currentFile || SP.state.currentPath;
-    var currentTime = this.video.currentTime;
-    var wasPlaying = !this.video.paused;
-
-    audio.pause();
-    audio.src = this._audioTrackUrl(filepath, audioTrackIdx);
-    audio.currentTime = currentTime;
-    if (wasPlaying) {
-        audio.play().catch(function() {});
-    }
-    console.log("[ClientPlayer] Reloaded audio element for track", audioTrackIdx);
+    await this._restartPipeline(this.video.currentTime, newAbsIdx);
+    return true;
 };
 
 // Collect subtitle packets from a readPackets result into the accumulator.
-// Called from _pumpLoop on every batch — zero-cost when no subtitle streams exist.
+// Zero-cost when no subtitle streams exist.
 ClientPlayer.prototype._collectSubtitlePackets = function(packets) {
     var dominated = false;
     for (var i = 0; i < this._subtitleStreamIndices.length; i++) {
@@ -397,7 +440,6 @@ ClientPlayer.prototype._collectSubtitlePackets = function(packets) {
             for (var j = 0; j < packets[subIdx].length; j++) {
                 this._subtitlePackets[subIdx].push(packets[subIdx][j]);
             }
-            // If this is the active subtitle track, schedule a progressive update
             if (subIdx === this._activeSubtitleAbsIdx) {
                 dominated = true;
             }
@@ -412,7 +454,6 @@ ClientPlayer.prototype._collectSubtitlePackets = function(packets) {
     }
 };
 
-// Rebuild and re-attach the VTT for the currently active subtitle track
 ClientPlayer.prototype._refreshActiveSubtitle = function() {
     if (this._activeSubtitleTrack < 0 || this._activeSubtitleAbsIdx < 0) return;
 
@@ -433,18 +474,15 @@ ClientPlayer.prototype._refreshActiveSubtitle = function() {
     attachVTTToVideo(this.video, vtt, label);
 };
 
-// Select a subtitle track from piggybacked packets.
-// Shows whatever has been collected so far; updates progressively as playback continues.
 ClientPlayer.prototype.loadSubtitleTrack = async function(subTrackIndex) {
     if (!this.demuxer) return;
 
     var subInfo = this.probeData.subtitles[subTrackIndex];
     if (!subInfo) {
-        console.warn("[ClientPlayer] Subtitle track not found:", subTrackIndex);
+        SP.log.warn("ClientPlayer", "Subtitle track not found:", subTrackIndex);
         return;
     }
 
-    // Find the absolute stream index
     var absIndex = -1;
     var subCount = 0;
     for (var i = 0; i < this.demuxer.streams.length; i++) {
@@ -459,17 +497,17 @@ ClientPlayer.prototype.loadSubtitleTrack = async function(subTrackIndex) {
     }
 
     if (absIndex < 0) {
-        console.warn("[ClientPlayer] Subtitle stream not found in demuxer");
+        SP.log.warn("ClientPlayer", "Subtitle stream not found in demuxer");
         return;
     }
 
-    // Mark this track as active for progressive updates
     this._activeSubtitleTrack = subTrackIndex;
     this._activeSubtitleAbsIdx = absIndex;
     this._subtitleUpdateCounter = 0;
 
     var pkts = this._subtitlePackets[absIndex] || [];
-    console.log("[ClientPlayer] Showing subtitle track", subTrackIndex, "with", pkts.length, "packets collected so far");
+    SP.log.debug("ClientPlayer", "Showing subtitle track", subTrackIndex,
+        "with", pkts.length, "packets collected so far");
 
     var stream = this.demuxer.streams[absIndex];
     var timeBase = 1;
@@ -482,14 +520,12 @@ ClientPlayer.prototype.loadSubtitleTrack = async function(subTrackIndex) {
     attachVTTToVideo(this.video, vtt, label);
 };
 
-// Build stream infos array for muxer initialization (video-only)
-ClientPlayer.prototype._buildStreamInfos = function() {
+// Build stream infos array for muxer initialization. Video comes from the
+// demuxer; audio is a freshly-built Opus codecpar (WebCodecs does the encode,
+// so libav never sees the audio encoding path).
+ClientPlayer.prototype._buildStreamInfos = async function() {
     var streamInfos = [];
     var videoStream = this.demuxer.streams[this.demuxer.videoStreamIndex];
-    // Codec name comes from the original probe data — used by the muxer to
-    // apply HEVC-specific open-GOP handling (clearing AV_PKT_FLAG_KEY on CRA
-    // packets so MSE doesn't flag "sync sample with later PTS than dependent
-    // non-sync sample").
     var videoCodec = this.probeData && this.probeData.video && this.probeData.video.codec;
     if (videoStream) {
         streamInfos.push({
@@ -500,66 +536,18 @@ ClientPlayer.prototype._buildStreamInfos = function() {
             codecName: videoCodec
         });
     }
-    return streamInfos;
-};
-
-// Build the audio-only mp4 URL for a given file + audio track.
-// Uses the /api/audio endpoint which extracts audio-only (no video track) so
-// Chrome doesn't allocate a duplicate D3D11VideoDecoder on the <audio> element.
-ClientPlayer.prototype._audioTrackUrl = function(filepath, audioTrackIdx) {
-    return "/api/audio/" + encodeFilePath(filepath) + "/track/" + (audioTrackIdx || 0) + ".m4a";
-};
-
-// Play audio directly via a hidden <audio> element synced to the MSE video
-ClientPlayer.prototype._startDirectAudio = function(filepath, probeData) {
-    if (!probeData.audio || probeData.audio.length === 0) return;
-
-    this._audioEl = document.createElement("audio");
-    this._audioEl.preload = "auto";
-    this._audioEl.style.display = "none";
-    document.body.appendChild(this._audioEl);
-
-    var video = this.video;
-    var audio = this._audioEl;
-    var self = this;
-    var audioUrl = this._audioTrackUrl(filepath, this.currentAudioTrack);
-
-    // Retry on error: first request triggers a cold ffmpeg extraction server-side
-    // which can outlast the media element's initial load window, surfacing as a
-    // MEDIA_ERR_SRC_NOT_SUPPORTED (code 4). Retry with backoff until cache warms.
-    this._audioRetries = 0;
-    audio.addEventListener("error", function() {
-        if (!self.running || self._audioEl !== audio) return;
-        if (self._audioRetries >= 8) return;
-        self._audioRetries++;
-        var delay = Math.min(500 * self._audioRetries, 3000);
-        setTimeout(function() {
-            if (!self.running || self._audioEl !== audio) return;
-            audio.src = audioUrl;
-            audio.load();
-            if (!video.paused) {
-                audio.currentTime = video.currentTime;
-                audio.play().catch(function(){});
-            }
-        }, delay);
-    });
-
-    // Sync audio to video on play/pause/seek
-    video.addEventListener("play", function() { audio.play().catch(function(){}); });
-    video.addEventListener("pause", function() { audio.pause(); });
-    video.addEventListener("seeking", function() { audio.currentTime = video.currentTime; });
-    video.addEventListener("volumechange", function() {
-        audio.volume = video.volume;
-        audio.muted = video.muted;
-    });
-
-    audio.src = audioUrl;
-
-    // Start audio when video starts
-    if (!video.paused) {
-        audio.currentTime = video.currentTime;
-        audio.play().catch(function(){});
+    if (this._audioAbsIdx >= 0 && this.audioReencoder) {
+        var opusCodecpar = await buildOpusCodecpar(this.demuxer.libav,
+            this.audioReencoder.outputChannels, this.audioReencoder.outputSampleRate);
+        streamInfos.push({
+            inputIndex: this._audioAbsIdx,
+            codecpar: opusCodecpar,
+            time_base_num: 1,
+            time_base_den: this.audioReencoder.outputSampleRate,
+            codecName: "opus"
+        });
     }
+    return streamInfos;
 };
 
 ClientPlayer.prototype.cleanup = function() {
@@ -586,22 +574,11 @@ ClientPlayer.prototype.cleanup = function() {
     }
 
     if (this.mediaSource && this.mediaSource.readyState === "open") {
-        try {
-            this.mediaSource.endOfStream();
-        } catch (e) {}
+        try { this.mediaSource.endOfStream(); } catch (e) {}
     }
     this.mediaSource = null;
     this.sourceBuffer = null;
 
-    if (this._audioEl) {
-        this._audioEl.pause();
-        this._audioEl.removeAttribute("src");
-        // Calling .load() after stripping src forces the element to abort any
-        // in-flight network activity for the previous file's audio track.
-        try { this._audioEl.load(); } catch (e) {}
-        if (this._audioEl.parentNode) this._audioEl.parentNode.removeChild(this._audioEl);
-        this._audioEl = null;
-    }
-
     this.currentAudioTrack = 0;
+    this._audioAbsIdx = -1;
 };

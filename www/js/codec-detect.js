@@ -141,6 +141,15 @@ function canWebCodecsDecodeAudio(codec) {
     return WEBCODECS_AUDIO_CODECS.indexOf(codec.toLowerCase()) !== -1;
 }
 
+// The client tier always re-encodes audio to Opus in fMP4. Verify the
+// browser can play that combination before routing files through this path —
+// Safari has no Opus-in-MP4 MSE support and must fall through to the HLS or
+// server-transcode tiers.
+function clientTierSupportsOpusOutput() {
+    if (typeof MediaSource === "undefined") return false;
+    return MediaSource.isTypeSupported('audio/mp4; codecs="opus"');
+}
+
 // Check if MSE supports any MP4 output at all (needed for client-side transmux)
 function canMSEHandleMP4() {
     if (typeof MediaSource === "undefined") return false;
@@ -172,25 +181,24 @@ function chooseTier(probeData) {
     // Direct play: browser can handle the container+codec natively (e.g. MP4 H.264)
     // This is the fastest path — no demuxing, no MSE, no transcoding.
     if (canPlayDirect(probeData)) {
-        console.log("[Tier] Direct (native playback:", probeData.container, probeData.video.codec + ")");
+        SP.log.debug("Tier", "Direct (native playback:", probeData.container, probeData.video.codec + ")");
         return "direct";
     }
 
     // Tier 2 (client-side transmux) is preferred when available — it handles
     // any container/codec combo the browser can decode via MSE, without relying
     // on nginx-vod-module or HLS.js transmuxing which can be unreliable.
-    if (canMSEHandleMP4()) {
+    // Client tier always re-encodes audio to Opus, so require Opus-in-mp4
+    // playback support (excludes Safari).
+    if (canMSEHandleMP4() && clientTierSupportsOpusOutput()) {
         var videoMime = buildMSEMimeType("video", probeData.video);
         if (canMSEPlay(videoMime)) {
             var hasPlayableAudio = probeData.audio.length === 0 || probeData.audio.some(function(a) {
-                var audioMime = buildMSEMimeType("audio", a);
-                if (canMSEPlay(audioMime)) return true;
-                if (canWebCodecsDecodeAudio(a.codec)) return true;
-                return false;
+                return canWebCodecsDecodeAudio(a.codec);
             });
 
             if (hasPlayableAudio) {
-                console.log("[Tier] Client-side (video:", probeData.video.codec + ", audio:",
+                SP.log.debug("Tier", "Client-side (video:", probeData.video.codec + ", audio:",
                     probeData.audio.map(function(a) { return a.codec; }).join("/") + ")");
                 return "client";
             }
@@ -199,10 +207,10 @@ function chooseTier(probeData) {
 
     // Tier 1: native HLS via nginx-vod-module (fallback for browsers without MSE MP4)
     if (isTier1Compatible(probeData)) {
-        console.log("[Tier] HLS (H.264+AAC, compatible container)");
+        SP.log.debug("Tier", "HLS (H.264+AAC, compatible container)");
         return "hls";
     }
 
-    console.log("[Tier] Transcode (video:", probeData.video.codec + ")");
+    SP.log.debug("Tier", "Transcode (video:", probeData.video.codec + ")");
     return "transcode";
 }

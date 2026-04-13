@@ -76,7 +76,7 @@ ClientDemuxer.prototype.init = async function() {
             await self.libav.ff_block_reader_dev_send(name, position, slice);
         } catch (err) {
             if (err.name !== "AbortError") {
-                console.error("[Demuxer] Range request failed:", err);
+                SP.log.error("Demuxer", "Range request failed:", err);
             }
             await self.libav.ff_block_reader_dev_send(name, position, new Uint8Array(0));
         } finally {
@@ -130,7 +130,7 @@ ClientDemuxer.prototype.init = async function() {
         this.duration = this.streams[0].duration;
     }
 
-    console.log("[Demuxer] Initialized:", this.streams.length, "streams",
+    SP.log.debug("Demuxer", "Initialized:", this.streams.length, "streams",
         "video:", this.videoStreamIndex, "audio:", this.audioStreamIndex);
 };
 
@@ -160,7 +160,7 @@ ClientDemuxer.prototype.fixAudioParams = async function(probeData) {
 
         if (!channels || channels <= 0) {
             var probeChannels = probeAudio.channels || 2;
-            console.log("[Demuxer] Fixing audio stream", s.index, "channels:", 0, "→", probeChannels);
+            SP.log.debug("Demuxer", "Fixing audio stream", s.index, "channels:", 0, "→", probeChannels);
             if (typeof this.libav.AVCodecParameters_ch_layout_nb_channels_s === "function") {
                 await this.libav.AVCodecParameters_ch_layout_nb_channels_s(codecparPtr, probeChannels);
             }
@@ -188,7 +188,7 @@ ClientDemuxer.prototype.fixAudioParams = async function(probeData) {
                     if (channelConfig > 0) {
                         extradata[1] = (extradata[1] & 0x87) | (channelConfig << 3);
                         await this.libav.copyin_u8(extraPtr, extradata);
-                        console.log("[Demuxer] Patched AAC AudioSpecificConfig channelConfiguration →", channelConfig);
+                        SP.log.debug("Demuxer", "Patched AAC AudioSpecificConfig channelConfiguration →", channelConfig);
                     }
                 }
             }
@@ -213,6 +213,20 @@ ClientDemuxer.prototype.getAudioStreamIndex = function(audioTrackNum) {
         }
     }
     return -1;
+};
+
+// Read the codec-private extradata (e.g. AAC AudioSpecificConfig, Vorbis
+// identification/setup headers) for an audio stream so it can be passed to
+// AudioDecoder.configure({ description }). Returns null if the stream has no
+// extradata or is not an audio stream.
+ClientDemuxer.prototype.getAudioExtradata = async function(absStreamIndex) {
+    if (absStreamIndex < 0 || absStreamIndex >= this.streams.length) return null;
+    var streamPtr = await this.libav.AVFormatContext_streams_a(this.fmtCtx, absStreamIndex);
+    var codecparPtr = await this.libav.AVStream_codecpar(streamPtr);
+    var extraPtr = await this.libav.AVCodecParameters_extradata(codecparPtr);
+    var extraSize = await this.libav.AVCodecParameters_extradata_size(codecparPtr);
+    if (!extraPtr || extraSize <= 0) return null;
+    return await this.libav.copyout_u8(extraPtr, extraSize);
 };
 
 // Read a batch of packets. Returns { packets: Record<streamIndex, Packet[]>, eof: boolean }
@@ -267,7 +281,7 @@ ClientDemuxer.prototype.destroy = async function() {
             if (this.pkt) await this.libav.av_packet_free(this.pkt);
             if (this.fmtCtx) await this.libav.avformat_close_input_js(this.fmtCtx);
         } catch (e) {
-            console.warn("[Demuxer] Cleanup error:", e);
+            SP.log.warn("Demuxer", "Cleanup error:", e);
         }
         this.libav.terminate();
         this.libav = null;

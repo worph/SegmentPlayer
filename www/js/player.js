@@ -264,7 +264,7 @@ function playDirect(filePath, fileName, token) {
     SP.elements.video.onerror = function() {
         if (token !== SP.state.loadToken) return;
         // Auto-fallback: try remux, then transcode
-        console.log("Direct playback failed, falling back...");
+        SP.log.warn("Client", "Direct playback failed, falling back...");
         if (SP.state.probeData) {
             var vcodec = SP.state.probeData.video && SP.state.probeData.video.codec;
             var acodec = SP.state.probeData.audio && SP.state.probeData.audio[0] && SP.state.probeData.audio[0].codec;
@@ -311,7 +311,7 @@ async function playFileClient(filePath, fileName, probeData, token) {
 
     function fallback(reason) {
         if (token !== SP.state.loadToken) return;
-        console.warn("[Client] Falling back:", reason);
+        SP.log.warn("Client", "Falling back:", reason);
         SP.state.isClientSide = false;
         if (SP.state.clientPlayer) {
             SP.state.clientPlayer.cleanup();
@@ -329,7 +329,7 @@ async function playFileClient(filePath, fileName, probeData, token) {
                 return testVideo.canPlayType(m) !== '';
             });
             if (canDirect) {
-                console.log("[Client] Falling back to Direct mode");
+                SP.log.warn("Client", "Falling back to Direct mode");
                 // Reset video element and wait a tick before Direct mode
                 SP.elements.video.removeAttribute('src');
                 SP.elements.video.onerror = null;
@@ -344,7 +344,7 @@ async function playFileClient(filePath, fileName, probeData, token) {
                 return;
             }
         }
-        console.log("[Client] Falling back to server transcode");
+        SP.log.warn("Client", "Falling back to server transcode");
         tryTranscodedFallback(filePath, fileName, token);
     }
 
@@ -397,7 +397,7 @@ async function playFileClient(filePath, fileName, probeData, token) {
         // commonly has 10+ second IDR spacing, so 5 s is too tight.
         var watchdog = setTimeout(function() {
             if (SP.state.clientPlayer && SP.elements.video.readyState < 3) {
-                console.warn("[Client] Watchdog: no playable data after 20s");
+                SP.log.warn("Client", "Watchdog: no playable data after 20s");
                 fallback("Watchdog timeout — no playable data");
             }
         }, 20000);
@@ -510,7 +510,7 @@ function playRemux(filePath, fileName, token) {
                 bufferErrorCount++;
                 if (bufferErrorCount >= 10 && !remuxFallingBack) {
                     remuxFallingBack = true;
-                    console.warn("[Remux] Too many buffer errors (" + bufferErrorCount + "), falling back to transcode");
+                    SP.log.warn("Remux", "Too many buffer errors (" + bufferErrorCount + "), falling back to transcode");
                     // Destroy synchronously to stop the error flood, then schedule fallback
                     if (SP.state.hls === remuxHls) SP.state.hls = null;
                     remuxHls.destroy();
