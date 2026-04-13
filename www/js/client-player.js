@@ -515,13 +515,34 @@ ClientPlayer.prototype._startDirectAudio = function(filepath, probeData) {
     if (!probeData.audio || probeData.audio.length === 0) return;
 
     this._audioEl = document.createElement("audio");
-    this._audioEl.src = this._audioTrackUrl(filepath, this.currentAudioTrack);
     this._audioEl.preload = "auto";
     this._audioEl.style.display = "none";
     document.body.appendChild(this._audioEl);
 
     var video = this.video;
     var audio = this._audioEl;
+    var self = this;
+    var audioUrl = this._audioTrackUrl(filepath, this.currentAudioTrack);
+
+    // Retry on error: first request triggers a cold ffmpeg extraction server-side
+    // which can outlast the media element's initial load window, surfacing as a
+    // MEDIA_ERR_SRC_NOT_SUPPORTED (code 4). Retry with backoff until cache warms.
+    this._audioRetries = 0;
+    audio.addEventListener("error", function() {
+        if (!self.running || self._audioEl !== audio) return;
+        if (self._audioRetries >= 8) return;
+        self._audioRetries++;
+        var delay = Math.min(500 * self._audioRetries, 3000);
+        setTimeout(function() {
+            if (!self.running || self._audioEl !== audio) return;
+            audio.src = audioUrl;
+            audio.load();
+            if (!video.paused) {
+                audio.currentTime = video.currentTime;
+                audio.play().catch(function(){});
+            }
+        }, delay);
+    });
 
     // Sync audio to video on play/pause/seek
     video.addEventListener("play", function() { audio.play().catch(function(){}); });
@@ -531,6 +552,8 @@ ClientPlayer.prototype._startDirectAudio = function(filepath, probeData) {
         audio.volume = video.volume;
         audio.muted = video.muted;
     });
+
+    audio.src = audioUrl;
 
     // Start audio when video starts
     if (!video.paused) {
