@@ -23,8 +23,9 @@ docker-compose.local.yml
 media/*
 !media/README.md
 
-# Vendor libs (downloaded during docker build / dev setup)
-www/vendor/
+# Vendor libs are bundled into the repo so the Docker image is CDN-independent.
+# (The custom sp-audio libav.js variant — see docs/libav-custom-build.md — is
+# not available on any CDN, so we commit everything together.)
 CLAUDE.md
 .claude/settings.local.json
 benchmarks/tomato.md
