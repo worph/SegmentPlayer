@@ -92,14 +92,21 @@ function ClientMuxer(libav) {
     this._clampCount = {};                // monotonicity clamp trigger count
     this._synthesisFallback = {};         // revert to DTS = PTS if clamp count exceeds threshold
     this._isHevc = {};                    // true for HEVC video streams (enables CRA flag filtering)
+    this._isAv1 = {};                     // true for AV1 video streams (routes to DTS=PTS passthrough)
 }
 
 // Tunables
 ClientMuxer.WARMUP_MIN_PACKETS = 16;
 ClientMuxer.WARMUP_MIN_PACKETS_NO_B = 32;
-ClientMuxer.WARMUP_MAX_PACKETS = 64;
-ClientMuxer.REORDER_DEPTH_CAP = 16;
-ClientMuxer.CLAMP_FALLBACK_THRESHOLD = 5;
+ClientMuxer.WARMUP_MAX_PACKETS = 128;
+// CLAMP_FALLBACK_THRESHOLD is set ≥ REORDER_DEPTH_CAP so the +1-per-clamp
+// growth in _onDepthInsufficient always runs to exhaustion before the
+// DTS=PTS fallback engages. Tripping fallback early on reordered video
+// produces non-monotonic DTS that Chrome's ChunkDemuxer rejects with
+// CHUNK_DEMUXER_ERROR_APPEND_FAILED — the fallback is for genuinely broken
+// timestamps, not deep B-pyramids.
+ClientMuxer.REORDER_DEPTH_CAP = 32;
+ClientMuxer.CLAMP_FALLBACK_THRESHOLD = 32;
 
 // Initialize muxer with stream configurations from demuxer
 // streamInfos: array of { inputIndex, codecpar, time_base_num, time_base_den }
@@ -131,6 +138,7 @@ ClientMuxer.prototype.init = async function(streamInfos) {
         // filtering in the mux loop — see the "HEVC open-GOP filter" block.
         var cname = (info.codecName || "").toLowerCase();
         this._isHevc[i] = (cname === "hevc" || cname === "h265");
+        this._isAv1[i] = (cname === "av1");
     }
 
     // Initialize muxer
@@ -182,6 +190,22 @@ ClientMuxer.prototype.init = async function(streamInfos) {
 
             if (codecType === this.libav.AVMEDIA_TYPE_VIDEO) {
                 this._streamKind[si] = "video";
+                // AV1 in MKV stores packets in display order — no container-level
+                // reorder to synthesize DTS around. Running the sort-assign path
+                // on already-ordered PTS with a non-zero `_dtsShift` produces
+                // early DTS values clamped to 0 then ramped by +1, yielding
+                // 1-tick sample durations for the first N frames. Chrome's
+                // ChunkDemuxer rejects the resulting timeline with
+                // CHUNK_DEMUXER_ERROR_APPEND_FAILED. The AV1 bitstream carries
+                // its own decode-vs-display ordering via show_existing_frame;
+                // the MP4 AV1 sample entry lets the decoder handle that, so
+                // DTS = PTS passthrough is correct here.
+                if (this._isAv1[si]) {
+                    this._synthesisFallback[si] = true;
+                    this._reorderDepth[si] = 0;
+                    this._depthMeasured[si] = true;
+                    SP.log.debug("Muxer", "AV1 stream", si, "→ DTS=PTS passthrough (display-order packets)");
+                }
                 // For HEVC, force the sample-entry codec_tag to 'hvc1' (instead
                 // of the default 'hev1'). With 'hev1', VPS/SPS/PPS parameter
                 // sets are inline per fragment, and Chrome's D3D11 hardware
@@ -250,6 +274,7 @@ ClientMuxer.prototype._resetStreamState = function(outputIdx) {
     this._clampCount[outputIdx] = 0;
     this._synthesisFallback[outputIdx] = false;
     this._isHevc[outputIdx] = false;
+    this._isAv1[outputIdx] = false;
     this._dtsShift[outputIdx] = 0;
 };
 
@@ -464,7 +489,7 @@ ClientMuxer.prototype._warmupPush = function(outputIdx, pkt, flatPackets) {
     var stable = this._stableCount[outputIdx];
     var kfs = this._warmupKeyframes[outputIdx];
     var minPackets = (depth === 0) ? ClientMuxer.WARMUP_MIN_PACKETS_NO_B : ClientMuxer.WARMUP_MIN_PACKETS;
-    var requiredStable = Math.max(depth + 4, 8);
+    var requiredStable = Math.max(depth * 2, 8);
 
     var shouldFreeze =
         n >= ClientMuxer.WARMUP_MAX_PACKETS ||
@@ -616,9 +641,10 @@ ClientMuxer.prototype._onDepthInsufficient = function(outputIdx, reason) {
     if (this._reorderDepth[outputIdx] < ClientMuxer.REORDER_DEPTH_CAP) {
         this._reorderDepth[outputIdx] += 1;
     }
-    if (this._clampCount[outputIdx] >= ClientMuxer.CLAMP_FALLBACK_THRESHOLD) {
+    if (this._clampCount[outputIdx] >= ClientMuxer.CLAMP_FALLBACK_THRESHOLD &&
+        this._reorderDepth[outputIdx] >= ClientMuxer.REORDER_DEPTH_CAP) {
         SP.log.error("Muxer", "Stream", outputIdx,
-            "exceeded clamp threshold; disabling DTS synthesis (DTS = PTS fallback).");
+            "exceeded clamp threshold at depth cap; disabling DTS synthesis (DTS = PTS fallback).");
         this._synthesisFallback[outputIdx] = true;
     }
 };

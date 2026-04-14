@@ -454,7 +454,7 @@ ClientPlayer.prototype._collectSubtitlePackets = function(packets) {
     }
 };
 
-ClientPlayer.prototype._refreshActiveSubtitle = function() {
+ClientPlayer.prototype._refreshActiveSubtitle = async function() {
     if (this._activeSubtitleTrack < 0 || this._activeSubtitleAbsIdx < 0) return;
 
     var subInfo = this.probeData.subtitles[this._activeSubtitleTrack];
@@ -469,7 +469,7 @@ ClientPlayer.prototype._refreshActiveSubtitle = function() {
         timeBase = stream.time_base_num / stream.time_base_den;
     }
 
-    var vtt = buildVTTFromPackets(pkts, timeBase, subInfo.codec);
+    var vtt = await buildVTTFromPackets(pkts, timeBase, subInfo.codec);
     var label = subInfo.title || subInfo.language || "Track " + (this._activeSubtitleTrack + 1);
     attachVTTToVideo(this.video, vtt, label);
 };
@@ -515,7 +515,7 @@ ClientPlayer.prototype.loadSubtitleTrack = async function(subTrackIndex) {
         timeBase = stream.time_base_num / stream.time_base_den;
     }
 
-    var vtt = buildVTTFromPackets(pkts, timeBase, subInfo.codec);
+    var vtt = await buildVTTFromPackets(pkts, timeBase, subInfo.codec);
     var label = subInfo.title || subInfo.language || "Track " + (subTrackIndex + 1);
     attachVTTToVideo(this.video, vtt, label);
 };

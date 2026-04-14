@@ -58,9 +58,37 @@ ClientSubtitleExtractor.prototype.extract = async function(subStreamIndex, codec
     return buildVTTFromPackets(subtitlePackets, timeBase, codec);
 };
 
+// Matroska ContentCompression (zlib) leaves subtitle packets deflated —
+// libav.js strips a few things but doesn't inflate. Detect the zlib header
+// (0x78 0x01 / 0x9C / 0xDA) and inflate via the platform DecompressionStream.
+function looksZlib(data) {
+    return data && data.length >= 2 && data[0] === 0x78 &&
+        (data[1] === 0x01 || data[1] === 0x9C || data[1] === 0xDA);
+}
+
+async function inflateZlib(data) {
+    var ds = new DecompressionStream("deflate");
+    var w = ds.writable.getWriter();
+    w.write(data);
+    w.close();
+    var buf = await new Response(ds.readable).arrayBuffer();
+    return new Uint8Array(buf);
+}
+
+async function decompressPacketData(data) {
+    if (looksZlib(data)) {
+        try {
+            return await inflateZlib(data);
+        } catch (e) {
+            SP.log.warn("Subtitles", "zlib inflate failed:", e);
+        }
+    }
+    return data;
+}
+
 // Build a WebVTT string from an array of subtitle packets.
 // Reusable by both the full-file extractor and piggyback collection.
-function buildVTTFromPackets(packets, timeBase, codec) {
+async function buildVTTFromPackets(packets, timeBase, codec) {
     if (!packets || packets.length === 0) return "WEBVTT\n\n";
 
     // Sort by PTS so packets collected out-of-order (e.g. after seeks) are correct
@@ -87,7 +115,8 @@ function buildVTTFromPackets(packets, timeBase, codec) {
 
         if (duration <= 0 || startTime < 0) continue;
 
-        var text = decoder.decode(pkt.data);
+        var data = await decompressPacketData(pkt.data);
+        var text = decoder.decode(data);
         var cleanText = decodeSubtitleText(text, codec);
 
         if (cleanText.trim() === "") continue;
