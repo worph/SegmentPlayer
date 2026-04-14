@@ -6,11 +6,45 @@
  * run asynchronously via their own WebCodecs queues, and we pick up output
  * whenever it's ready rather than blocking on per-batch flush.
  *
+ * Decoder fallback: when the browser's native AudioDecoder rejects a codec
+ * (AudioDecoder.isConfigSupported returns false — common for AC3/EAC3/DTS on
+ * some Chromium Linux builds), we fall back to the libav.js-backed
+ * LibAVWebCodecs.AudioDecoder from vendor/libavjs-webcodecs-polyfill.js. The
+ * polyfill is configured to share our already-loaded LibAV wrapper so no
+ * second WASM is downloaded — its decoder pool just creates additional
+ * instances against the same WASM. Native stays the fast-path (hardware-
+ * accelerated where available); polyfill is strictly a fallback.
+ *
  * Output timestamps are rescaled from WebCodecs microseconds to the Opus
  * native 1/48000 timebase that the muxer is initialized with.
  */
 
 var OPUS_TB_DEN = 48000; // output timebase denominator (Hz)
+
+// Lazy one-time bootstrap for the polyfill. Loads the vendor JS, then calls
+// LibAVWebCodecs.load({LibAV}) pointing it at our existing LibAV wrapper so
+// its decoder instances reuse our WASM build. Resolves with the polyfill's
+// exported namespace; subsequent calls return the cached promise.
+// Bump this when the vendored polyfill is patched so previously-cached copies
+// aren't reused. Matches the ?v= suffix convention used in index.html.
+var POLYFILL_VERSION = "sp2";
+
+var _polyfillReady = null;
+function ensurePolyfillReady() {
+    if (_polyfillReady) return _polyfillReady;
+    _polyfillReady = (async function() {
+        await loadVendor("webcodecs-polyfill",
+            "vendor/libavjs-webcodecs-polyfill.js?v=" + POLYFILL_VERSION);
+        if (typeof LibAVWebCodecs === "undefined") {
+            throw new Error("LibAVWebCodecs polyfill failed to load");
+        }
+        await LibAVWebCodecs.load({
+            LibAV: (typeof LibAV !== "undefined") ? LibAV : undefined
+        });
+        return LibAVWebCodecs;
+    })();
+    return _polyfillReady;
+}
 
 function AudioReencoder() {
     this.decoder = null;
@@ -28,6 +62,11 @@ function AudioReencoder() {
     this.inputTimeBaseDen = 1000000;
     this.outputSampleRate = 48000;
     this.outputChannels = 2;
+    // Decoder/chunk class pair selected at configure-time. Defaults to globals
+    // (native WebCodecs); swapped to LibAVWebCodecs.* when native rejects.
+    this._AudioDecoderClass = (typeof AudioDecoder !== "undefined") ? AudioDecoder : null;
+    this._EncodedAudioChunkClass = (typeof EncodedAudioChunk !== "undefined") ? EncodedAudioChunk : null;
+    this._usingPolyfill = false;
 }
 
 // Map ffprobe codec names to WebCodecs codec strings for AudioDecoder
@@ -41,8 +80,8 @@ function mapAudioCodecToWebCodecs(codec) {
         case "flac": return "flac";
         case "vorbis": return "vorbis";
         case "dts":
-            // DTS is not universally supported by WebCodecs
-            // Will need polyfill fallback
+            // DTS is not universally supported by WebCodecs; the libav.js
+            // polyfill fallback handles it.
             return "dts";
         default: return null;
     }
@@ -76,9 +115,48 @@ AudioReencoder.prototype._buildDecoderConfig = function() {
     return cfg;
 };
 
+// Pick a decoder implementation that actually supports the current config.
+// Tries native first (hardware-accelerated where possible), falls back to the
+// libav.js polyfill (CPU decode in WASM) when native rejects the codec.
+// Throws if neither supports it.
+AudioReencoder.prototype._selectDecoderImpl = async function() {
+    var cfg = this._buildDecoderConfig();
+
+    // Native path.
+    if (typeof AudioDecoder !== "undefined") {
+        try {
+            var nativeSupport = await AudioDecoder.isConfigSupported(cfg);
+            if (nativeSupport && nativeSupport.supported) {
+                this._AudioDecoderClass = AudioDecoder;
+                this._EncodedAudioChunkClass = EncodedAudioChunk;
+                this._usingPolyfill = false;
+                return;
+            }
+        } catch (e) { /* fall through to polyfill */ }
+    }
+
+    // Polyfill path.
+    var pf;
+    try {
+        pf = await ensurePolyfillReady();
+    } catch (e) {
+        throw new Error("No decoder available for " + this.inputCodec
+            + " (native rejected, polyfill load failed: " + e.message + ")");
+    }
+    var pfSupport = await pf.AudioDecoder.isConfigSupported(cfg);
+    if (!pfSupport || !pfSupport.supported) {
+        throw new Error("No decoder available for " + this.inputCodec
+            + " (native rejected, polyfill also rejected)");
+    }
+    this._AudioDecoderClass = pf.AudioDecoder;
+    this._EncodedAudioChunkClass = pf.EncodedAudioChunk;
+    this._usingPolyfill = true;
+    SP.log.debug("AudioReencoder", "Using libav polyfill for codec:", this.inputCodec);
+};
+
 AudioReencoder.prototype._createDecoder = function() {
     var self = this;
-    this.decoder = new AudioDecoder({
+    this.decoder = new this._AudioDecoderClass({
         output: function(frame) { self._onDecodedFrame(frame); },
         error: function(e) { SP.log.error("AudioReencoder", "Decode error:", e); }
     });
@@ -87,6 +165,7 @@ AudioReencoder.prototype._createDecoder = function() {
 
 AudioReencoder.prototype._createEncoder = function() {
     var self = this;
+    // Encoder stays native — AudioEncoder for Opus is reliably available.
     this.encoder = new AudioEncoder({
         output: function(chunk, metadata) { self._onEncodedChunk(chunk, metadata); },
         error: function(e) { SP.log.error("AudioReencoder", "Encode error:", e); }
@@ -109,19 +188,19 @@ AudioReencoder.prototype.init = async function(inputCodec, sampleRate, channels,
         this.inputTimeBaseDen = timeBase.den;
     }
 
-    // Ensure WebCodecs is available (load polyfill for Firefox if needed)
-    if (typeof AudioDecoder === "undefined") {
-        await loadVendor("webcodecs-polyfill", "vendor/libavjs-webcodecs-polyfill.js");
-        if (typeof AudioDecoder === "undefined") {
-            throw new Error("WebCodecs AudioDecoder not available");
-        }
+    // If native AudioDecoder/AudioEncoder are missing entirely (Firefox until
+    // ~2024), load the polyfill globally to provide both. On modern browsers
+    // this is a no-op and native WebCodecs is used.
+    if (typeof AudioDecoder === "undefined" || typeof AudioEncoder === "undefined") {
+        var pf = await ensurePolyfillReady();
+        if (typeof AudioDecoder === "undefined") AudioDecoder = pf.AudioDecoder;
+        if (typeof EncodedAudioChunk === "undefined") EncodedAudioChunk = pf.EncodedAudioChunk;
+        if (typeof AudioEncoder === "undefined") AudioEncoder = pf.AudioEncoder;
+        if (typeof AudioData === "undefined") AudioData = pf.AudioData;
     }
 
-    var decoderConfig = this._buildDecoderConfig();
-    var support = await AudioDecoder.isConfigSupported(decoderConfig);
-    if (!support.supported) {
-        throw new Error("WebCodecs cannot decode " + inputCodec);
-    }
+    // Select decoder implementation (native fast-path or polyfill fallback).
+    await this._selectDecoderImpl();
 
     // Downmix to stereo for compatibility
     this.outputChannels = Math.min(this.inputChannels, 2);
@@ -132,7 +211,8 @@ AudioReencoder.prototype.init = async function(inputCodec, sampleRate, channels,
 
     this.ready = true;
     SP.log.debug("AudioReencoder", "Initialized:", inputCodec, "->", "Opus",
-        this.outputChannels + "ch", this.outputSampleRate + "Hz");
+        this.outputChannels + "ch", this.outputSampleRate + "Hz",
+        this._usingPolyfill ? "(via polyfill)" : "(native)");
 };
 
 // Resample and/or downmix a decoded AudioData to the encoder's expected
@@ -140,11 +220,17 @@ AudioReencoder.prototype.init = async function(inputCodec, sampleRate, channels,
 // high-quality resampler and standard ITU-R BS.775-1 downmix). WebCodecs
 // AudioEncoder requires frames to match encoder.configure() exactly — it
 // does NOT auto-convert. Common mismatch: source is 44.1 kHz or multichannel.
+//
+// Polyfill note: when decode runs through libav.js, the resulting AudioData
+// is a polyfill class. Native AudioEncoder may reject non-native AudioData
+// via internal type checks, so we always route polyfill frames through this
+// repackage path (which constructs a fresh native AudioData from the samples).
 AudioReencoder.prototype._convertFrame = async function(frame) {
     var srcRate = frame.sampleRate;
     var srcCh = frame.numberOfChannels;
     var srcFrames = frame.numberOfFrames;
-    if (srcRate === this.outputSampleRate && srcCh === this.outputChannels) {
+    var sameFormat = srcRate === this.outputSampleRate && srcCh === this.outputChannels;
+    if (sameFormat && !this._usingPolyfill) {
         return frame;
     }
 
@@ -238,7 +324,7 @@ AudioReencoder.prototype.submitPackets = function(packets) {
         try {
             var tsUs = Math.round((pkt.pts || 0) * tickToUs);
             var durUs = Math.round((pkt.duration || 0) * tickToUs);
-            var chunk = new EncodedAudioChunk({
+            var chunk = new this._EncodedAudioChunkClass({
                 type: (pkt.flags & 1) ? "key" : "delta",
                 timestamp: tsUs,
                 duration: durUs,
@@ -292,8 +378,10 @@ AudioReencoder.prototype.reset = async function() {
 // segment does not change.
 //
 // Verifies decoder support BEFORE tearing down the existing decoder so that
-// a failed switch (e.g. browser lacks the codec implementation) leaves the
-// previous audio pipeline intact.
+// a failed switch (e.g. neither native nor polyfill handles the codec) leaves
+// the previous audio pipeline intact. Re-selects between native/polyfill based
+// on the NEW codec's config — a switch from AAC (native) to EAC3 (polyfill)
+// swaps the decoder class as well.
 AudioReencoder.prototype.reconfigureInput = async function(inputCodec, sampleRate, channels, extradata, timeBase) {
     var prev = {
         inputCodec: this.inputCodec,
@@ -301,7 +389,10 @@ AudioReencoder.prototype.reconfigureInput = async function(inputCodec, sampleRat
         inputChannels: this.inputChannels,
         inputExtradata: this.inputExtradata,
         inputTimeBaseNum: this.inputTimeBaseNum,
-        inputTimeBaseDen: this.inputTimeBaseDen
+        inputTimeBaseDen: this.inputTimeBaseDen,
+        _AudioDecoderClass: this._AudioDecoderClass,
+        _EncodedAudioChunkClass: this._EncodedAudioChunkClass,
+        _usingPolyfill: this._usingPolyfill
     };
     this.inputCodec = inputCodec;
     this.inputSampleRate = sampleRate || 48000;
@@ -312,21 +403,20 @@ AudioReencoder.prototype.reconfigureInput = async function(inputCodec, sampleRat
         this.inputTimeBaseDen = timeBase.den;
     }
 
-    var support;
     try {
-        support = await AudioDecoder.isConfigSupported(this._buildDecoderConfig());
+        await this._selectDecoderImpl();
     } catch (e) {
-        support = { supported: false };
-    }
-    if (!support.supported) {
-        // Roll back input-config state so the existing decoder stays valid.
+        // Roll back — neither native nor polyfill supports the new codec.
         this.inputCodec = prev.inputCodec;
         this.inputSampleRate = prev.inputSampleRate;
         this.inputChannels = prev.inputChannels;
         this.inputExtradata = prev.inputExtradata;
         this.inputTimeBaseNum = prev.inputTimeBaseNum;
         this.inputTimeBaseDen = prev.inputTimeBaseDen;
-        throw new Error("Audio codec not supported by this browser: " + inputCodec);
+        this._AudioDecoderClass = prev._AudioDecoderClass;
+        this._EncodedAudioChunkClass = prev._EncodedAudioChunkClass;
+        this._usingPolyfill = prev._usingPolyfill;
+        throw e;
     }
 
     // Keep the same outputChannels — changing it mid-stream would invalidate

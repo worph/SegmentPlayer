@@ -28,3 +28,5 @@ www/vendor/
 CLAUDE.md
 .claude/settings.local.json
 benchmarks/tomato.md
+.build-tmp
+.claude

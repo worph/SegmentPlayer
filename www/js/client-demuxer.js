@@ -23,8 +23,14 @@ ClientDemuxer.prototype.getStats = function() {
 };
 
 ClientDemuxer.prototype.init = async function() {
-    // Load libav.js if not already loaded
-    await loadVendor("libav", "vendor/libav-webcodecs.js");
+    // Load libav.js if not already loaded. We use a custom "sp-audio" variant
+    // (built via Docker from the libav.js sources with configs/configs/sp-audio).
+    // Same 6.8.8.0 API as the base webcodecs build, but with additional audio
+    // decoders compiled in: AC3, EAC3, DTS (dca), AAC, MP3, MP2, TRUEHD, ALAC,
+    // plus the libopus encoder we already use for muxing. These decoders back
+    // the WebCodecs polyfill fallback in audio-reencode.js when the browser's
+    // native AudioDecoder rejects a codec (e.g. EAC3 on some Chromium builds).
+    await loadVendor("libav", "vendor/libav-sp-audio.js");
 
     // Create libav instance (runs in Web Worker for non-blocking I/O)
     this.libav = await LibAV.LibAV();
