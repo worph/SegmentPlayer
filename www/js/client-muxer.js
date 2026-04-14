@@ -485,6 +485,21 @@ ClientMuxer.prototype._freezeDepthAndDrain = function(outputIdx, flatPackets) {
     // 3 covers the common case cheaply; the CTS-sanity peek in
     // _steadyPush is the correctness backstop for deeper pyramids.
     if (this._isHevc[outputIdx] && depth < 3) depth = 3;
+
+    // Max-packets-freeze safety floor. _warmupPush freezes on the first of
+    // two triggers: the confident stable branch (kfs >= 2 && stable >=
+    // requiredStable) or the n >= WARMUP_MAX_PACKETS fallback. If we
+    // exhausted the window without the confident branch firing and still
+    // measured depth=0, we don't actually have evidence the stream lacks
+    // B-frames — we just haven't seen one yet (long-GOP H.264 content can
+    // easily go >64 packets between keyframes, e.g. 24fps movie encodes).
+    // Seeding depth=2 here keeps the steady-state lookahead (and the
+    // dtsShift computed below) wide enough to absorb the first B-frames
+    // without tripping the monotonicity clamp, which in turn prevents the
+    // fallback cascade into DTS=PTS passthrough that breaks B-frame streams.
+    var hitMaxPackets = this._warmupBuf[outputIdx].length >= ClientMuxer.WARMUP_MAX_PACKETS;
+    if (depth === 0 && hitMaxPackets) depth = 2;
+
     this._reorderDepth[outputIdx] = depth;
     this._depthMeasured[outputIdx] = true;
 
