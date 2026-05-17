@@ -67,6 +67,14 @@ function AudioReencoder() {
     this._AudioDecoderClass = (typeof AudioDecoder !== "undefined") ? AudioDecoder : null;
     this._EncodedAudioChunkClass = (typeof EncodedAudioChunk !== "undefined") ? EncodedAudioChunk : null;
     this._usingPolyfill = false;
+    // Bresenham accumulator for frame-count resampling — bounded by srcRate, so
+    // long-run output count converges to the exact srcFrames × out/in ratio.
+    this._sampleAccum = 0;
+    // Timestamp anchor: the first input frame's timestamp seeds this, then all
+    // subsequent output AudioData timestamps are derived from a running output-
+    // sample count so the encoder sees a self-consistent (sample-count, ts) pair.
+    this._anchorTsUs = null;
+    this._totalOutSamples = 0;
 }
 
 // Map ffprobe codec names to WebCodecs codec strings for AudioDecoder
@@ -241,12 +249,24 @@ AudioReencoder.prototype._convertFrame = async function(frame) {
         frame.copyTo(buf, { planeIndex: c, format: "f32-planar" });
         planes[c] = buf;
     }
+
+    // Seed the timestamp anchor from the first input frame so output stays
+    // tied to the source media timeline (including post-seek positions).
+    if (this._anchorTsUs === null) this._anchorTsUs = frame.timestamp;
+
     frame.close();
+
+    // Bresenham frame-count selection: maintain an integer accumulator so
+    // outFrames alternates between floor and ceil of the true ratio, keeping
+    // the long-run average exact. Bounded by srcRate, never grows unbounded.
+    this._sampleAccum += srcFrames * this.outputSampleRate;
+    var outFrames = Math.floor(this._sampleAccum / srcRate);
+    this._sampleAccum -= outFrames * srcRate;
+    if (outFrames < 1) outFrames = 1;
 
     // Render through an OfflineAudioContext at the target rate + channel count.
     // The OAC handles resampling (src buffer's rate -> context rate) and
     // channel-count reduction (connection downmix to destination.channelCount).
-    var outFrames = Math.max(1, Math.ceil(srcFrames * this.outputSampleRate / srcRate));
     var oac = new OfflineAudioContext(this.outputChannels, outFrames, this.outputSampleRate);
     var srcBuf = oac.createBuffer(srcCh, srcFrames, srcRate);
     for (var ch = 0; ch < srcCh; ch++) srcBuf.copyToChannel(planes[ch], ch);
@@ -266,12 +286,18 @@ AudioReencoder.prototype._convertFrame = async function(frame) {
         }
     }
 
+    // Derive timestamp from cumulative output samples so the (numberOfFrames,
+    // timestamp) pair the encoder sees is internally consistent across the run.
+    var newTsUs = this._anchorTsUs + Math.round(
+        this._totalOutSamples * 1e6 / this.outputSampleRate);
+    this._totalOutSamples += renderedFrames;
+
     return new AudioData({
         format: "f32",
         sampleRate: this.outputSampleRate,
         numberOfFrames: renderedFrames,
         numberOfChannels: this.outputChannels,
-        timestamp: frame.timestamp,
+        timestamp: newTsUs,
         data: interleaved
     });
 };
@@ -295,6 +321,18 @@ AudioReencoder.prototype._onEncodedChunk = function(chunk, metadata) {
     // timebase (the audio stream's time_base set at ff_init_muxer time).
     var ptsTicks = Math.round((chunk.timestamp || 0) * OPUS_TB_DEN / 1e6);
     var durTicks = Math.round((chunk.duration || 0) * OPUS_TB_DEN / 1e6);
+
+    // Optional drift-tap — populated only when window.__driftTap is enabled.
+    // Captures per-chunk timestamp directly from the encoder, bypassing the
+    // muxer-lastDts staircase noise that polluted earlier measurements.
+    if (typeof window !== "undefined" && window.__driftTap && window.__driftTap.enabled) {
+        window.__driftTap.outputs.push({
+            ts_us: chunk.timestamp,
+            dur_us: chunk.duration,
+            bytes: chunk.byteLength,
+            wall: performance.now()
+        });
+    }
 
     var data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
@@ -324,6 +362,9 @@ AudioReencoder.prototype.submitPackets = function(packets) {
         try {
             var tsUs = Math.round((pkt.pts || 0) * tickToUs);
             var durUs = Math.round((pkt.duration || 0) * tickToUs);
+            if (typeof window !== "undefined" && window.__driftTap && window.__driftTap.enabled) {
+                window.__driftTap.inputs.push({ ts_us: tsUs, dur_us: durUs, dataLen: (pkt.data && pkt.data.byteLength) || 0 });
+            }
             var chunk = new this._EncodedAudioChunkClass({
                 type: (pkt.flags & 1) ? "key" : "delta",
                 timestamp: tsUs,
@@ -369,6 +410,11 @@ AudioReencoder.prototype.reset = async function() {
     try { this.decoder.close(); } catch (e) {}
     try { this.encoder.close(); } catch (e) {}
     this._outputQueue = [];
+    // Re-anchor timestamps to the first post-seek input frame and clear the
+    // Bresenham accumulator so frame-count rounding stays unbiased after seek.
+    this._sampleAccum = 0;
+    this._anchorTsUs = null;
+    this._totalOutSamples = 0;
     this._createDecoder();
     this._createEncoder();
 };
