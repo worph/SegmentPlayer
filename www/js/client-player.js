@@ -28,6 +28,7 @@ function ClientPlayer(videoElement) {
     this._activeSubtitleTrack = -1;   // subtitle track index currently displayed (-1 = none)
     this._activeSubtitleAbsIdx = -1;  // absolute stream index of active subtitle
     this._subtitleUpdateCounter = 0;  // throttle progressive VTT rebuilds
+    this._primerBatch = null;         // first post-seek packet batch (peeked to derive muxer base)
 }
 
 // Combined video+audio MIME for the single muxed SourceBuffer. Audio half is
@@ -168,7 +169,16 @@ ClientPlayer.prototype._pumpLoop = async function() {
                 setStatus("Buffering...", "#ffd43b", true);
             }
 
-            var result = await this.demuxer.readPackets(4 * 1024 * 1024);
+            // Consume the primer batch from _restartPipeline first — those
+            // packets were already read from the demuxer to derive the muxer
+            // base PTS, so re-reading here would skip past them.
+            var result;
+            if (this._primerBatch) {
+                result = this._primerBatch;
+                this._primerBatch = null;
+            } else {
+                result = await this.demuxer.readPackets(4 * 1024 * 1024);
+            }
 
             if (!this.running) break;
 
@@ -338,13 +348,6 @@ ClientPlayer.prototype._restartPipeline = async function(resumeTime, newAudioAbs
 
         if (generation !== this._seekGeneration) return;
 
-        // Each new muxer instance emits fMP4 fragments with tfdt
-        // baseMediaDecodeTime starting from 0 (the muxer normalizes to the
-        // start of its internal track). Shift the SourceBuffer's timeline so
-        // those 0-based fragments land at the seek target instead of t=0,
-        // which would otherwise leave Chrome's MSE silently dropping them.
-        try { this.sourceBuffer.timestampOffset = resumeTime; } catch (e) {}
-
         // 3. Optionally swap the active audio track on the demuxer side.
         if (typeof newAudioAbsIdx === "number" && newAudioAbsIdx >= 0
                 && newAudioAbsIdx !== this._audioAbsIdx) {
@@ -356,6 +359,42 @@ ClientPlayer.prototype._restartPipeline = async function(resumeTime, newAudioAbs
         await this.demuxer.seek(resumeTime);
 
         if (generation !== this._seekGeneration) return;
+
+        // 4b. Peek the first batch of packets so we can derive the muxer's
+        //     actual normalization base. AVSEEK_FLAG_BACKWARD lands on the
+        //     keyframe ≤ resumeTime, so the first video PTS is typically
+        //     earlier than resumeTime — and the first AAC frame can lie at a
+        //     third position again. The muxer normalizes its first packet's
+        //     DTS to 0, so we set timestampOffset to that base instead of
+        //     resumeTime, keeping subtitle cues (which carry raw source PTS)
+        //     aligned with the audio/video content at the same MSE position.
+        var primerBatch = await this.demuxer.readPackets(4 * 1024 * 1024);
+        var videoIdx = this.demuxer.videoStreamIndex;
+        var audioIdx = this._audioAbsIdx;
+        var minPts = Infinity;
+        function firstPts(arr) { return (arr && arr.length > 0) ? arr[0].pts : Infinity; }
+        if (primerBatch && primerBatch.packets) {
+            var vFirst = firstPts(primerBatch.packets[videoIdx]);
+            var aFirst = (audioIdx >= 0) ? firstPts(primerBatch.packets[audioIdx]) : Infinity;
+            // Both are in their stream's native timebase (each track has its own
+            // num/den). Convert to seconds via each track's time_base before
+            // taking the min.
+            var vStream = this.demuxer.streams[videoIdx];
+            var aStream = (audioIdx >= 0) ? this.demuxer.streams[audioIdx] : null;
+            var vFirstSec = (isFinite(vFirst) && vStream)
+                ? vFirst * vStream.time_base_num / vStream.time_base_den : Infinity;
+            var aFirstSec = (isFinite(aFirst) && aStream)
+                ? aFirst * aStream.time_base_num / aStream.time_base_den : Infinity;
+            minPts = Math.min(vFirstSec, aFirstSec);
+        }
+        // Fall back to resumeTime if the peek failed to yield any packets — the
+        // pump will re-read on its first iteration.
+        if (!isFinite(minPts)) minPts = resumeTime;
+
+        // Set timestampOffset to the muxer's expected first-PTS base so MSE
+        // position = source content position. Subtitle cues anchored to source
+        // PTS now fire when the corresponding A/V content actually plays.
+        try { this.sourceBuffer.timestampOffset = minPts; } catch (e) {}
 
         // 5. Reset audio re-encoder. Opus state is stateful; a half-filled
         //    frame from before the seek would corrupt output.
@@ -369,6 +408,11 @@ ClientPlayer.prototype._restartPipeline = async function(resumeTime, newAudioAbs
         await this.muxer.init(await this._buildStreamInfos());
 
         if (generation !== this._seekGeneration) return;
+
+        // 6b. Hand the peeked primer batch to the pump so it doesn't re-read
+        //     (which would skip past these packets) — the pump consumes the
+        //     primer on its first iteration before reading anew.
+        this._primerBatch = primerBatch;
 
         // 7. Restart pump.
         this.running = true;

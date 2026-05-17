@@ -96,10 +96,32 @@ async function buildVTTFromPackets(packets, timeBase, codec) {
         return (a.pts || 0) - (b.pts || 0);
     });
 
-    // Deduplicate by PTS (same subtitle collected from overlapping reads)
-    var deduped = [sorted[0]];
-    for (var i = 1; i < sorted.length; i++) {
-        if (sorted[i].pts !== sorted[i - 1].pts) {
+    // Deduplicate identical packets collected from overlapping reads — but
+    // NOT distinct cues that legitimately share the same PTS (ASS screener
+    // signs and stacked dialogue lines routinely declare multiple co-starting
+    // events). Key by pts + payload length + a cheap byte-rolling hash so
+    // genuine duplicates collapse while distinct cues survive.
+    function fingerprint(pkt) {
+        var d = pkt.data;
+        var len = d ? d.byteLength : 0;
+        var h = 0;
+        if (d) {
+            var bytes = (d instanceof Uint8Array) ? d : new Uint8Array(d);
+            // Sample up to 32 bytes evenly across the payload — bounded cost,
+            // separates animated sign lines whose first bytes are similar.
+            var step = Math.max(1, Math.floor(len / 32));
+            for (var k = 0; k < len; k += step) {
+                h = ((h << 5) - h + bytes[k]) | 0;
+            }
+        }
+        return pkt.pts + ":" + len + ":" + h;
+    }
+    var seen = Object.create(null);
+    var deduped = [];
+    for (var i = 0; i < sorted.length; i++) {
+        var key = fingerprint(sorted[i]);
+        if (!seen[key]) {
+            seen[key] = true;
             deduped.push(sorted[i]);
         }
     }
