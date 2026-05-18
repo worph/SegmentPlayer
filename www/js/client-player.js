@@ -29,6 +29,18 @@ function ClientPlayer(videoElement) {
     this._activeSubtitleAbsIdx = -1;  // absolute stream index of active subtitle
     this._subtitleUpdateCounter = 0;  // throttle progressive VTT rebuilds
     this._primerBatch = null;         // first post-seek packet batch (peeked to derive muxer base)
+    // Recovery watchdog state. The initial 20-s startup watchdog lives in
+    // player.js::playFileClient (it triggers a mode-fallback if first frames
+    // never arrive). Once playback starts, _installRecoveryWatchdog hooks
+    // ongoing health: spots pump death / SourceBuffer errors / video.error /
+    // stalled progress, and attempts soft or hard recovery.
+    this._loadedFilepath = null;      // saved so _fullReload can rebuild the pipeline
+    this._pumpAlive = false;          // true while _pumpLoop is iterating
+    this._watchdog = null;            // setInterval handle for the recovery watchdog
+    this._sbErrorListener = null;     // sourceBuffer 'error' event listener
+    this._videoErrorListener = null;  // video 'error' event listener
+    this._needsHardReload = false;    // set by event listeners; consumed by watchdog
+    this._onUnrecoverable = null;     // optional callback set by player.js for mode-fallback
 }
 
 // Combined video+audio MIME for the single muxed SourceBuffer. Audio half is
@@ -67,9 +79,11 @@ function sleep(ms) {
 
 ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx) {
     this.cleanup();
+    this._loadedFilepath = filepath;
     this.probeData = probeData;
     this.currentAudioTrack = audioTrackIdx || 0;
     this.stats = { bytesRead: 0, packetsRead: 0, startTime: Date.now(), framesDropped: 0 };
+    this._needsHardReload = false;
 
     var fileUrl = "/direct/" + encodeFilePath(filepath);
 
@@ -151,11 +165,21 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
     this.running = true;
     this._pumpPromise = this._pumpLoop();
 
+    // 9. Ongoing health monitoring. The 20-s startup watchdog in player.js
+    //    only catches "never started" failures; this one catches
+    //    mid-playback stalls, silent pump exits, SourceBuffer errors, and
+    //    `video.error` (which puts the native browser controls in an inert
+    //    state — play/pause/seek all become no-ops until the video element
+    //    gets a fresh `src`).
+    this._installRecoveryWatchdog();
+
     SP.log.debug("ClientPlayer", "Started unified video+audio pipeline");
 };
 
 ClientPlayer.prototype._pumpLoop = async function() {
+    this._pumpAlive = true;
     var firstData = true;
+    try {
     while (this.running) {
         try {
             var ahead = getBufferedAhead(this.video);
@@ -289,6 +313,15 @@ ClientPlayer.prototype._pumpLoop = async function() {
             await sleep(500);
         }
     }
+    } finally {
+        // Always reflect "pump exited" in both flags so the recovery
+        // watchdog can detect "running set but pump silently gone" and
+        // attempt restart. Without this, a soft pump death (3 errors then
+        // `break`) left `this.running === true`, so external checks
+        // couldn't tell the pipeline had stopped feeding the SourceBuffer.
+        this._pumpAlive = false;
+        this.running = false;
+    }
 };
 
 ClientPlayer.prototype._evictOldData = function() {
@@ -305,10 +338,213 @@ ClientPlayer.prototype._setupSeekHandler = function() {
     var self = this;
     this._seekGeneration = 0;
     this._seekHandler = function() {
+        // If the video element is in an error state, a soft pipeline restart
+        // can't recover — the browser will refuse to play any newly-appended
+        // data until `src` is reset. Hand off to the watchdog to do a hard
+        // reload (fresh MediaSource + SourceBuffer).
+        if (self.video.error) {
+            self._needsHardReload = true;
+            return;
+        }
         // Always accept seeks — generation counter handles rapid re-entry.
         self._restartPipeline(self.video.currentTime);
     };
     this.video.addEventListener("seeking", this._seekHandler);
+};
+
+// Ongoing playback health monitoring. Runs every 2 s after `load()`
+// completes; tears itself down via `cleanup()`. Spots four failure modes:
+//   1. `video.error` set — browser refuses further playback; needs
+//      a fresh MediaSource (hard reload).
+//   2. SourceBuffer fired an `error` event — MSE pipeline is corrupt;
+//      hard reload.
+//   3. Pump silently exited (`_pumpAlive === false` while we believed
+//      we were running) — soft restart of the pipeline.
+//   4. Playback stalled — `currentTime` not advancing for >8 s while
+//      paused === false and buffered-ahead is empty. Soft restart;
+//      hard reload if a soft restart didn't unstick it.
+// On repeated failure (≥3 hard recoveries or ≥5 soft, within one
+// session), give up and call `_onUnrecoverable` so the caller can
+// fall back to a different playback mode.
+ClientPlayer.prototype._installRecoveryWatchdog = function() {
+    var self = this;
+    if (this._watchdog) {
+        clearInterval(this._watchdog);
+        this._watchdog = null;
+    }
+
+    // Listen for SourceBuffer-level decode failures. The 'error' event
+    // can fire after a bad MP4 fragment makes it through `appendBuffer`
+    // and trips the segment parser. After this, MSE is unrecoverable
+    // without a fresh MediaSource.
+    if (this.sourceBuffer && !this._sbErrorListener) {
+        this._sbErrorListener = function() {
+            SP.log.warn("ClientPlayer", "SourceBuffer error — scheduling hard reload");
+            self._needsHardReload = true;
+        };
+        try {
+            this.sourceBuffer.addEventListener("error", this._sbErrorListener);
+        } catch (e) { /* SB may be in a weird state already */ }
+    }
+
+    // Listen for video-element fatal errors (MEDIA_ERR_DECODE etc.).
+    // Once `video.error` is set the native controls go inert — play /
+    // pause / seek all become no-ops, matching the exact production
+    // symptom we're fixing.
+    if (!this._videoErrorListener) {
+        this._videoErrorListener = function() {
+            var err = self.video.error;
+            SP.log.warn("ClientPlayer", "video.error event",
+                err && { code: err.code, message: err.message });
+            self._needsHardReload = true;
+        };
+        this.video.addEventListener("error", this._videoErrorListener);
+    }
+
+    var lastCt = this.video.currentTime;
+    var lastProgressAt = performance.now();
+    var softRecoveries = 0;
+    var hardRecoveries = 0;
+    var recoveryInFlight = false;
+
+    this._watchdog = setInterval(function() {
+        // Pipeline already torn down — stop polling.
+        if (!self.video || !self.mediaSource || !self._watchdog) {
+            return;
+        }
+        if (recoveryInFlight) return;
+
+        var now = performance.now();
+        var ct = self.video.currentTime;
+
+        // Tick progress tracker. A 50 ms threshold filters out the natural
+        // jitter in currentTime updates without flagging a real stall.
+        if (Math.abs(ct - lastCt) > 0.05) {
+            lastCt = ct;
+            lastProgressAt = now;
+        }
+
+        var sawHardError = self._needsHardReload || !!self.video.error;
+        var pumpDiedSilently = self.running === false && self._pumpAlive === false
+            && (self.mediaSource.readyState === "open");
+        // `running===false` is also the natural EOF state; distinguish
+        // EOF (mediaSource ended) from "pump unexpectedly stopped while
+        // still open and we're not at the end".
+        if (pumpDiedSilently) {
+            // If we're effectively at the end of the file, leave the pipeline
+            // alone — that's not a stall, the user just reached the end.
+            var dur = self.mediaSource.duration;
+            if (isFinite(dur) && dur > 0 && ct >= dur - 0.5) {
+                pumpDiedSilently = false;
+            }
+        }
+        var stalledMs = now - lastProgressAt;
+        var bufAhead = getBufferedAhead(self.video);
+        var stuckPlaying = !self.video.paused && stalledMs > 8000 && bufAhead < 0.5;
+
+        if (sawHardError) {
+            hardRecoveries++;
+            recoveryInFlight = true;
+            self._needsHardReload = false;
+            if (hardRecoveries > 3) {
+                SP.log.error("ClientPlayer", "Hard recovery exhausted; bailing");
+                self._teardownRecoveryWatchdog();
+                if (typeof self._onUnrecoverable === "function") {
+                    self._onUnrecoverable("video.error after " + hardRecoveries + " hard recoveries");
+                }
+                return;
+            }
+            SP.log.warn("ClientPlayer", "Hard recovery #" + hardRecoveries + " (fresh MediaSource)");
+            setStatus("Recovering…", "#ffd43b", true);
+            self._fullReload(ct).then(function() {
+                lastProgressAt = performance.now();
+                lastCt = self.video.currentTime;
+                recoveryInFlight = false;
+            }).catch(function(e) {
+                SP.log.error("ClientPlayer", "Hard recovery threw:", e);
+                recoveryInFlight = false;
+            });
+            return;
+        }
+
+        if (pumpDiedSilently || stuckPlaying) {
+            softRecoveries++;
+            recoveryInFlight = true;
+            if (softRecoveries > 5) {
+                SP.log.error("ClientPlayer", "Soft recovery exhausted; escalating to hard reload");
+                self._needsHardReload = true;
+                recoveryInFlight = false;
+                return;
+            }
+            SP.log.warn("ClientPlayer", "Soft recovery #" + softRecoveries
+                + " (" + (pumpDiedSilently ? "pump-dead" : "stalled") + ")");
+            setStatus("Recovering…", "#ffd43b", true);
+            // _restartPipeline is async but we don't await — kick it off and
+            // let the next watchdog tick observe whether it unstuck things.
+            Promise.resolve(self._restartPipeline(ct)).then(function() {
+                lastProgressAt = performance.now();
+                lastCt = self.video.currentTime;
+                recoveryInFlight = false;
+            }).catch(function() {
+                recoveryInFlight = false;
+            });
+        }
+    }, 2000);
+};
+
+ClientPlayer.prototype._teardownRecoveryWatchdog = function() {
+    if (this._watchdog) {
+        clearInterval(this._watchdog);
+        this._watchdog = null;
+    }
+    if (this._sbErrorListener && this.sourceBuffer) {
+        try { this.sourceBuffer.removeEventListener("error", this._sbErrorListener); }
+        catch (e) { /* SB may be gone */ }
+        this._sbErrorListener = null;
+    }
+    if (this._videoErrorListener) {
+        this.video.removeEventListener("error", this._videoErrorListener);
+        this._videoErrorListener = null;
+    }
+};
+
+// Tear down the whole pipeline (cleanup) and reload from scratch at
+// `resumeTime`. Used when soft `_restartPipeline` can't recover — e.g.
+// after `video.error` makes the browser refuse further appends, or the
+// SourceBuffer hit an unrecoverable decode failure. Preserves
+// audio/subtitle track selection across the rebuild.
+ClientPlayer.prototype._fullReload = async function(resumeTime) {
+    var probeData = this.probeData;
+    var filepath = this._loadedFilepath;
+    var audioTrack = this.currentAudioTrack;
+    var subtitleTrack = this._activeSubtitleTrack;
+
+    if (!filepath || !probeData) {
+        throw new Error("ClientPlayer._fullReload: no filepath/probeData to reload from");
+    }
+
+    // cleanup() already nulls these out before they're used; capture
+    // them above first.
+    this.cleanup();
+    await this.load(filepath, probeData, audioTrack);
+
+    if (subtitleTrack >= 0) {
+        try { await this.loadSubtitleTrack(subtitleTrack); }
+        catch (e) { SP.log.warn("ClientPlayer", "Re-attach subtitle failed:", e); }
+    }
+
+    if (resumeTime > 0 && isFinite(resumeTime)) {
+        // Setting currentTime fires 'seeking' which triggers
+        // _restartPipeline — fine because _restartPipeline is cheap when
+        // the pipeline just started and the demuxer has minimal in-flight
+        // state.
+        try { this.video.currentTime = resumeTime; }
+        catch (e) { /* may throw if readyState < HAVE_METADATA */ }
+    }
+    // Best-effort resume — the user may have paused during the recovery
+    // gap; play() failure here just leaves the video in paused state
+    // which is the expected outcome of a user-paused video.
+    this.video.play().catch(function() {});
 };
 
 // Teardown + rebuild the decode/mux pipeline at the given resume time. Shared
@@ -596,6 +832,10 @@ ClientPlayer.prototype._buildStreamInfos = async function() {
 
 ClientPlayer.prototype.cleanup = function() {
     this.running = false;
+    this._pumpAlive = false;
+    this._needsHardReload = false;
+
+    this._teardownRecoveryWatchdog();
 
     if (this._seekHandler) {
         this.video.removeEventListener("seeking", this._seekHandler);
