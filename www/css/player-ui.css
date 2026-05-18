@@ -1,0 +1,523 @@
+/* Custom player UI — control bar, settings menu, overlays, fullscreen.
+ * The native <video controls> is removed; everything visual lives inside
+ * .video-container so it survives fullscreen.
+ */
+
+/* Container needs positioning context for absolute overlays + bar. */
+.video-container {
+    position: relative;
+}
+
+/* Legacy hidden control block — overrides .controls's display:flex during
+ * the phased refactor so the old <select>s stay invisible while we build
+ * the new UI. Removed in phase 6.
+ */
+.legacy-controls[hidden] {
+    display: none !important;
+}
+
+.video-container:focus {
+    outline: none;
+}
+
+/* Click-to-play target sits between the video and the controls. */
+.player-click-shield {
+    position: absolute;
+    inset: 0;
+    cursor: pointer;
+    background: transparent;
+}
+
+/* ─── Top-left now-playing overlay ─── */
+.now-playing-overlay {
+    position: absolute;
+    top: 1rem;
+    left: 1rem;
+    right: 1rem;
+    max-width: 60%;
+    padding: 0.5rem 0.9rem;
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0.3));
+    border-radius: var(--radius-md);
+    color: var(--color-text);
+    font-size: 0.95rem;
+    font-weight: 500;
+    pointer-events: none;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    opacity: 1;
+    transition: opacity 0.25s ease;
+    z-index: 5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+    .now-playing-overlay {
+        font-size: 0.8rem;
+        padding: 0.4rem 0.6rem;
+    }
+}
+
+/* ─── Centered loading spinner ─── */
+/* Centered with margin offsets instead of transform so the rotate animation
+ * doesn't fight the translate(-50%, -50%). */
+.player-loading {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 56px;
+    height: 56px;
+    margin: -28px 0 0 -28px;
+    border: 4px solid rgba(255, 255, 255, 0.15);
+    border-top-color: var(--color-primary);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 6;
+}
+
+.player-loading.is-visible {
+    opacity: 1;
+}
+
+/* ─── Control bar (bottom) ─── */
+.player-controls {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 0.5rem 1rem 0.75rem;
+    background: linear-gradient(0deg, rgba(0, 0, 0, 0.85) 0%, rgba(0, 0, 0, 0.55) 60%, rgba(0, 0, 0, 0) 100%);
+    color: var(--color-text);
+    font-size: 0.85rem;
+    user-select: none;
+    opacity: 1;
+    transition: opacity 0.25s ease;
+    z-index: 10;
+}
+
+/* Auto-hide while playing — controls fade out, overlay fades with them. */
+.video-container.is-idle .player-controls,
+.video-container.is-idle .now-playing-overlay {
+    opacity: 0;
+    pointer-events: none;
+}
+.video-container.is-idle {
+    cursor: none;
+}
+
+/* ─── Seek bar ─── */
+.player-controls__seek {
+    position: relative;
+    height: 18px;
+    margin: 0 0 0.25rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+}
+
+.player-controls__seek-track {
+    position: relative;
+    width: 100%;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 2px;
+    overflow: hidden;
+    transition: height 0.12s ease;
+}
+
+.player-controls__seek:hover .player-controls__seek-track,
+.player-controls__seek.is-dragging .player-controls__seek-track {
+    height: 6px;
+}
+
+.player-controls__seek-buffered,
+.player-controls__seek-played {
+    position: absolute;
+    left: 0;
+    top: 0;
+    height: 100%;
+    pointer-events: none;
+}
+
+.player-controls__seek-buffered {
+    background: rgba(255, 255, 255, 0.35);
+    width: 0%;
+}
+
+.player-controls__seek-played {
+    background: var(--color-primary);
+    width: 0%;
+}
+
+.player-controls__seek-thumb {
+    position: absolute;
+    top: 50%;
+    width: 12px;
+    height: 12px;
+    margin-left: -6px;
+    background: var(--color-primary);
+    border-radius: 50%;
+    transform: translateY(-50%) scale(0);
+    transition: transform 0.12s ease;
+    pointer-events: none;
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+}
+
+.player-controls__seek:hover .player-controls__seek-thumb,
+.player-controls__seek.is-dragging .player-controls__seek-thumb {
+    transform: translateY(-50%) scale(1);
+}
+
+/* ─── Bar row (buttons, time, volume, settings) ─── */
+.player-controls__bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.player-controls__left {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex: 1;
+    min-width: 0;
+}
+
+.player-controls__right {
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
+}
+
+/* Generic icon button */
+.player-btn {
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--color-text);
+    cursor: pointer;
+    font-size: 1.1rem;
+    line-height: 1;
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+
+.player-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.player-btn:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: -2px;
+}
+
+.player-btn.is-active {
+    color: var(--color-primary);
+}
+
+.player-btn[hidden] {
+    display: none !important;
+}
+
+/* Time readout */
+.player-controls__time {
+    font-variant-numeric: tabular-nums;
+    font-size: 0.85rem;
+    color: var(--color-text);
+    white-space: nowrap;
+    margin-left: 0.25rem;
+}
+
+.player-controls__time-sep {
+    color: var(--color-text-muted);
+    margin: 0 0.25rem;
+}
+
+/* Mode badge (relocated from metrics panel) */
+.player-controls__mode-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.55rem;
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--color-primary);
+    white-space: nowrap;
+}
+
+.player-controls__mode-badge[data-mode="client"] { color: var(--color-success); }
+.player-controls__mode-badge[data-mode="transcode"] { color: var(--color-warning); }
+.player-controls__mode-badge[data-mode="remux"] { color: var(--color-cyan); }
+.player-controls__mode-badge[data-mode="direct"] { color: var(--color-primary); }
+.player-controls__mode-badge[data-mode=""] { display: none; }
+
+/* Subtitle loading indicator (inline in bar) */
+.player-controls__subtitle-loading {
+    display: none;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.7rem;
+    color: var(--color-warning);
+    margin-right: 0.25rem;
+}
+
+.player-controls__subtitle-loading.is-active {
+    display: inline-flex;
+}
+
+.player-controls__subtitle-loading .mini-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--color-border);
+    border-top-color: var(--color-warning);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+/* Volume control */
+.player-controls__volume {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* Wrap needs extra width beyond the slider so the thumb (which extends
+ * beyond the track) doesn't get clipped at either end of the range. */
+.player-controls__volume-slider-wrap {
+    width: 0;
+    overflow: hidden;
+    transition: width 0.18s ease;
+    display: flex;
+    align-items: center;
+}
+
+.player-controls__volume:hover .player-controls__volume-slider-wrap,
+.player-controls__volume.is-open .player-controls__volume-slider-wrap {
+    width: 96px;
+}
+
+.player-controls__volume-slider {
+    width: 80px;
+    height: 4px;
+    margin: 0 0.5rem;
+    flex-shrink: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.player-controls__volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    background: var(--color-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+}
+
+.player-controls__volume-slider::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    background: var(--color-primary);
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+}
+
+/* ─── Settings menu ─── */
+/* Anchored above the control bar (which is ~64px tall). Sibling of
+ * .player-controls inside .video-container, so 'bottom' is measured from
+ * the container's bottom edge. */
+.player-settings-menu {
+    position: absolute;
+    right: 0.75rem;
+    bottom: 4.5rem;
+    min-width: 220px;
+    max-width: 320px;
+    max-height: 60vh;
+    overflow: hidden;
+    background: rgba(20, 20, 28, 0.97);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+    color: var(--color-text);
+    font-size: 0.85rem;
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+    transform-origin: bottom right;
+    pointer-events: none;
+    transition: opacity 0.14s ease, transform 0.14s ease;
+    z-index: 15;
+}
+
+.player-settings-menu.is-open {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+}
+
+.player-settings-menu__page {
+    padding: 0.4rem 0;
+}
+
+.player-settings-menu__page[hidden] {
+    display: none;
+}
+
+.player-settings-menu__page-header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.75rem 0.6rem;
+    border-bottom: 1px solid var(--color-border);
+    margin-bottom: 0.25rem;
+    color: var(--color-text-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+}
+
+.player-settings-menu__page-header:hover {
+    color: var(--color-text);
+}
+
+.player-settings-menu__page-header .player-settings-menu__back {
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
+.player-settings-menu__items {
+    max-height: calc(60vh - 3rem);
+    overflow-y: auto;
+}
+
+.player-settings-menu__item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.75rem;
+    cursor: pointer;
+    color: var(--color-text);
+    transition: background 0.12s ease;
+}
+
+.player-settings-menu__item:hover,
+.player-settings-menu__item:focus-visible {
+    background: rgba(255, 255, 255, 0.08);
+    outline: none;
+}
+
+.player-settings-menu__item-label {
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.player-settings-menu__item-value {
+    color: var(--color-text-muted);
+    font-size: 0.78rem;
+    max-width: 50%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.player-settings-menu__item-chevron {
+    color: var(--color-text-dim);
+    font-size: 0.9rem;
+}
+
+.player-settings-menu__item.is-active .player-settings-menu__item-check {
+    color: var(--color-primary);
+}
+
+.player-settings-menu__item-check {
+    width: 1rem;
+    color: transparent;
+    flex-shrink: 0;
+}
+
+.player-settings-menu__divider {
+    height: 1px;
+    background: var(--color-border);
+    margin: 0.3rem 0;
+}
+
+/* ─── Fullscreen overrides ─── */
+.video-container:fullscreen,
+.video-container:-webkit-full-screen {
+    border-radius: 0;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+}
+
+.video-container:fullscreen video,
+.video-container:-webkit-full-screen video {
+    max-height: 100vh;
+    width: 100vw;
+    height: 100vh;
+    object-fit: contain;
+}
+
+.video-container:fullscreen .player-controls,
+.video-container:-webkit-full-screen .player-controls {
+    padding: 0.75rem 1.5rem 1rem;
+    font-size: 0.95rem;
+}
+
+.video-container:fullscreen .player-btn,
+.video-container:-webkit-full-screen .player-btn {
+    width: 42px;
+    height: 42px;
+    font-size: 1.25rem;
+}
+
+.video-container:fullscreen .now-playing-overlay,
+.video-container:-webkit-full-screen .now-playing-overlay {
+    top: 1.5rem;
+    left: 1.5rem;
+    font-size: 1.05rem;
+    padding: 0.6rem 1rem;
+}
+
+/* Tighter on mobile */
+@media (max-width: 900px) {
+    .player-controls {
+        padding: 0.4rem 0.6rem 0.6rem;
+        font-size: 0.75rem;
+    }
+    .player-btn {
+        width: 32px;
+        height: 32px;
+        font-size: 1rem;
+    }
+    .player-settings-menu {
+        right: 0.4rem;
+        min-width: 200px;
+        max-width: 85vw;
+    }
+}

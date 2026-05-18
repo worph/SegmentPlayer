@@ -99,6 +99,11 @@ function resetPlaybackUIState() {
         SP.elements.subtitleLoading.classList.remove("active");
     }
 
+    // Close any open settings menu and clear remembered captions selection.
+    if (typeof resetSettingsMenuState === "function") {
+        resetSettingsMenuState();
+    }
+
     // Bump generation token so stale async work bails out
     SP.state.loadToken = (SP.state.loadToken || 0) + 1;
     return SP.state.loadToken;
@@ -175,6 +180,7 @@ function fallbackToTier(tier, filePath, fileName, token, reason) {
     SP.log.warn("Fallback", "-> " + tier + ": " + reason);
     SP.state.activePlaybackMode = tier;
     updateAutoModeLabel();
+    setPlayerModeBadge(tier);
     updateQualityDisplay();
     if (tier === "transcode") setStatus("Transcoding...", "#ffd43b", true);
     var fn = TIER_DISPATCH[tier];
@@ -194,8 +200,11 @@ function playFileSetup(filePath, fileName) {
         item.classList.toggle("active", item.dataset.path === filePath);
     });
 
-    SP.elements.nowPlaying.style.display = "block";
+    // Legacy nowPlaying panel is hidden via the [hidden] attribute now —
+    // the in-player overlay (setNowPlayingTitle) shows the same info.
+    // Keep the textContent assignment so anything reading from it stays valid.
     SP.elements.nowPlayingName.textContent = fileName;
+    setNowPlayingTitle(fileName);
     setStatus("Loading...", "#4dabf7", true);
 
     SP.elements.downloadBtn.disabled = false;
@@ -223,6 +232,7 @@ async function playFile(filePath, fileName) {
 
     SP.state.activePlaybackMode = mode;
     updateAutoModeLabel();
+    setPlayerModeBadge(mode);
     if (mode === "transcode") updateQualityDisplay();
 
     var dispatch = TIER_DISPATCH[mode];
@@ -302,6 +312,7 @@ function playDirect(filePath, fileName, token) {
 async function playFileClient(filePath, fileName, probeData, token) {
     setStatus("Analyzing...", "#4dabf7", true);
     SP.state.activePlaybackMode = "client";
+    setPlayerModeBadge("client");
     updateQualityDisplay();
 
     function fallback(reason) {
@@ -477,6 +488,7 @@ function playRemux(filePath, fileName, token) {
             });
             setSubtitleTracks(subOptions);
 
+            refreshSettingsMenu();
             playWhenReady(token);
         });
 
@@ -661,6 +673,7 @@ async function playTranscoded(url, fileName, token) {
             }
         }
 
+        refreshSettingsMenu();
         playWhenReady(token);
     });
 

@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="css/layout.css">
     <link rel="stylesheet" href="css/browse.css">
     <link rel="stylesheet" href="css/player.css">
+    <link rel="stylesheet" href="css/player-ui.css">
     <link rel="stylesheet" href="css/metrics.css">
     <link rel="stylesheet" href="css/animations.css">
 </head>
@@ -49,50 +50,63 @@
 
                 <!-- Player Section -->
                 <div class="player-section">
-                    <div class="video-container">
-                        <video id="video" controls crossorigin="anonymous" autoplay></video>
-                        <div class="controls">
-                            <div class="control-group">
-                                <label>Quality:</label>
-                                <select id="resolutionSelect" disabled>
-                                    <option value="auto">Auto</option>
-                                    <option value="original">Original</option>
-                                    <option value="1080p">1080p</option>
-                                    <option value="720p">720p</option>
-                                    <option value="480p">480p</option>
-                                    <option value="360p">360p</option>
-                                </select>
-                            </div>
-                            <div class="control-group">
-                                <label>Audio:</label>
-                                <select id="audioSelect" disabled>
-                                    <option value="">Default</option>
-                                </select>
-                            </div>
-                            <div class="control-group">
-                                <label>Subtitles:</label>
-                                <select id="subtitleSelect" disabled>
-                                    <option value="">Off</option>
-                                </select>
-                                <span class="subtitle-loading" id="subtitleLoading">
-                                    <span class="mini-spinner"></span>
-                                    <span>Generating...</span>
-                                </span>
-                            </div>
-                            <div class="control-group">
-                                <label>Mode:</label>
-                                <select id="modeSelect">
-                                    <option value="auto">Auto</option>
-                                    <option value="direct">Direct</option>
-                                    <option value="client">Client</option>
-                                    <option value="transcode">Transcode</option>
-                                </select>
-                            </div>
-                            <button id="downloadBtn" disabled title="Download original file">
-                                <span>Download</span>
-                            </button>
-                            <span class="status" id="status"><span class="status-dot" id="statusDot"></span><span id="statusText">Select a file</span></span>
+                    <div class="video-container" id="videoContainer" tabindex="0">
+                        <video id="video" crossorigin="anonymous" autoplay></video>
+                        <div class="now-playing-overlay" id="nowPlayingOverlay" hidden></div>
+                        <div class="player-loading" id="playerLoading" aria-hidden="true"></div>
+                        <div class="player-click-shield" id="playerClickShield"></div>
+                        <div class="player-controls" id="playerControls" aria-label="Video controls">
+                            <!-- player-ui.js builds the bar contents here -->
                         </div>
+                        <div class="player-settings-menu" id="playerSettingsMenu" role="menu" hidden></div>
+                    </div>
+
+                    <!--
+                      Legacy hidden controls — kept during phased refactor as
+                      the canonical source of truth for Quality/Audio/Subtitle/Mode
+                      selection. The new settings menu (phase 6) reads/writes
+                      these <select> elements via existing controls.js handlers,
+                      so nothing in player.js / controls.js / ui.js needs to
+                      change defensively during phases 2–5. Removed in phase 6
+                      after the menu fully replaces them.
+                    -->
+                    <div class="controls legacy-controls" hidden aria-hidden="true">
+                        <select id="resolutionSelect" disabled>
+                            <option value="auto">Auto</option>
+                            <option value="original">Original</option>
+                            <option value="1080p">1080p</option>
+                            <option value="720p">720p</option>
+                            <option value="480p">480p</option>
+                            <option value="360p">360p</option>
+                        </select>
+                        <select id="audioSelect" disabled>
+                            <option value="">Default</option>
+                        </select>
+                        <select id="subtitleSelect" disabled>
+                            <option value="">Off</option>
+                        </select>
+                        <span class="subtitle-loading" id="subtitleLoading">
+                            <span class="mini-spinner"></span>
+                            <span>Generating...</span>
+                        </span>
+                        <select id="modeSelect">
+                            <option value="auto">Auto</option>
+                            <option value="direct">Direct</option>
+                            <option value="client">Client</option>
+                            <option value="transcode">Transcode</option>
+                        </select>
+                        <button id="downloadBtn" disabled title="Download original file">
+                            <span>Download</span>
+                        </button>
+                        <span class="status" id="status"><span class="status-dot" id="statusDot"></span><span id="statusText">Select a file</span></span>
+                    </div>
+
+                    <!-- Legacy now-playing — kept hidden because the new
+                         in-player overlay shows the same info. player.js
+                         still updates the inner text for parity. -->
+                    <div class="now-playing" id="nowPlaying" hidden>
+                        <div class="now-playing-title">Now Playing</div>
+                        <div class="now-playing-name" id="nowPlayingName"></div>
                     </div>
 
                     <div class="subtitle-progress" id="subtitleProgress">
@@ -104,11 +118,6 @@
                             <div class="subtitle-progress-fill" id="subtitleProgressFill"></div>
                         </div>
                         <div class="subtitle-progress-text" id="subtitleProgressText">Extracting subtitle track from video...</div>
-                    </div>
-
-                    <div class="now-playing" id="nowPlaying" style="display: none;">
-                        <div class="now-playing-title">Now Playing</div>
-                        <div class="now-playing-name" id="nowPlayingName"></div>
                     </div>
 
                     <div class="metrics-panel" id="metricsPanel">
@@ -314,20 +323,22 @@
     </div>
 
     <!-- JavaScript modules (loaded in dependency order) -->
-    <script src="js/config.js?v=16"></script>
-    <script src="js/utils.js?v=16"></script>
-    <script src="js/ui.js?v=16"></script>
-    <script src="js/codec-detect.js?v=16"></script>
-    <script src="js/client-demuxer.js?v=16"></script>
-    <script src="js/client-muxer.js?v=16"></script>
-    <script src="js/audio-reencode.js?v=16"></script>
-    <script src="js/client-subtitles.js?v=16"></script>
-    <script src="js/client-player.js?v=16"></script>
-    <script src="js/router.js?v=16"></script>
-    <script src="js/browser.js?v=16"></script>
-    <script src="js/player.js?v=16"></script>
-    <script src="js/controls.js?v=16"></script>
-    <script src="js/metrics.js?v=16"></script>
-    <script src="js/app.js?v=16"></script>
+    <script src="js/config.js?v=17"></script>
+    <script src="js/utils.js?v=17"></script>
+    <script src="js/ui.js?v=17"></script>
+    <script src="js/codec-detect.js?v=17"></script>
+    <script src="js/client-demuxer.js?v=17"></script>
+    <script src="js/client-muxer.js?v=17"></script>
+    <script src="js/audio-reencode.js?v=17"></script>
+    <script src="js/client-subtitles.js?v=17"></script>
+    <script src="js/client-player.js?v=17"></script>
+    <script src="js/router.js?v=17"></script>
+    <script src="js/browser.js?v=17"></script>
+    <script src="js/player.js?v=17"></script>
+    <script src="js/controls.js?v=17"></script>
+    <script src="js/player-ui.js?v=17"></script>
+    <script src="js/settings-menu.js?v=17"></script>
+    <script src="js/metrics.js?v=17"></script>
+    <script src="js/app.js?v=17"></script>
 </body>
 </html>

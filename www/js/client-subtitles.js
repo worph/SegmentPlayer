@@ -225,10 +225,20 @@ function pad3(n) {
     return "" + n;
 }
 
-// Create a Blob URL for a VTT string and attach it to the video element
+// Create a Blob URL for a VTT string and attach it to the video element.
+//
+// Removing a <track> element does NOT remove its TextTrack from
+// videoElement.textTracks in Chromium — entries accumulate for the video's
+// lifetime. The client-mode subtitle collector calls this every 5 packet
+// batches, so we must (a) disable every existing TextTrack before adding the
+// new one, and (b) enable the *new* track by reference rather than assuming
+// it lands at textTracks[0]. Otherwise stale tracks stay in "showing" mode
+// and the user sees overlapping/duplicated cues.
 function attachVTTToVideo(videoElement, vttString, label) {
-    // Remove existing tracks
     videoElement.querySelectorAll("track").forEach(function(t) { t.remove(); });
+    for (var i = 0; i < videoElement.textTracks.length; i++) {
+        videoElement.textTracks[i].mode = "disabled";
+    }
 
     var blob = new Blob([vttString], { type: "text/vtt" });
     var url = URL.createObjectURL(blob);
@@ -240,11 +250,8 @@ function attachVTTToVideo(videoElement, vttString, label) {
     track.default = true;
     videoElement.appendChild(track);
 
-    // Show the track
     track.addEventListener("load", function() {
-        if (videoElement.textTracks.length > 0) {
-            videoElement.textTracks[0].mode = "showing";
-        }
+        if (track.track) track.track.mode = "showing";
     });
 
     return track;

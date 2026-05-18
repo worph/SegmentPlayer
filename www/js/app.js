@@ -35,7 +35,15 @@
 
             // Controls
             downloadBtn: document.getElementById("downloadBtn"),
-            modeSelect: document.getElementById("modeSelect")
+            modeSelect: document.getElementById("modeSelect"),
+
+            // Custom player UI (built by player-ui.js / settings-menu.js)
+            videoContainer: document.getElementById("videoContainer"),
+            playerControls: document.getElementById("playerControls"),
+            playerLoading: document.getElementById("playerLoading"),
+            playerClickShield: document.getElementById("playerClickShield"),
+            playerSettingsMenu: document.getElementById("playerSettingsMenu"),
+            nowPlayingOverlay: document.getElementById("nowPlayingOverlay")
         };
     }
 
@@ -54,6 +62,8 @@
     // Main initialization
     function init() {
         initElements();
+        initPlayerUI();
+        initSettingsMenu();
         initHomeButton();
         initControls();
         initMetricsToggle();
