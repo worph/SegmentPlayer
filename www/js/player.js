@@ -60,10 +60,6 @@ function resetPlaybackUIState() {
     SP.elements.video.load();
     removeAllTracks(SP.elements.video);
 
-    // Reset playback flags
-    SP.state.isClientSide = false;
-    SP.state.isTranscoding = false;
-
     // Reset audio dropdown to a neutral "Loading..." state. .value is reset
     // explicitly because replacing innerHTML alone leaves the property in
     // an awkward state where the dropdown can still report a stale numeric
@@ -93,7 +89,6 @@ function resetPlaybackUIState() {
     SP.state.currentTranscodeBase = "";
 
     // Reset probe caches for the in-flight file
-    SP.state.currentProbe = null;
     SP.state.probeData = null;
 
     // Cancel any in-flight subtitle progress polling
@@ -143,6 +138,49 @@ function setSubtitleTracks(options) {
     SP.elements.subtitleSelect.disabled = !(options && options.length > 0);
 }
 
+// Token-checked play(): every tier eventually calls this after the source
+// is wired up. Bails out if the user has navigated to another file in the
+// meantime, and swallows the autoplay-policy rejection that browsers raise
+// when there's no prior user gesture (we don't care — it just means the
+// poster stays visible until the user clicks play).
+function playWhenReady(token) {
+    if (token !== SP.state.loadToken) return;
+    SP.elements.video.play().catch(function() {});
+}
+
+// Tier dispatch table. Used by playFile() for the initial selection and by
+// fallbackToTier() when one tier fails and we need to retry on another.
+// Each entry takes (filePath, fileName, token).
+var TIER_DISPATCH = {
+    direct: function(fp, fn, tok) { playDirect(fp, fn, tok); },
+    remux: function(fp, fn, tok) { playRemux(fp, fn, tok); },
+    client: function(fp, fn, tok) { playFileClient(fp, fn, SP.state.probeData, tok); },
+    transcode: function(fp, fn, tok) {
+        var src = "/transcode/" + encodeFilePath(fp) + "/master.m3u8";
+        playTranscoded(src, fn, tok);
+    }
+};
+
+// chooseTier() returns "direct"/"client"/"hls"/"transcode"; we use "remux"
+// internally for the second one. This bridge keeps chooseTier() agnostic of
+// our naming.
+var TIER_FROM_CHOOSER = { direct: "direct", client: "client", hls: "remux", transcode: "transcode" };
+
+// Switch to a different playback tier after a failure in the current one.
+// Caller MUST have already torn down its own pipeline (HLS instance,
+// ClientPlayer, video.src). This helper only owns the mode-transition state
+// and the dispatch.
+function fallbackToTier(tier, filePath, fileName, token, reason) {
+    if (token !== SP.state.loadToken) return;
+    SP.log.warn("Fallback", "-> " + tier + ": " + reason);
+    SP.state.activePlaybackMode = tier;
+    updateAutoModeLabel();
+    updateQualityDisplay();
+    if (tier === "transcode") setStatus("Transcoding...", "#ffd43b", true);
+    var fn = TIER_DISPATCH[tier];
+    if (fn) fn(filePath, fileName, token);
+}
+
 // Common setup shared by all playback tiers. Returns the loadToken for this
 // load; tier handlers should capture it and check it across await points.
 function playFileSetup(filePath, fileName) {
@@ -177,53 +215,22 @@ async function playFile(filePath, fileName) {
     if (token !== SP.state.loadToken) return;
 
     SP.state.probeData = probe;
-    SP.state.currentProbe = probe;
 
-    // Determine playback mode
-    var mode;
-    if (SP.state.playbackMode === "auto") {
-        if (SP.state.probeData) {
-            var tier = chooseTier(SP.state.probeData);
-            mode = tier === "direct" ? "direct" : tier === "client" ? "client" : tier === "hls" ? "remux" : "transcode";
-        } else {
-            mode = "remux";
-        }
-    } else if (SP.state.playbackMode === "direct") {
-        mode = "direct";
-    } else if (SP.state.playbackMode === "client") {
-        mode = "client";
-    } else if (SP.state.playbackMode === "transcode") {
-        mode = "transcode";
-    } else {
-        mode = "remux";
-    }
+    // Auto picks a tier from the probe; otherwise the user's selection wins.
+    var mode = SP.state.playbackMode === "auto"
+        ? (probe ? (TIER_FROM_CHOOSER[chooseTier(probe)] || "transcode") : "remux")
+        : SP.state.playbackMode;
 
     SP.state.activePlaybackMode = mode;
     updateAutoModeLabel();
+    if (mode === "transcode") updateQualityDisplay();
 
-    // Route to appropriate handler
-    switch (mode) {
-        case "direct":
-            playDirect(filePath, fileName, token);
-            break;
-        case "client":
-            playFileClient(filePath, fileName, SP.state.probeData, token);
-            break;
-        case "remux":
-            playRemux(filePath, fileName, token);
-            break;
-        case "transcode":
-            var transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
-            SP.state.isTranscoding = true;
-            updateQualityDisplay();
-            playTranscoded(transcodedSrc, fileName, true, token);
-            break;
-    }
+    var dispatch = TIER_DISPATCH[mode];
+    if (dispatch) dispatch(filePath, fileName, token);
 }
 
 // Direct mode: native <video> element plays the raw file
 function playDirect(filePath, fileName, token) {
-    if (token === undefined) token = SP.state.loadToken;
     var videoSrc = "/direct/" + encodeFilePath(filePath);
 
     setStatus("Direct", "#51cf66");
@@ -258,28 +265,18 @@ function playDirect(filePath, fileName, token) {
             }
         }
 
-        SP.elements.video.play().catch(function() {});
+        playWhenReady(token);
     };
 
     SP.elements.video.onerror = function() {
         if (token !== SP.state.loadToken) return;
-        // Auto-fallback: try remux, then transcode
-        SP.log.warn("Client", "Direct playback failed, falling back...");
-        if (SP.state.probeData) {
-            var vcodec = SP.state.probeData.video && SP.state.probeData.video.codec;
-            var acodec = SP.state.probeData.audio && SP.state.probeData.audio[0] && SP.state.probeData.audio[0].codec;
-            if ((vcodec === 'h264' || vcodec === 'avc1') && (acodec === 'aac' || acodec === 'mp3')) {
-                SP.state.activePlaybackMode = "remux";
-                updateAutoModeLabel();
-                playRemux(filePath, fileName, token);
-                return;
-            }
-        }
-        SP.state.activePlaybackMode = "transcode";
-        updateAutoModeLabel();
-        SP.state.isTranscoding = true;
-        updateQualityDisplay();
-        tryTranscodedFallback(filePath, fileName, token);
+        // Auto-fallback: prefer remux for H.264+AAC/MP3, else server transcode.
+        var probe = SP.state.probeData;
+        var vcodec = probe && probe.video && probe.video.codec;
+        var acodec = probe && probe.audio && probe.audio[0] && probe.audio[0].codec;
+        var remuxable = (vcodec === 'h264' || vcodec === 'avc1') && (acodec === 'aac' || acodec === 'mp3');
+        fallbackToTier(remuxable ? "remux" : "transcode", filePath, fileName, token,
+            "Direct playback failed");
     };
 
     // Load external subtitles, then merge with embedded subtitles from probe.
@@ -303,49 +300,40 @@ function playDirect(filePath, fileName, token) {
 
 // Client-side demux + transmux via libav.js + MediaSource
 async function playFileClient(filePath, fileName, probeData, token) {
-    if (token === undefined) token = SP.state.loadToken;
     setStatus("Analyzing...", "#4dabf7", true);
-    SP.state.isClientSide = true;
     SP.state.activePlaybackMode = "client";
     updateQualityDisplay();
 
     function fallback(reason) {
         if (token !== SP.state.loadToken) return;
-        SP.log.warn("Client", "Falling back:", reason);
-        SP.state.isClientSide = false;
         if (SP.state.clientPlayer) {
             SP.state.clientPlayer.cleanup();
             SP.state.clientPlayer = null;
         }
         setStatus("Falling back...", "#ffd43b", true);
-        // Try Direct mode first (browser may play the file natively even if MSE can't)
-        // then fall back to server transcode as last resort
+
+        // Prefer Direct if the browser can natively open this container —
+        // skips the round-trip through the server transcoder. The native
+        // <video> needs the failed MediaSource fully torn down before we
+        // hand it a new src, hence the explicit reset + small timeout.
         var vcodec = probeData && probeData.video && probeData.video.codec;
         if (vcodec) {
             var testVideo = document.createElement('video');
-            // Test common container MIME types the browser might handle natively
-            var mimeTests = ['video/x-matroska', 'video/webm', 'video/mp4'];
-            var canDirect = mimeTests.some(function(m) {
+            var canDirect = ['video/x-matroska', 'video/webm', 'video/mp4'].some(function(m) {
                 return testVideo.canPlayType(m) !== '';
             });
             if (canDirect) {
-                SP.log.warn("Client", "Falling back to Direct mode");
-                // Reset video element and wait a tick before Direct mode
                 SP.elements.video.removeAttribute('src');
                 SP.elements.video.onerror = null;
                 SP.elements.video.onloadedmetadata = null;
                 SP.elements.video.load();
-                SP.state.activePlaybackMode = "direct";
-                updateAutoModeLabel();
                 setTimeout(function() {
-                    if (token !== SP.state.loadToken) return;
-                    playDirect(filePath, fileName, token);
+                    fallbackToTier("direct", filePath, fileName, token, reason);
                 }, 100);
                 return;
             }
         }
-        SP.log.warn("Client", "Falling back to server transcode");
-        tryTranscodedFallback(filePath, fileName, token);
+        fallbackToTier("transcode", filePath, fileName, token, reason);
     }
 
     try {
@@ -396,7 +384,7 @@ async function playFileClient(filePath, fileName, probeData, token) {
         updateQualityDisplay();
 
         setStatus("Client-side", "#51cf66");
-        SP.elements.video.play().catch(function() {});
+        playWhenReady(token);
 
         // Watchdog: if no video frames appear within this window, fallback.
         // For HEVC open-GOP content, the muxer has to wait for the first IDR
@@ -454,7 +442,6 @@ async function populateSubtitlesFromProbe(probeData, filePath, token) {
 
 // HLS remux via nginx-vod-module (H.264+AAC in compatible containers)
 function playRemux(filePath, fileName, token) {
-    if (token === undefined) token = SP.state.loadToken;
     var videoSrc = "/hls/" + encodeURIComponent(filePath) + "/master.m3u8";
 
     if (Hls.isSupported()) {
@@ -490,7 +477,7 @@ function playRemux(filePath, fileName, token) {
             });
             setSubtitleTracks(subOptions);
 
-            SP.elements.video.play().catch(function() {});
+            playWhenReady(token);
         });
 
         var bufferErrorCount = 0;
@@ -507,7 +494,7 @@ function playRemux(filePath, fileName, token) {
                 switch (data.type) {
                     case Hls.ErrorTypes.NETWORK_ERROR:
                         remuxFallingBack = true;
-                        tryTranscodedFallback(filePath, fileName, token);
+                        fallbackToTier("transcode", filePath, fileName, token, "HLS network error");
                         break;
                     case Hls.ErrorTypes.MEDIA_ERROR:
                         SP.state.hls.recoverMediaError();
@@ -519,13 +506,12 @@ function playRemux(filePath, fileName, token) {
                 bufferErrorCount++;
                 if (bufferErrorCount >= 10 && !remuxFallingBack) {
                     remuxFallingBack = true;
-                    SP.log.warn("Remux", "Too many buffer errors (" + bufferErrorCount + "), falling back to transcode");
                     // Destroy synchronously to stop the error flood, then schedule fallback
                     if (SP.state.hls === remuxHls) SP.state.hls = null;
                     remuxHls.destroy();
                     setTimeout(function() {
-                        if (token !== SP.state.loadToken) return;
-                        tryTranscodedFallback(filePath, fileName, token);
+                        fallbackToTier("transcode", filePath, fileName, token,
+                            "HLS buffer errors x" + bufferErrorCount);
                     }, 0);
                 }
             }
@@ -551,35 +537,10 @@ function playRemux(filePath, fileName, token) {
         SP.elements.video.src = videoSrc;
         SP.elements.video.addEventListener("loadedmetadata", function() {
             setStatus("Ready", "#51cf66");
-            SP.elements.video.play().catch(function() {});
+            playWhenReady(token);
         });
     } else {
         setStatus("HLS not supported", "#ff6b6b");
-    }
-}
-
-async function tryTranscodedFallback(filePath, fileName, token) {
-    if (token === undefined) token = SP.state.loadToken;
-    setStatus("Transcoding...", "#ffd43b", true);
-
-    SP.state.isTranscoding = true;
-    SP.state.activePlaybackMode = "transcode";
-    updateAutoModeLabel();
-    updateQualityDisplay();
-
-    var transcodedSrc = "/transcode/" + encodeFilePath(filePath) + "/master.m3u8";
-
-    try {
-        var response = await fetch(transcodedSrc);
-        if (token !== SP.state.loadToken) return;
-        if (response.ok) {
-            playTranscoded(transcodedSrc, fileName, true, token);
-        } else {
-            setStatus("Error", "#ff6b6b");
-        }
-    } catch (err) {
-        if (token !== SP.state.loadToken) return;
-        setStatus("Error", "#ff6b6b");
     }
 }
 
@@ -609,27 +570,18 @@ function parseAndPopulateTracks(manifest) {
     }
 
     if (SP.state.transcodedSubtitleTracks.length > 0) {
-        // Transcoded subtitles use "-1" as the Off sentinel because the change
-        // handler treats that value specially. Build the dropdown directly
-        // here instead of via setSubtitleTracks.
-        SP.elements.subtitleSelect.innerHTML = '<option value="-1">Off</option>' +
-            SP.state.transcodedSubtitleTracks.map(function(track, i) {
-                return '<option value="' + i + '">' + track.name + '</option>';
-            }).join("");
-        SP.elements.subtitleSelect.value = "-1";
-        SP.elements.subtitleSelect.disabled = false;
+        setSubtitleTracks(SP.state.transcodedSubtitleTracks.map(function(track, i) {
+            return { value: String(i), label: track.name || "Track " + (i + 1) };
+        }));
     }
 }
 
-async function playTranscoded(url, fileName, isActiveTranscode, token) {
-    if (isActiveTranscode === undefined) isActiveTranscode = false;
-    if (token === undefined) token = SP.state.loadToken;
-
+async function playTranscoded(url, fileName, token) {
     if (SP.state.hls) {
         SP.state.hls.destroy();
     }
 
-    setStatus(isActiveTranscode ? "Transcoding..." : "Transcoded", "#ffd43b", isActiveTranscode);
+    setStatus("Transcoding...", "#ffd43b", true);
 
     SP.state.currentTranscodeBase = url.replace("/master.m3u8", "");
 
@@ -709,13 +661,11 @@ async function playTranscoded(url, fileName, isActiveTranscode, token) {
             }
         }
 
-        SP.elements.video.play().catch(function() {});
+        playWhenReady(token);
     });
 
     SP.state.hls.on(Hls.Events.FRAG_LOADING, function() {
-        if (isActiveTranscode) {
-            setStatus("", "#ffd43b", true);
-        }
+        setStatus("", "#ffd43b", true);
     });
 
     SP.state.hls.on(Hls.Events.FRAG_LOADED, function() {

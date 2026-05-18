@@ -14,6 +14,31 @@ function getLevelsForAudioTrack(audioIdx) {
         .filter(function(item) { return getAudioIdxFromLevel(item.level) === audioIdx; });
 }
 
+// Helper: create and append a <track> element pointing at a VTT URL.
+// Shared by all subtitle-loading paths (embedded server-extract, transcoded,
+// external .srt). Handles the loading spinner and progress banner uniformly.
+function attachExternalSubtitle(url, label) {
+    SP.elements.subtitleLoading.classList.add("active");
+    if (label) showSubtitleProgress(label);
+    var track = document.createElement("track");
+    track.kind = "subtitles";
+    track.src = url;
+    track.default = true;
+    if (label) track.label = label;
+    track.addEventListener("load", function() {
+        SP.elements.subtitleLoading.classList.remove("active");
+        hideSubtitleProgress(true);
+        if (SP.elements.video.textTracks.length > 0) {
+            SP.elements.video.textTracks[0].mode = "showing";
+        }
+    });
+    track.addEventListener("error", function() {
+        SP.elements.subtitleLoading.classList.remove("active");
+        hideSubtitleProgress(false);
+    });
+    SP.elements.video.appendChild(track);
+}
+
 function initAudioControl() {
     SP.elements.audioSelect.addEventListener("change", function() {
         if (this.value === "") return;
@@ -30,7 +55,7 @@ function initAudioControl() {
         // is async and may reject (e.g. browser lacks a decoder for the target
         // codec). Revert the dropdown and state on rejection so the UI keeps
         // reflecting the actually-playing track.
-        if (SP.state.isClientSide && SP.state.clientPlayer) {
+        if (SP.state.activePlaybackMode === "client" && SP.state.clientPlayer) {
             var self = this;
             var prevIdx = SP.state.currentAudioIdx;
             SP.state.currentAudioIdx = newAudioIdx;
@@ -59,7 +84,7 @@ function initAudioControl() {
 
         // For transcoded mode with muxed audio, we need to find the level
         // with the matching audio index and switch to it
-        if (SP.state.isTranscoding && SP.state.hls.levels && SP.state.hls.levels.length > 0) {
+        if (SP.state.activePlaybackMode === "transcode" && SP.state.hls.levels && SP.state.hls.levels.length > 0) {
             var levelsForTrack = getLevelsForAudioTrack(newAudioIdx);
 
             if (levelsForTrack.length > 0) {
@@ -116,7 +141,6 @@ function initAudioControl() {
 function initSubtitleControl() {
     SP.elements.subtitleSelect.addEventListener("change", function() {
         var rawVal = this.value;
-        var val = parseInt(rawVal);
         removeAllTracks(SP.elements.video);
         for (var i = 0; i < SP.elements.video.textTracks.length; i++) {
             SP.elements.video.textTracks[i].mode = "hidden";
@@ -124,107 +148,51 @@ function initSubtitleControl() {
         SP.elements.subtitleLoading.classList.remove("active");
         hideSubtitleProgress(false);
 
-        if (val === -1 || rawVal === "" || rawVal === "-1") {
-            // Clear active subtitle track in client mode
-            if (SP.state.isClientSide && SP.state.clientPlayer) {
-                SP.state.clientPlayer._activeSubtitleTrack = -1;
-                SP.state.clientPlayer._activeSubtitleAbsIdx = -1;
+        if (rawVal === "") {
+            // Off — clear active subtitle track in client mode
+            if (SP.state.activePlaybackMode === "client" && SP.state.clientPlayer) {
+                SP.state.clientPlayer.clearActiveSubtitle();
             }
             return;
         }
 
         if (SP.state.hls && SP.state.hls.subtitleTracks && SP.state.hls.subtitleTracks.length > 0) {
-            SP.state.hls.subtitleTrack = val;
+            SP.state.hls.subtitleTrack = parseInt(rawVal);
             return;
         }
+
+        var label = this.options[this.selectedIndex].text;
 
         // Embedded subtitle track
         if (rawVal.indexOf("embedded:") === 0) {
             var subIndex = parseInt(rawVal.split(":")[1]);
-            var trackName = this.options[this.selectedIndex].text || "Track " + (subIndex + 1);
-
             // Client-side mode: use piggybacked subtitle packets (no server needed)
-            if (SP.state.isClientSide && SP.state.clientPlayer) {
+            if (SP.state.activePlaybackMode === "client" && SP.state.clientPlayer) {
                 SP.state.clientPlayer.loadSubtitleTrack(subIndex).catch(function(err) {
                     SP.log.error("Subtitles", "Client extraction error:", err);
                 });
                 return;
             }
-
             // Direct/other modes: extract via server API
-            SP.elements.subtitleLoading.classList.add("active");
-            showSubtitleProgress(trackName);
-
-            var vttUrl = "/api/subtitle/" + encodeFilePath(SP.state.currentFile) + "/track/" + subIndex + ".vtt";
-            var track = document.createElement("track");
-            track.kind = "subtitles";
-            track.src = vttUrl;
-            track.default = true;
-            track.label = trackName;
-            SP.elements.video.appendChild(track);
-            track.addEventListener("load", function() {
-                SP.elements.subtitleLoading.classList.remove("active");
-                hideSubtitleProgress(true);
-                if (SP.elements.video.textTracks.length > 0) {
-                    SP.elements.video.textTracks[0].mode = "showing";
-                }
-            });
-            track.addEventListener("error", function() {
-                SP.elements.subtitleLoading.classList.remove("active");
-                hideSubtitleProgress(false);
-            });
+            attachExternalSubtitle(
+                "/api/subtitle/" + encodeFilePath(SP.state.currentFile) + "/track/" + subIndex + ".vtt",
+                label || ("Track " + (subIndex + 1))
+            );
             return;
         }
 
-        // Show loading indicators for VTT that needs extraction
-        SP.elements.subtitleLoading.classList.add("active");
-
+        // Transcoded subtitle track (rawVal is a numeric index)
+        var val = parseInt(rawVal);
         if (SP.state.currentTranscodeBase && SP.state.transcodedSubtitleTracks[val]) {
-            var trackName = SP.state.transcodedSubtitleTracks[val].name || "Track " + (val + 1);
-            showSubtitleProgress(trackName);
-
-            var vttUrl = SP.state.currentTranscodeBase + "/subs_" + val + ".vtt";
-            var track = document.createElement("track");
-            track.kind = "subtitles";
-            track.src = vttUrl;
-            track.default = true;
-            track.label = trackName;
-            SP.elements.video.appendChild(track);
-            track.addEventListener("load", function() {
-                SP.elements.subtitleLoading.classList.remove("active");
-                hideSubtitleProgress(true);
-                if (SP.elements.video.textTracks.length > 0) {
-                    SP.elements.video.textTracks[0].mode = "showing";
-                }
-            });
-            track.addEventListener("error", function() {
-                SP.elements.subtitleLoading.classList.remove("active");
-                hideSubtitleProgress(false);
-            });
+            attachExternalSubtitle(
+                SP.state.currentTranscodeBase + "/subs_" + val + ".vtt",
+                label || (SP.state.transcodedSubtitleTracks[val].name || "Track " + (val + 1))
+            );
             return;
         }
 
-        if (rawVal) {
-            var subTrackName = this.options[this.selectedIndex].text || "Subtitle";
-            showSubtitleProgress(subTrackName);
-
-            var subTrack = document.createElement("track");
-            subTrack.kind = "subtitles";
-            subTrack.src = "/subs/" + this.value;
-            subTrack.default = true;
-            SP.elements.video.appendChild(subTrack);
-            subTrack.addEventListener("load", function() {
-                SP.elements.subtitleLoading.classList.remove("active");
-                hideSubtitleProgress(true);
-                if (SP.elements.video.textTracks.length > 0) {
-                    SP.elements.video.textTracks[0].mode = "showing";
-                }
-            });
-            subTrack.addEventListener("error", function() {
-                SP.elements.subtitleLoading.classList.remove("active");
-                hideSubtitleProgress(false);
-            });
-        }
+        // External subtitle file (rawVal is a path under /subs/)
+        attachExternalSubtitle("/subs/" + rawVal, label || "Subtitle");
     });
 }
 
@@ -242,7 +210,8 @@ function initResolutionControl() {
         updateQualityDisplay();
 
         // For transcoded mode, filter levels by current audio track
-        var candidateLevels = SP.state.isTranscoding
+        var isTranscoding = SP.state.activePlaybackMode === "transcode";
+        var candidateLevels = isTranscoding
             ? getLevelsForAudioTrack(SP.state.currentAudioIdx)
             : SP.state.hls.levels.map(function(level, idx) { return { level: level, idx: idx }; });
 
@@ -252,7 +221,7 @@ function initResolutionControl() {
             SP.state.hls.levels.forEach(function(level) {
                 audioIdxSet[getAudioIdxFromLevel(level)] = true;
             });
-            var hasMultipleAudioTracks = SP.state.isTranscoding && Object.keys(audioIdxSet).length > 1;
+            var hasMultipleAudioTracks = isTranscoding && Object.keys(audioIdxSet).length > 1;
 
             if (hasMultipleAudioTracks) {
                 // Pick highest quality level for current audio track instead

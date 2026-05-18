@@ -156,8 +156,6 @@ function _computeRate(prev, current, nowMs, lastMs) {
 function detectMode() {
     var m = SP.state.activePlaybackMode;
     if (m === "client" || m === "transcode" || m === "remux" || m === "direct") return m;
-    if (SP.state.isClientSide) return "client";
-    if (SP.state.isTranscoding) return "transcode";
     return "direct";
 }
 

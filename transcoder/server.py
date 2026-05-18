@@ -1165,92 +1165,81 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Range')
         self.end_headers()
 
+    # Routing table shared by do_GET and do_HEAD. Each row is
+    # (compiled regex, dispatch fn taking (handler, match), content-type or None).
+    # The dispatch fn does all argument extraction + type coercion so do_GET
+    # stays a one-line loop. Content-type is consumed by do_HEAD only.
+    ROUTES = [
+        (re.compile(r'^/api/probe/(.+)$'),
+            lambda h, m: h.handle_probe(m.group(1)),
+            'application/json'),
+        (re.compile(r'^/api/subtitle/(.+?)/track/(\d+)\.vtt$'),
+            lambda h, m: h.handle_subtitle_vtt(m.group(1), int(m.group(2))),
+            'text/vtt'),
+        (re.compile(r'^/direct/(.+)$'),
+            lambda h, m: h.handle_direct_file(m.group(1)),
+            None),
+        (re.compile(r'^/transcode/(.+?)/master\.m3u8$'),
+            lambda h, m: h.handle_master(m.group(1)),
+            'application/vnd.apple.mpegurl'),
+        (re.compile(r'^/transcode/(.+?)/master_(\w+)\.m3u8$'),
+            lambda h, m: h.handle_master(m.group(1), m.group(2)),
+            'application/vnd.apple.mpegurl'),
+        (re.compile(r'^/transcode/(.+?)/stream_a(\d+)_(\w+)\.m3u8$'),
+            lambda h, m: h.handle_stream(m.group(1), int(m.group(2)), m.group(3)),
+            'application/vnd.apple.mpegurl'),
+        (re.compile(r'^/transcode/(.+?)/playlist_(\w+)_video\.m3u8$'),
+            lambda h, m: h.handle_video_playlist(m.group(1), m.group(2)),
+            'application/vnd.apple.mpegurl'),
+        (re.compile(r'^/transcode/(.+?)/seg_a(\d+)_(\w+)_(\d+)\.ts$'),
+            lambda h, m: h.handle_segment(m.group(1), int(m.group(2)), m.group(3), int(m.group(4))),
+            'video/mp2t'),
+        (re.compile(r'^/transcode/(.+?)/(?:subtitle|subs)_(\d+)\.m3u8$'),
+            lambda h, m: h.handle_subtitle_playlist(m.group(1), int(m.group(2))),
+            'application/vnd.apple.mpegurl'),
+        (re.compile(r'^/transcode/(.+?)/(?:subtitle|subs)_(\d+)\.vtt$'),
+            lambda h, m: h.handle_subtitle_vtt(m.group(1), int(m.group(2))),
+            'text/vtt'),
+    ]
+
     def do_HEAD(self):
-        """Handle HEAD requests - return 200 OK for valid paths."""
+        """Handle HEAD requests - return 200 OK for known paths under /transcode/."""
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
 
-        # For transcode endpoints, just return 200 OK
-        if path.startswith('/transcode/'):
-            self.send_response(200)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            if path.endswith('.m3u8'):
-                self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
-            elif path.endswith('.json'):
-                self.send_header('Content-Type', 'application/json')
-            elif path.endswith('.ts'):
-                self.send_header('Content-Type', 'video/mp2t')
-            elif path.endswith('.vtt'):
-                self.send_header('Content-Type', 'text/vtt')
-            self.end_headers()
-        else:
+        # Preserve existing behavior: HEAD only succeeds for /transcode/ paths.
+        # Unknown /transcode/ suffixes still 200 with no Content-Type.
+        if not path.startswith('/transcode/'):
             self.send_error(404)
+            return
+
+        ct = None
+        for pattern, _dispatch, route_ct in self.ROUTES:
+            if pattern.match(path):
+                ct = route_ct
+                break
+
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        if ct:
+            self.send_header('Content-Type', ct)
+        self.end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
-        query = parse_qs(parsed.query)
 
-        # Metrics
+        # Metrics endpoints — not in ROUTES because they have no path arg.
         if path in ('/metrics', '/transcode/metrics'):
             return self.send_json(segment_manager.get_metrics())
-
         if path == '/transcode/reset-metrics':
             segment_manager.reset_metrics()
             return self.send_json({'status': 'ok'})
 
-        # Probe file metadata
-        m = re.match(r'^/api/probe/(.+)$', path)
-        if m:
-            return self.handle_probe(m.group(1))
-
-        # Subtitle VTT for direct mode (embedded subtitles)
-        m = re.match(r'^/api/subtitle/(.+?)/track/(\d+)\.vtt$', path)
-        if m:
-            return self.handle_subtitle_vtt(m.group(1), int(m.group(2)))
-        # Direct file serving
-        m = re.match(r'^/direct/(.+)$', path)
-        if m:
-            return self.handle_direct_file(m.group(1))
-
-        # Master playlist (all resolutions)
-        m = re.match(r'^/transcode/(.+?)/master\.m3u8$', path)
-        if m:
-            return self.handle_master(m.group(1))
-
-        # Quality-specific master playlist (e.g., master_720p.m3u8)
-        m = re.match(r'^/transcode/(.+?)/master_(\w+)\.m3u8$', path)
-        if m:
-            return self.handle_master(m.group(1), m.group(2))
-
-        # Stream playlist (old naming)
-        m = re.match(r'^/transcode/(.+?)/stream_a(\d+)_(\w+)\.m3u8$', path)
-        if m:
-            return self.handle_stream(m.group(1), int(m.group(2)), m.group(3))
-
-        # Video playlist (MetaMesh-style naming: playlist_source_video.m3u8, playlist_720p_video.m3u8)
-        m = re.match(r'^/transcode/(.+?)/playlist_(\w+)_video\.m3u8$', path)
-        if m:
-            resolution = m.group(2)
-            # Map 'source' to 'original', keep '720p' etc as-is (RESOLUTIONS keys use 'p' suffix)
-            if resolution == 'source':
-                resolution = 'original'
-            return self.handle_stream(m.group(1), 0, resolution)
-
-        # Muxed video+audio segment
-        m = re.match(r'^/transcode/(.+?)/seg_a(\d+)_(\w+)_(\d+)\.ts$', path)
-        if m:
-            return self.handle_segment(m.group(1), int(m.group(2)), m.group(3), int(m.group(4)))
-
-        # Subtitle playlist (both subtitle_N and subs_N naming)
-        m = re.match(r'^/transcode/(.+?)/(?:subtitle|subs)_(\d+)\.m3u8$', path)
-        if m:
-            return self.handle_subtitle_playlist(m.group(1), int(m.group(2)))
-
-        # Subtitle VTT (both subtitle_N and subs_N naming for compatibility)
-        m = re.match(r'^/transcode/(.+?)/(?:subtitle|subs)_(\d+)\.vtt$', path)
-        if m:
-            return self.handle_subtitle_vtt(m.group(1), int(m.group(2)))
+        for pattern, dispatch, _ct in self.ROUTES:
+            m = pattern.match(path)
+            if m:
+                return dispatch(self, m)
 
         self.send_error(404)
 
@@ -1277,19 +1266,22 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # Pre-extract subtitles in background (speeds up playback)
-        self._preextract_subtitles(full_path, file_hash, info)
+        _preextract_subtitles(full_path, file_hash, info)
 
         self.send_data(generate_master_playlist(info, resolution).encode(), 'application/vnd.apple.mpegurl')
-
-    def _preextract_subtitles(self, filepath: str, file_hash: str, info: dict):
-        """Start background extraction for all supported subtitle tracks."""
-        _preextract_subtitles(filepath, file_hash, info)
 
     def handle_stream(self, filepath: str, audio: int, resolution: str):
         full_path, file_hash, info = self.get_file_info(filepath)
         if not info:
             return
         self.send_data(generate_stream_playlist(info, audio, resolution).encode(), 'application/vnd.apple.mpegurl')
+
+    def handle_video_playlist(self, filepath: str, resolution: str):
+        """MetaMesh-style naming: playlist_source_video.m3u8 / playlist_720p_video.m3u8."""
+        # Map 'source' to 'original'; '720p' etc. keep their 'p' suffix.
+        if resolution == 'source':
+            resolution = 'original'
+        return self.handle_stream(filepath, 0, resolution)
 
     def handle_segment(self, filepath: str, audio: int, resolution: str, segment: int):
         full_path, file_hash, info = self.get_file_info(filepath)
