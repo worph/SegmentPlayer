@@ -371,15 +371,6 @@ async function playFileClient(filePath, fileName, probeData, token) {
 
         var player = new ClientPlayer(SP.elements.video);
         SP.state.clientPlayer = player;
-        // Wire mid-playback recovery exhaustion to the same fallback() path
-        // the startup watchdog uses. The client-player's recovery watchdog
-        // only calls this after soft + hard recoveries have both failed —
-        // by then the meaningful action is to switch playback tiers
-        // (remux / transcode) rather than keep banging on MSE.
-        player._onUnrecoverable = function(reason) {
-            if (token !== SP.state.loadToken) return;
-            fallback("Client recovery exhausted: " + reason);
-        };
         await player.load(filePath, probeData, 0);
         if (token !== SP.state.loadToken) return;
         populateAudioFromProbe(probeData);

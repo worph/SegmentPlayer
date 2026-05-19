@@ -12,6 +12,12 @@ function ClientDemuxer(fileUrl, fileSize) {
     this.duration = 0;
     this._abortController = null; // for cancelling in-flight range requests
     this._bytesRead = 0;          // cumulative bytes fetched from origin (for metrics)
+    // Optional callbacks the player wires for buffering UI. Fire on the first
+    // retry of a given range fetch and on its eventual success. Kept as plain
+    // properties so layering stays clean — the demuxer never reaches into the
+    // player's status code directly.
+    this.onStallStart = null;
+    this.onStallEnd = null;
 }
 
 // Read-only stats snapshot for the metrics UI.
@@ -63,28 +69,38 @@ ClientDemuxer.prototype.init = async function() {
             return;
         }
 
-        // Cache miss — fetch a larger chunk (read-ahead)
+        // Real EOF — libav probes past the end of the file. Empty buffer is
+        // the legitimate EOF signal here; this branch is the only place we
+        // intentionally hand libav 0 bytes.
+        if (position >= self.fileSize) {
+            await self.libav.ff_block_reader_dev_send(name, position, new Uint8Array(0));
+            return;
+        }
+
+        // Cache miss — fetch a larger chunk (read-ahead). Retries forever on
+        // transient network failure: handing libav an empty buffer here would
+        // be interpreted as EOF mid-file, sealing the MediaSource and freezing
+        // playback. Honor the demuxer's `_abortController` for legitimate
+        // cancellation (seek, cleanup).
         var fetchEnd = Math.min(position + READ_AHEAD, self.fileSize) - 1;
         var controller = new AbortController();
         self._abortController = controller;
         try {
-            var response = await fetch(self.fileUrl, {
-                headers: { "Range": "bytes=" + position + "-" + fetchEnd },
-                signal: controller.signal
-            });
-            var buffer = new Uint8Array(await response.arrayBuffer());
-            // Track origin bytes for metrics (only the fresh fetch, not cache hits)
-            self._bytesRead += buffer.length;
-            // Cache the full response
-            self._readCache = { start: position, end: position + buffer.length, data: buffer };
-            // Send the requested portion to libav
-            var slice = buffer.subarray(0, Math.min(length, buffer.length));
-            await self.libav.ff_block_reader_dev_send(name, position, slice);
-        } catch (err) {
-            if (err.name !== "AbortError") {
-                SP.log.error("Demuxer", "Range request failed:", err);
+            var result = await self._fetchRangeWithRetry(position, fetchEnd, controller.signal);
+
+            if (result.aborted || result.eof) {
+                // Aborted: caller is doing a seek; subsequent av_seek_frame
+                // clears libav's EOF state, so 0 bytes here is safe.
+                // EOF: server returned 416, real end-of-file.
+                await self.libav.ff_block_reader_dev_send(name, position, new Uint8Array(0));
+                return;
             }
-            await self.libav.ff_block_reader_dev_send(name, position, new Uint8Array(0));
+
+            var buffer = result.buffer;
+            self._bytesRead += buffer.length;
+            self._readCache = { start: position, end: position + buffer.length, data: buffer };
+            var sendSlice = buffer.subarray(0, Math.min(length, buffer.length));
+            await self.libav.ff_block_reader_dev_send(name, position, sendSlice);
         } finally {
             if (self._abortController === controller) {
                 self._abortController = null;
@@ -138,6 +154,70 @@ ClientDemuxer.prototype.init = async function() {
 
     SP.log.debug("Demuxer", "Initialized:", this.streams.length, "streams",
         "video:", this.videoStreamIndex, "audio:", this.audioStreamIndex);
+};
+
+// Fetch one byte range with retry-forever + capped exponential backoff.
+// Returns { buffer, aborted, eof }:
+//   - On success: { buffer: Uint8Array, aborted: false, eof: false }
+//   - On HTTP 416 (server says past EOF): { buffer: null, aborted: false, eof: true }
+//   - On caller abort via signal: { buffer: null, aborted: true, eof: false }
+// The retry loop is deliberately unbounded: a transient network failure must
+// not propagate as fake-EOF to libav, and the player has no better recovery
+// than waiting for the network to come back. Cancellation is the caller's
+// job via `abortReads()`. Fires `onStallStart` the first time a retry is
+// scheduled, and `onStallEnd` once a fetch eventually succeeds.
+ClientDemuxer.prototype._fetchRangeWithRetry = async function(position, fetchEnd, signal) {
+    var DELAYS_MS = [250, 500, 1000, 2000, 4000, 5000];
+    var attempt = 0;
+    var stalled = false;
+    var self = this;
+
+    while (true) {
+        if (signal.aborted) return { buffer: null, aborted: true, eof: false };
+
+        try {
+            var response = await fetch(self.fileUrl, {
+                headers: { "Range": "bytes=" + position + "-" + fetchEnd },
+                signal: signal
+            });
+
+            if (response.status === 416) {
+                if (stalled && typeof self.onStallEnd === "function") self.onStallEnd();
+                return { buffer: null, aborted: false, eof: true };
+            }
+            if (!response.ok) {
+                throw new Error("HTTP " + response.status);
+            }
+
+            var buffer = new Uint8Array(await response.arrayBuffer());
+            if (stalled && typeof self.onStallEnd === "function") self.onStallEnd();
+            return { buffer: buffer, aborted: false, eof: false };
+        } catch (err) {
+            if (err.name === "AbortError") {
+                return { buffer: null, aborted: true, eof: false };
+            }
+
+            if (!stalled) {
+                stalled = true;
+                if (typeof self.onStallStart === "function") self.onStallStart();
+            }
+
+            var delay = DELAYS_MS[Math.min(attempt, DELAYS_MS.length - 1)];
+            attempt++;
+            SP.log.warn("Demuxer", "Range request failed (attempt " + attempt
+                + ", retry in " + delay + "ms):", err.message || err.name || err);
+
+            await new Promise(function(resolve) {
+                if (signal.aborted) return resolve();
+                var t = setTimeout(function() {
+                    signal.removeEventListener("abort", onAbort);
+                    resolve();
+                }, delay);
+                function onAbort() { clearTimeout(t); resolve(); }
+                signal.addEventListener("abort", onAbort, { once: true });
+            });
+        }
+    }
 };
 
 // Fix missing audio codec parameters using probe data from the server.
