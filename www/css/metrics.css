@@ -52,6 +52,33 @@
     color: var(--color-text-muted);
 }
 
+/* "Copy log" sits at the right edge of the banner. Pushed there with margin
+   auto so it stays aligned regardless of mode-detail length. */
+.copy-log-btn {
+    margin-left: auto;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.3rem 0.7rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--color-text);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.copy-log-btn:hover {
+    background: rgba(255, 255, 255, 0.16);
+    border-color: rgba(255, 255, 255, 0.35);
+}
+
+.copy-log-btn.copied {
+    background: var(--color-success);
+    border-color: var(--color-success);
+    color: #000;
+}
+
 /* Per-mode section visibility — panel gets a `mode-{name}` class, sections
    with mismatched `.metric-section--{name}` class stay hidden. Common
    sections don't have a mode modifier so they're always visible. */

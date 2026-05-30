@@ -438,9 +438,149 @@ function setTextClass(id, text, cls) {
 // Panel toggle + polling lifecycle
 // ---------------------------------------------------------------------------
 
+// Assemble a self-contained diagnostic report: a snapshot of player/pipeline
+// state followed by the full persistent log history. This is what the user
+// copies and sends after a stall — it captures the lead-up that scrolled out
+// of the console plus the exact element/pipeline state at copy time.
+function buildDebugReport() {
+    var L = [];
+    function line(k, v) { L.push(k + ": " + v); }
+    var st = SP.state || {};
+    var v = SP.elements && SP.elements.video;
+
+    L.push("=== SegmentPlayer debug report ===");
+    try { line("time", new Date().toISOString()); } catch (e) {}
+    line("userAgent", (typeof navigator !== "undefined" && navigator.userAgent) || "?");
+    try { line("url", location.href); } catch (e) {}
+    line("playbackMode(setting)", st.playbackMode);
+    line("activePlaybackMode", st.activePlaybackMode);
+    line("currentPath", st.currentPath);
+
+    var pd = st.probeData;
+    if (pd) {
+        line("container", pd.container);
+        if (pd.video) {
+            line("video", pd.video.codec + " " + (pd.video.profile || "")
+                + " " + (pd.video.width || "?") + "x" + (pd.video.height || "?")
+                + " " + (pd.video.bit_depth || "?") + "bit");
+        }
+        if (pd.audio) {
+            line("audio", pd.audio.map(function(a) {
+                return a.codec + "/" + (a.channels || "?") + "ch/" + (a.sample_rate || "?") + "Hz";
+            }).join(", "));
+        }
+        if (pd.subtitles) {
+            line("subtitles", pd.subtitles.map(function(s) {
+                return s.codec + "(" + (s.language || s.title || "") + ")";
+            }).join(", "));
+        }
+        line("duration", pd.duration);
+        line("file_size", pd.file_size);
+    }
+
+    if (v) {
+        line("video.readyState", v.readyState);
+        line("video.networkState", v.networkState);
+        line("video.paused", v.paused);
+        line("video.seeking", v.seeking);
+        line("video.ended", v.ended);
+        line("video.currentTime", (typeof v.currentTime === "number") ? v.currentTime.toFixed(3) : "?");
+        line("video.duration", v.duration);
+        line("video.error", v.error ? (v.error.code + " " + (v.error.message || "")) : "none");
+        var ranges = [];
+        try {
+            for (var i = 0; i < v.buffered.length; i++) {
+                ranges.push("[" + v.buffered.start(i).toFixed(2) + "-" + v.buffered.end(i).toFixed(2) + "]");
+            }
+        } catch (e) {}
+        line("video.buffered", ranges.join(" ") || "(none)");
+    }
+
+    var cp = st.clientPlayer;
+    if (cp) {
+        line("client.running", cp.running);
+        line("client._recovering", cp._recovering);
+        line("client._ended", cp._ended);
+        line("client.recoveriesInWindow", (cp._recoveryTimes || []).length);
+        line("client.currentAudioTrack", cp.currentAudioTrack);
+        if (cp.stats) {
+            line("client.stats", "consecutiveErrors=" + (cp.stats.errors || 0)
+                + " appends=" + cp.stats.packetsRead + " bytesAppended=" + cp.stats.bytesRead);
+        }
+        if (cp.demuxer && typeof cp.demuxer.getStats === "function") {
+            var ds = cp.demuxer.getStats();
+            line("client.demuxer", "bytesRead=" + ds.bytesRead + "/" + ds.fileSize);
+        }
+        if (cp.muxer && typeof cp.muxer.getVideoStats === "function") {
+            var ms = cp.muxer.getVideoStats();
+            if (ms) {
+                line("client.muxer", "reorderDepth=" + ms.reorderDepth
+                    + " clampCount=" + ms.clampCount
+                    + " synthesisFallback=" + ms.synthesisFallback
+                    + " modalDuration=" + ms.modalDuration
+                    + " pktDurReliable=" + ms.pktDurationReliable
+                    + " warmingUp=" + ms.warmingUp);
+            }
+        }
+    }
+
+    L.push("");
+    L.push("=== log (" + (SP.log.historyLength ? SP.log.historyLength() : "?") + " lines, oldest first) ===");
+    L.push(SP.log.dump ? SP.log.dump() : "(log dump unavailable)");
+    return L.join("\n");
+}
+
+function _fallbackCopy(text, done) {
+    try {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.top = "-1000px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        var ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        done(ok);
+    } catch (e) {
+        done(false);
+    }
+}
+
+function copyDebugReport(btn) {
+    var text = buildDebugReport();
+    SP.log.info("DebugReport", "Copy log requested,", text.length, "chars");
+    function done(ok) {
+        if (!btn) return;
+        btn.textContent = ok ? "Copied ✓" : "Copy failed";
+        btn.classList.toggle("copied", !!ok);
+        setTimeout(function() {
+            btn.textContent = "Copy log";
+            btn.classList.remove("copied");
+        }, 1500);
+    }
+    // navigator.clipboard needs a secure context (works on http://localhost but
+    // not over a plain-http LAN IP), so fall back to execCommand there.
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function() { done(true); },
+            function() { _fallbackCopy(text, done); });
+    } else {
+        _fallbackCopy(text, done);
+    }
+}
+
 function initMetricsToggle() {
     var metricsToggle = document.getElementById("metricsToggle");
     var metricsPanel = document.getElementById("metricsPanel");
+
+    var copyLogBtn = document.getElementById("copyLogBtn");
+    if (copyLogBtn) {
+        copyLogBtn.addEventListener("click", function(e) {
+            e.stopPropagation();
+            copyDebugReport(this);
+        });
+    }
 
     metricsToggle.addEventListener("click", function() {
         this.classList.toggle("active");

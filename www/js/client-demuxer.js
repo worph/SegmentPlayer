@@ -170,6 +170,8 @@ ClientDemuxer.prototype._fetchRangeWithRetry = async function(position, fetchEnd
     var DELAYS_MS = [250, 500, 1000, 2000, 4000, 5000];
     var attempt = 0;
     var stalled = false;
+    var range416 = 0;
+    var max416 = (SP.config && SP.config.CLIENT_MAX_416_RETRIES) || 6;
     var self = this;
 
     while (true) {
@@ -182,9 +184,23 @@ ClientDemuxer.prototype._fetchRangeWithRetry = async function(position, fetchEnd
             });
 
             if (response.status === 416) {
-                if (stalled && typeof self.onStallEnd === "function") self.onStallEnd();
-                return { buffer: null, aborted: false, eof: true };
+                // Genuine end-of-file never reaches here: onblockread
+                // short-circuits to a 0-byte EOF whenever position >= fileSize,
+                // *before* any fetch. So a 416 on an in-range request is an
+                // anomaly — a flaky proxy, a momentary server view of a smaller
+                // size, or a probed file_size a few bytes too large. Treat it as
+                // a transient failure and retry (same backoff + buffering UI as
+                // a network error). Only after several consecutive 416s do we
+                // accept it as real EOF, which covers the too-large-size case
+                // without sealing the stream on a one-off 416.
+                range416++;
+                if (range416 >= max416) {
+                    if (stalled && typeof self.onStallEnd === "function") self.onStallEnd();
+                    return { buffer: null, aborted: false, eof: true };
+                }
+                throw new Error("HTTP 416 (in-range, transient #" + range416 + ")");
             }
+            range416 = 0;
             if (!response.ok) {
                 throw new Error("HTTP " + response.status);
             }

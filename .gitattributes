@@ -1,0 +1,10 @@
+# Normalize line endings: store as LF in the repo, check out native on each OS.
+* text=auto
+
+# Files that MUST stay LF even on a Windows checkout. The Dockerfile uses
+# `RUN cat > file <<'EOF'` heredocs to generate /entrypoint.sh and
+# /etc/supervisord.conf; under CRLF, BuildKit writes those as 0-byte files and
+# the container dies with "exec /entrypoint.sh: exec format error". Shell
+# scripts need LF for their shebang line too.
+Dockerfile text eol=lf
+*.sh text eol=lf

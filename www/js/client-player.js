@@ -24,6 +24,20 @@ function ClientPlayer(videoElement) {
     this._pumpPromise = null;
     this._primerBatch = null;        // first post-seek packet batch (peeked to derive muxer base)
 
+    // Self-healing state (see _startWatchdog / _recover). The pump never dies
+    // permanently anymore: any silent stall (error cap, premature EOF, restart
+    // throw, wedged playback) is caught by the watchdog and recovered via a
+    // re-seek to the current position. onFatal is invoked only after recovery
+    // repeatedly fails inside CLIENT_RECOVER_WINDOW_MS — the caller wires it to
+    // the transcode fallback.
+    this.onFatal = null;
+    this._watchdogTimer = null;
+    this._recovering = false;
+    this._ended = false;             // true once a *legitimate* EOF sealed the MediaSource
+    this._lastObservedTime = 0;      // last currentTime the watchdog saw
+    this._lastProgressTs = 0;        // wall-clock of the last forward progress
+    this._recoveryTimes = [];        // recent recovery timestamps (sliding window)
+
     // Subordinate concerns kept as separate objects — see end of file.
     this.subtitles = new ClientSubtitleCollector(this);
 }
@@ -67,6 +81,9 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
     this.probeData = probeData;
     this.currentAudioTrack = audioTrackIdx || 0;
     this.stats = { bytesRead: 0, packetsRead: 0, startTime: Date.now(), framesDropped: 0 };
+    this._ended = false;
+    this._recovering = false;
+    this._recoveryTimes = [];
 
     var fileUrl = "/direct/" + encodeFilePath(filepath);
 
@@ -99,9 +116,21 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
     // Buffering UI hooks: the demuxer retries failed range reads indefinitely
     // rather than faking EOF, so the right UX during a network hiccup is the
     // browser-native buffer-pause feel — same status badge change a stalled
-    // HLS player would do.
-    this.demuxer.onStallStart = function() { setStatus("Buffering…", "#ffd43b", true); };
-    this.demuxer.onStallEnd = function() { setStatus("Client-side", "#51cf66"); };
+    // HLS player would do. We also log stall start/recovery (with how long the
+    // outage lasted) so a copied log shows the network timeline.
+    var self = this;
+    this.demuxer.onStallStart = function() {
+        self._stallStartTs = Date.now();
+        SP.log.warn("ClientPlayer", "Network stall — range read retrying ["
+            + self._diag() + "]");
+        setStatus("Buffering…", "#ffd43b", true);
+    };
+    this.demuxer.onStallEnd = function() {
+        var ms = self._stallStartTs ? (Date.now() - self._stallStartTs) : 0;
+        SP.log.info("ClientPlayer", "Network stall recovered after " + ms + "ms");
+        self._stallStartTs = 0;
+        setStatus("Client-side", "#51cf66");
+    };
     await this.demuxer.init();
 
     // Discover subtitle streams (piggyback collection during playback)
@@ -155,11 +184,15 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
     this.running = true;
     this._pumpPromise = this._pumpLoop();
 
+    // 9. Stall watchdog — turns any silent pipeline death into a re-seek+resume.
+    this._startWatchdog();
+
     SP.log.debug("ClientPlayer", "Started unified video+audio pipeline");
 };
 
 ClientPlayer.prototype._pumpLoop = async function() {
     var firstData = true;
+    SP.log.debug("ClientPlayer", "Pump start [" + this._diag() + "]");
     try {
     while (this.running) {
         try {
@@ -188,7 +221,22 @@ ClientPlayer.prototype._pumpLoop = async function() {
             if (!this.running) break;
 
             if (result.eof && Object.keys(result.packets).length === 0) {
-                SP.log.debug("ClientPlayer", "End of stream");
+                var eofDur = (this.probeData && this.probeData.duration) || 0;
+                var eofCt = this.video ? this.video.currentTime : 0;
+                var nearEnd = (eofDur <= 0) ||
+                    (eofDur - eofCt) <= (SP.config.CLIENT_EOF_GUARD_SEC || 10);
+                if (!nearEnd) {
+                    // Premature EOF far from the real end — almost always a
+                    // transient read fault (flaky range server, proxy 416) or a
+                    // corrupt region, not the actual end of the file. Sealing the
+                    // MediaSource here would freeze playback for good. Exit the
+                    // pump instead; the watchdog re-seeks to currentTime (which
+                    // clears libav's EOF state) and resumes.
+                    SP.log.warn("ClientPlayer", "Premature EOF at",
+                        eofCt.toFixed(1) + "s of " + eofDur + "s — will recover");
+                    break;
+                }
+                SP.log.info("ClientPlayer", "End of stream (real EOF) [" + this._diag() + "]");
                 if (this.mediaSource && this.mediaSource.readyState === "open") {
                     try {
                         // Drain the audio re-encoder first so tail Opus frames
@@ -219,6 +267,7 @@ ClientPlayer.prototype._pumpLoop = async function() {
                     await waitForSBUpdate(this.sourceBuffer);
                     this.mediaSource.endOfStream();
                 }
+                this._ended = true;
                 break;
             }
 
@@ -258,6 +307,10 @@ ClientPlayer.prototype._pumpLoop = async function() {
 
                 this.stats.bytesRead += fmp4Data.length;
                 this.stats.packetsRead++;
+                // A successful append clears the error tally: the threshold
+                // below is about *consecutive* failures, not a lifetime count
+                // (which would eventually kill any long playback).
+                this.stats.errors = 0;
 
                 if (firstData) {
                     firstData = false;
@@ -284,11 +337,17 @@ ClientPlayer.prototype._pumpLoop = async function() {
         } catch (err) {
             if (!this.running) break;
             this.stats.errors = (this.stats.errors || 0) + 1;
-            SP.log.error("ClientPlayer", "Pump error (" + this.stats.errors + "):", err);
+            SP.log.error("ClientPlayer", "Pump error #" + this.stats.errors
+                + " [" + this._diag() + "]:", err);
 
             if (this.stats.errors >= 3) {
-                SP.log.error("ClientPlayer", "Too many errors, stopping pipeline");
-                setStatus("Decode error", "#ff6b6b");
+                // Three *consecutive* failures (the counter resets on every
+                // successful append). Exit the pump rather than spinning on a
+                // bad batch — the watchdog re-seeks to the current position and
+                // restarts a clean pipeline. Repeated failures inside the
+                // recovery window escalate to the transcode fallback.
+                SP.log.warn("ClientPlayer", "3 consecutive pump errors — exiting for watchdog recovery");
+                setStatus("Buffering…", "#ffd43b", true);
                 break;
             }
             await sleep(500);
@@ -298,6 +357,8 @@ ClientPlayer.prototype._pumpLoop = async function() {
         // Pump must clear `running` even on exception so subsequent
         // cleanup() / _restartPipeline see the right state.
         this.running = false;
+        SP.log.debug("ClientPlayer", "Pump exit [" + this._diag()
+            + "] ended=" + this._ended + " firstData=" + firstData);
     }
 };
 
@@ -308,6 +369,126 @@ ClientPlayer.prototype._evictOldData = function() {
         try {
             this.sourceBuffer.remove(0, behind);
         } catch (e) { /* may be updating */ }
+    }
+};
+
+// Compact one-line snapshot of the playback state, embedded in log lines at
+// every interesting transition so a copied log reads as a timeline of how the
+// pipeline got into trouble (buffer drained? pump dead? MSE closed?).
+ClientPlayer.prototype._diag = function() {
+    var v = this.video;
+    var ahead = v ? getBufferedAhead(v) : 0;
+    return "ct=" + (v ? v.currentTime.toFixed(2) : "?")
+        + " ahead=" + ahead.toFixed(2)
+        + " rs=" + (v ? v.readyState : "?")
+        + " net=" + (v ? v.networkState : "?")
+        + " paused=" + (v ? v.paused : "?")
+        + " ms=" + (this.mediaSource ? this.mediaSource.readyState : "none")
+        + " running=" + this.running
+        + " errs=" + ((this.stats && this.stats.errors) || 0);
+};
+
+// ── Self-healing watchdog ──────────────────────────────────────────────────
+// Runs while a file is loaded. Each tick it checks whether playback is making
+// forward progress; if not — and the stall isn't an expected one (user pause,
+// seek, genuine EOF, a restart already in flight) — it recovers by re-seeking
+// to the current position. The native <video> "waiting" event already shows
+// the spinner, so the user sees: stall → loading → playback resumes.
+ClientPlayer.prototype._startWatchdog = function() {
+    this._stopWatchdog();
+    this._lastObservedTime = this.video ? this.video.currentTime : 0;
+    this._lastProgressTs = Date.now();
+    var self = this;
+    this._watchdogTimer = setInterval(function() { self._watchdogTick(); }, 1000);
+};
+
+ClientPlayer.prototype._stopWatchdog = function() {
+    if (this._watchdogTimer) {
+        clearInterval(this._watchdogTimer);
+        this._watchdogTimer = null;
+    }
+};
+
+ClientPlayer.prototype._watchdogTick = function() {
+    var v = this.video;
+    if (!v) return;
+
+    var now = Date.now();
+    var ct = v.currentTime;
+    var advancing = ct > this._lastObservedTime + 0.02;
+    if (advancing) {
+        this._lastObservedTime = ct;
+        this._lastProgressTs = now;
+    }
+
+    // Stalls we must not fight: nothing is supposed to be playing, or a
+    // teardown/restart is already underway.
+    if (this._ended || v.ended || v.paused || v.seeking || this._recovering) {
+        this._lastObservedTime = ct;
+        return;
+    }
+
+    var ahead = getBufferedAhead(v);
+    var pumpDead = !this.running;
+    var stalledMs = now - this._lastProgressTs;
+
+    if (pumpDead && ahead < (SP.config.CLIENT_PUMP_DEAD_REFILL_AHEAD || 2)) {
+        // The pump exited (consecutive errors, premature EOF, or a restart
+        // throw). Refill just before the existing buffer drains so recovery is
+        // as seamless as the network allows.
+        this._recover("pump exited");
+    } else if (!pumpDead && !advancing && ahead < 0.5
+            && stalledMs > (SP.config.CLIENT_STALL_RECOVER_MS || 12000)) {
+        // Pump alive but no forward progress and the buffer is empty for a
+        // sustained window — the demuxer's own read-retry hasn't resolved it
+        // (e.g. a decode wedge, not just a slow network). Force a clean re-seek.
+        this._recover("playback wedged");
+    }
+};
+
+// Restart the pipeline at the current position to recover from a stall. Counts
+// recoveries in a sliding window; if they pile up faster than the file can make
+// progress, give up and let the caller fall back to the transcode tier.
+ClientPlayer.prototype._recover = function(reason) {
+    if (this._recovering || this._ended || !this.video) return;
+
+    var now = Date.now();
+    var win = SP.config.CLIENT_RECOVER_WINDOW_MS || 30000;
+    this._recoveryTimes = (this._recoveryTimes || []).filter(function(t) {
+        return now - t < win;
+    });
+    this._recoveryTimes.push(now);
+    if (this._recoveryTimes.length > (SP.config.CLIENT_RECOVER_MAX || 4)) {
+        this._giveUp(reason);
+        return;
+    }
+
+    this._recovering = true;
+    SP.log.warn("ClientPlayer", "Auto-recovering (" + reason + ") attempt "
+        + this._recoveryTimes.length + "/" + (SP.config.CLIENT_RECOVER_MAX || 4)
+        + " in window [" + this._diag() + "]");
+
+    var self = this;
+    var resumeTime = this.video.currentTime;
+    this._restartPipeline(resumeTime, undefined, "Buffering…").then(function() {
+        // Give the freshly-restarted pump a moment to produce data before the
+        // next tick judges progress, and re-anchor the progress baseline.
+        self._lastObservedTime = self.video ? self.video.currentTime : 0;
+        self._lastProgressTs = Date.now();
+        self._recovering = false;
+    }, function() {
+        self._recovering = false;
+    });
+};
+
+ClientPlayer.prototype._giveUp = function(reason) {
+    SP.log.error("ClientPlayer", "Recovery limit exceeded — giving up:", reason);
+    this._stopWatchdog();
+    this.running = false;
+    if (typeof this.onFatal === "function") {
+        this.onFatal("Client playback unrecoverable (" + (reason || "repeated stalls") + ")");
+    } else {
+        setStatus("Playback stalled", "#ff6b6b");
     }
 };
 
@@ -328,12 +509,17 @@ ClientPlayer.prototype._setupSeekHandler = function() {
 // Because the output Opus codecpar is deterministic (always 48 kHz stereo),
 // the muxer re-init produces a byte-identical init segment across both flows.
 // MSE treats an identical init segment as a no-op, so the SourceBuffer stays.
-ClientPlayer.prototype._restartPipeline = async function(resumeTime, newAudioAbsIdx) {
+ClientPlayer.prototype._restartPipeline = async function(resumeTime, newAudioAbsIdx, statusText) {
     var generation = ++this._seekGeneration;
+
+    // A restart re-establishes the stream from `resumeTime`, so any prior
+    // legitimate-EOF state no longer applies (e.g. recovering after a spurious
+    // EOF, or the user seeking backward from the end).
+    this._ended = false;
 
     SP.log.debug("ClientPlayer", "Restarting pipeline at", resumeTime.toFixed(2) + "s",
         "(gen " + generation + ")");
-    setStatus("Seeking...", "#4dabf7", true);
+    setStatus(statusText || "Seeking...", statusText ? "#ffd43b" : "#4dabf7", true);
 
     // 1. Stop the pump and abort any in-flight range requests.
     this.running = false;
@@ -525,6 +711,9 @@ ClientPlayer.prototype._buildStreamInfos = async function() {
 
 ClientPlayer.prototype.cleanup = function() {
     this.running = false;
+    this._stopWatchdog();
+    this._recovering = false;
+    this._ended = false;
 
     this.subtitles.reset();
 
@@ -688,6 +877,12 @@ ClientSubtitleCollector.prototype._renderVTT = async function(absIdx, subInfo, p
         timeBase = stream.time_base_num / stream.time_base_den;
     }
     var vtt = await buildVTTFromPackets(pkts, timeBase, subInfo.codec);
+    // Cue count is a cheap proxy for "are subtitles keeping up": if the user
+    // reports sentences being skipped, compare cue growth here against the
+    // demuxer read progress in the surrounding log lines.
+    var cueCount = (vtt.match(/-->/g) || []).length;
+    SP.log.debug("ClientSubtitle", "VTT rebuilt track=" + this._activeTrack
+        + " pkts=" + pkts.length + " cues=" + cueCount + " codec=" + subInfo.codec);
     var label = subInfo.title || subInfo.language || "Track " + (this._activeTrack + 1);
     attachVTTToVideo(this.player.video, vtt, label);
 };

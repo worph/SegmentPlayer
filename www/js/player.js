@@ -371,6 +371,9 @@ async function playFileClient(filePath, fileName, probeData, token) {
 
         var player = new ClientPlayer(SP.elements.video);
         SP.state.clientPlayer = player;
+        // When the in-pipeline watchdog can't recover (repeated stalls inside
+        // the recovery window), drop to a server-side tier instead of freezing.
+        player.onFatal = fallback;
         await player.load(filePath, probeData, 0);
         if (token !== SP.state.loadToken) return;
         populateAudioFromProbe(probeData);

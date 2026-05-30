@@ -60,10 +60,17 @@ async function getProbeData(filePath) {
  * console unless verbose mode is on (?debug=1 in URL, or localStorage
  * sp_debug=1). warn/error print immediately and flush the buffer as a
  * collapsed group so the lead-up to a failure is visible retroactively.
+ *
+ * Separately, *every* line (all levels) is mirrored into a larger persistent
+ * `history` ring that is NOT cleared by flush(). That's what SP.log.dump()
+ * returns and what the "Copy log" button in the metrics panel exports — so a
+ * user can grab the lead-up to a stall long after it scrolled out of console.
  */
 (function() {
     var RING_SIZE = 200;
+    var HISTORY_SIZE = 1000;
     var ring = [];
+    var history = [];
     var verbose = false;
     try {
         verbose = new URLSearchParams(location.search).has("debug")
@@ -72,9 +79,32 @@ async function getProbeData(filePath) {
 
     function now() { return Math.round(performance.now()); }
 
+    // Stringify a single log argument for the copyable history. Errors keep
+    // their stack; objects are JSON'd (with a circular-safe fallback) so the
+    // dump is self-contained text rather than "[object Object]".
+    function fmtArg(a) {
+        if (a instanceof Error) {
+            return (a.name || "Error") + ": " + (a.message || "")
+                + (a.stack ? "\n" + a.stack : "");
+        }
+        if (a !== null && typeof a === "object") {
+            try { return JSON.stringify(a); } catch (e) { return String(a); }
+        }
+        return String(a);
+    }
+
+    function pushHistory(level, tag, args) {
+        if (history.length >= HISTORY_SIZE) history.shift();
+        var msg;
+        try { msg = Array.prototype.map.call(args, fmtArg).join(" "); }
+        catch (e) { msg = "<unformattable>"; }
+        history.push({ t: now(), level: level, tag: tag, msg: msg });
+    }
+
     function push(level, tag, args) {
         if (ring.length >= RING_SIZE) ring.shift();
         ring.push({ t: now(), level: level, tag: tag, args: args });
+        pushHistory(level, tag, args);
     }
 
     function flush() {
@@ -94,6 +124,17 @@ async function getProbeData(filePath) {
         } catch (err) {}
     }
 
+    // Render the persistent history as plain text (oldest → newest).
+    function dump() {
+        var lines = [];
+        for (var i = 0; i < history.length; i++) {
+            var e = history[i];
+            lines.push("[+" + e.t + "ms] [" + e.level.toUpperCase() + "] ["
+                + e.tag + "] " + e.msg);
+        }
+        return lines.join("\n");
+    }
+
     SP.log = {
         _verbose: verbose,
         debug: function(tag) {
@@ -108,15 +149,19 @@ async function getProbeData(filePath) {
         },
         warn: function(tag) {
             var args = Array.prototype.slice.call(arguments, 1);
+            pushHistory("warn", tag, args);
             console.warn.apply(console, ["[" + tag + "]"].concat(args));
             flush();
         },
         error: function(tag) {
             var args = Array.prototype.slice.call(arguments, 1);
+            pushHistory("error", tag, args);
             console.error.apply(console, ["[" + tag + "]"].concat(args));
             flush();
         },
-        flush: flush
+        flush: flush,
+        dump: dump,
+        historyLength: function() { return history.length; }
     };
 
     window.addEventListener("error", flush);
