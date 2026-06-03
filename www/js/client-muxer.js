@@ -62,6 +62,7 @@ function ClientMuxer(libav) {
     this.pb = 0;      // IO context
     this.pkt = 0;     // reusable packet
     this.outputChunks = [];
+    this._pendingTail = null;   // incomplete trailing fragment held across mux() calls
     this.initialized = false;
     this.streamMap = {};        // input stream index -> output stream index
     this.lastStreamDts = {};    // last DTS written per output stream (cross-batch monotonicity)
@@ -654,21 +655,27 @@ ClientMuxer.prototype._onDepthInsufficient = function(outputIdx, reason) {
 // AV_PKT_FLAG_KEY) survives into ff_write_multi — crucial for frag_keyframe
 // fragment boundaries to land on real I-frames.
 ClientMuxer.prototype._emitSynthesized = function(outputIdx, pkt, dts, flatPackets) {
-    // Apply DTS shift (see _freezeDepthAndDrain). Clamp negatives to 0; the
-    // monotonicity guard below ensures subsequent DTS values advance even if
-    // several initial packets bottom out at 0.
+    // Apply DTS shift (see _freezeDepthAndDrain). The first ~reorderDepth
+    // packets have PTS < shift, so their shifted DTS goes negative and floors to
+    // 0 — an expected startup ramp (DTS climbs 0,1,2,… via the guard below), not
+    // a reorder-depth problem.
     var shift = this._dtsShift[outputIdx] || 0;
+    var flooredByShift = false;
     if (shift > 0) {
         dts -= shift;
-        if (dts < 0) dts = 0;
+        if (dts < 0) { dts = 0; flooredByShift = true; }
     }
 
     var lastDts = this.lastStreamDts[outputIdx];
     if (lastDts !== undefined && dts <= lastDts) {
-        // Safety net — reached only when the CTS-sanity peek in _steadyPush
-        // didn't catch an under-measured depth (e.g. first packet after
-        // freeze, before the window is primed). Grow depth and clamp DTS.
-        this._onDepthInsufficient(outputIdx, "DTS monotonicity clamp fired");
+        // A bump in the shift-clamped prefix is expected; only a clamp on a
+        // *non-floored* DTS signals genuinely under-measured reorder depth
+        // (the CTS-sanity peek in _steadyPush didn't catch it). Grow depth only
+        // then — otherwise we'd spuriously grow 3→6 and log a misleading warning
+        // on every clip's first frames.
+        if (!flooredByShift) {
+            this._onDepthInsufficient(outputIdx, "DTS monotonicity clamp fired");
+        }
         dts = lastDts + 1;
     }
 
@@ -755,7 +762,7 @@ ClientMuxer.prototype.flush = async function() {
 
     await this.libav.av_write_trailer(this.oc);
     await this.libav.avio_flush(this.pb);
-    var output = this._collectOutput();
+    var output = this._collectOutput(true); // EOF — emit everything, hold back nothing
 
     // Edge case: file was shorter than one mux() batch — init segment never
     // got prepended to a media fragment. Ship it with whatever we have.
@@ -773,24 +780,105 @@ ClientMuxer.prototype.flush = async function() {
     return output;
 };
 
-// Collect accumulated output chunks into a single Uint8Array
-ClientMuxer.prototype._collectOutput = function() {
-    if (this.outputChunks.length === 0) return null;
-
+// Collect accumulated output chunks into a single Uint8Array.
+//
+// libav's per-call `avio_flush` can evict a *trailing fragment that isn't fully
+// written*: its `moof`/`traf`/`trun` sizes are still the placeholder 0 (libav
+// back-patches them at finalization) AND its `mdat` may be truncated mid-write.
+// Appending that to MSE fails — first the parser (`size==0` moof "extends to
+// EOF", swallowing the mdat), then the decoder (samples whose bytes are
+// missing). So we emit only **complete** fragments, hold any incomplete trailing
+// bytes in `_pendingTail`, and prepend them to the next call (libav writes
+// sequentially, so the next call's bytes complete the held fragment). The
+// emitted, now-complete fragments then get their zero container sizes patched.
+//
+// `isFinal` (flush()/EOF, after av_write_trailer) emits everything — nothing is
+// left incomplete at that point.
+ClientMuxer.prototype._collectOutput = function(isFinal) {
+    var parts = [];
     var totalLen = 0;
+    if (this._pendingTail) { parts.push(this._pendingTail); totalLen += this._pendingTail.length; }
     for (var i = 0; i < this.outputChunks.length; i++) {
+        parts.push(this.outputChunks[i]);
         totalLen += this.outputChunks[i].length;
     }
+    this.outputChunks = [];
+    if (totalLen === 0) return null;
 
-    var result = new Uint8Array(totalLen);
+    var all = new Uint8Array(totalLen);
     var offset = 0;
-    for (var i = 0; i < this.outputChunks.length; i++) {
-        result.set(this.outputChunks[i], offset);
-        offset += this.outputChunks[i].length;
+    for (var i = 0; i < parts.length; i++) {
+        all.set(parts[i], offset);
+        offset += parts[i].length;
     }
 
-    this.outputChunks = [];
-    return result;
+    var cut;
+    if (isFinal) {
+        this._sizeAndBound(all); // patch in place; emit everything (nothing is incomplete post-trailer)
+        cut = totalLen;
+        this._pendingTail = null;
+    } else {
+        cut = this._sizeAndBound(all);
+        this._pendingTail = (cut < totalLen) ? all.slice(cut) : null;
+        if (cut === 0) return null; // no complete fragment yet — keep buffering
+    }
+
+    return (cut === totalLen) ? all : all.slice(0, cut);
+};
+
+// fMP4 child boxes of a `traf`, used to delimit a zero-size `traf`/`moof`.
+ClientMuxer.TRAF_CHILDREN = { tfhd: 1, tfdt: 1, trun: 1, senc: 1, saiz: 1, saio: 1, sbgp: 1, sgpd: 1, subs: 1 };
+
+// Walk `data`, **patching** any zero-size container box (`moof`/`traf`/`trun` —
+// libav's unpatched placeholder, see _collectOutput) with its real size, and
+// return the byte offset after the last COMPLETE top-level unit (ftyp/moov/styp
+// or a moof+mdat pair). Anything past that is an incomplete trailing fragment (a
+// container/mdat running past the buffer) and is left untouched for the caller
+// to hold back. Mutates `data` in place; idempotent (already-sized boxes skip).
+ClientMuxer.prototype._sizeAndBound = function(data) {
+    var dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    var N = data.byteLength;
+    function typ(p) { return String.fromCharCode(data[p + 4], data[p + 5], data[p + 6], data[p + 7]); }
+
+    // Size of the box at p, patching a zero-size container in place. -1 if the
+    // box (or any descendant) is truncated / uncomputable within the buffer.
+    function size(p) {
+        if (p + 8 > N) return -1;
+        var s = dv.getUint32(p);
+        if (s === 1) return (p + 16 <= N) ? Number(dv.getBigUint64(p + 8)) : -1; // 64-bit leaf
+        if (s >= 8) return (p + s <= N) ? s : -1;                                // already sized
+        if (s !== 0) return -1;                                                  // 2..7 = corrupt
+        var t = typ(p), real;
+        if (t === "trun") {
+            if (p + 16 > N) return -1;
+            var f = dv.getUint32(p + 8) & 0xffffff, sc = dv.getUint32(p + 12);
+            var per = ((f & 0x100) ? 4 : 0) + ((f & 0x200) ? 4 : 0) + ((f & 0x400) ? 4 : 0) + ((f & 0x800) ? 4 : 0);
+            real = 16 + ((f & 0x1) ? 4 : 0) + ((f & 0x4) ? 4 : 0) + sc * per;
+        } else if (t === "moof" || t === "traf") {
+            var kids = (t === "moof") ? { mfhd: 1, traf: 1 } : ClientMuxer.TRAF_CHILDREN;
+            var q = p + 8;
+            while (q + 8 <= N && kids[typ(q)]) {
+                var cs = size(q);
+                if (cs < 0) return -1;
+                q += cs;
+            }
+            real = q - p;
+        } else {
+            return -1; // unknown zero-size box
+        }
+        if (real < 8 || p + real > N) return -1;
+        dv.setUint32(p, real); // patch the placeholder
+        return real;
+    }
+
+    var p = 0, lastComplete = 0;
+    while (p + 8 <= N) {
+        var t = typ(p), s = size(p);
+        if (s < 0) break; // incomplete from here — hold back
+        p += s;
+        if (t === "mdat" || t === "moov" || t === "ftyp" || t === "styp") lastComplete = p;
+    }
+    return lastComplete;
 };
 
 ClientMuxer.prototype.destroy = async function() {

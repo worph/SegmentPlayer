@@ -37,6 +37,7 @@ function ClientPlayer(videoElement) {
     this._lastObservedTime = 0;      // last currentTime the watchdog saw
     this._lastProgressTs = 0;        // wall-clock of the last forward progress
     this._recoveryTimes = [];        // recent recovery timestamps (sliding window)
+    this._filepath = null;           // stored so _hardReload can rebuild the pipeline
 
     // Subordinate concerns kept as separate objects — see end of file.
     this.subtitles = new ClientSubtitleCollector(this);
@@ -78,6 +79,7 @@ function sleep(ms) {
 
 ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx) {
     this.cleanup();
+    this._filepath = filepath;       // stored so _hardReload can rebuild the pipeline
     this.probeData = probeData;
     this.currentAudioTrack = audioTrackIdx || 0;
     this.stats = { bytesRead: 0, packetsRead: 0, startTime: Date.now(), framesDropped: 0 };
@@ -421,9 +423,18 @@ ClientPlayer.prototype._watchdogTick = function() {
         this._lastProgressTs = now;
     }
 
+    // A restart already in flight — leave it alone.
+    if (this._recovering) { this._lastObservedTime = ct; return; }
+
+    // A fatal element error (MEDIA_ERR_DECODE from a malformed append) pauses
+    // the <video>, so it would otherwise look like an intentional pause below.
+    // Catch it first — it needs a full MediaSource rebuild (_hardReload), not a
+    // re-seek. The view-layer onerror usually fires first; this is the backstop.
+    if (v.error) { this._recover("media error " + v.error.code); return; }
+
     // Stalls we must not fight: nothing is supposed to be playing, or a
     // teardown/restart is already underway.
-    if (this._ended || v.ended || v.paused || v.seeking || this._recovering) {
+    if (this._ended || v.ended || v.paused || v.seeking) {
         this._lastObservedTime = ct;
         return;
     }
@@ -470,15 +481,58 @@ ClientPlayer.prototype._recover = function(reason) {
 
     var self = this;
     var resumeTime = this.video.currentTime;
-    this._restartPipeline(resumeTime, undefined, "Buffering…").then(function() {
+    var settled = function() {
         // Give the freshly-restarted pump a moment to produce data before the
         // next tick judges progress, and re-anchor the progress baseline.
         self._lastObservedTime = self.video ? self.video.currentTime : 0;
         self._lastProgressTs = Date.now();
         self._recovering = false;
-    }, function() {
-        self._recovering = false;
-    });
+    };
+    var failed = function() { self._recovering = false; };
+
+    // A fatal element error (MEDIA_ERR_DECODE — e.g. a malformed transmux
+    // segment when warmup-measured B-frame reorder depth was too shallow for a
+    // later, deeper GOP) can only be cleared by a *new* MediaSource; re-seeking
+    // the existing (errored) one is a no-op. Rebuild client-side first — only if
+    // that keeps failing does _giveUp drop to the server transcode tier.
+    if (this.video.error) {
+        this._hardReload(resumeTime).then(settled, failed);
+    } else {
+        this._restartPipeline(resumeTime, undefined, "Buffering…").then(settled, failed);
+    }
+};
+
+// Public entry for a fatal <video> error, called from the view-layer onerror
+// handler. Routes into the sliding-window recovery (→ _hardReload), so a
+// recoverable decode glitch is retried client-side before the view falls back
+// to the server transcoder.
+ClientPlayer.prototype.handleMediaError = function() {
+    var code = (this.video && this.video.error && this.video.error.code) || "?";
+    this._recover("media error " + code);
+};
+
+// Full client-tier rebuild at resumeTime. Re-runs load() — which tears down the
+// errored MediaSource and builds a fresh one (clearing MEDIA_ERR_DECODE), then
+// re-inits the demuxer/muxer so a fresh warmup re-measures reorder depth for the
+// *current* region of the file (the depth measured at t≈0 can be too shallow for
+// a later, deeper B-pyramid GOP — the exact cause of the malformed segment).
+// Keeps the client tier instead of dropping to the server transcoder.
+ClientPlayer.prototype._hardReload = async function(resumeTime) {
+    SP.log.warn("ClientPlayer", "Hard reload (media error) at " + resumeTime.toFixed(1) + "s");
+    setStatus("Recovering…", "#ffd43b", true);
+    // load() resets _recovering/_recoveryTimes; snapshot the sliding-window
+    // count so repeated hard reloads still escalate to _giveUp (→ onFatal →
+    // transcode) instead of looping forever.
+    var savedTimes = this._recoveryTimes;
+    await this.load(this._filepath, this.probeData, this.currentAudioTrack);
+    this._recoveryTimes = savedTimes;
+    this._recovering = true; // load() cleared it; _recover's .then() resets it
+    // Resume at the failed position: setting currentTime fires the seek handler
+    // → _restartPipeline seeks the demuxer to the nearest keyframe ≤ resumeTime.
+    if (resumeTime > 0) {
+        try { this.video.currentTime = resumeTime; } catch (e) {}
+    }
+    try { this.video.play().catch(function() {}); } catch (e) {}
 };
 
 ClientPlayer.prototype._giveUp = function(reason) {

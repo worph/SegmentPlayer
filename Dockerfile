@@ -41,46 +41,14 @@ RUN find /data/www -type f -exec chmod 644 {} \; && \
     find /data/www -type d -exec chmod 755 {} \; && \
     find /app -type f -exec chmod 644 {} \;
 
-# Create supervisord config for process management
-RUN cat > /etc/supervisord.conf <<'EOF'
-[supervisord]
-nodaemon=true
-logfile=/var/log/supervisor/supervisord.log
-pidfile=/var/run/supervisord.pid
-user=root
-
-[program:nginx]
-command=/usr/local/nginx/sbin/nginx -g "daemon off;"
-autostart=true
-autorestart=true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
-
-[program:transcoder]
-command=python3 -u /app/server.py
-autostart=true
-autorestart=true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stderr
-stderr_logfile_maxbytes=0
-environment=PYTHONUNBUFFERED="1",MEDIA_DIR="/data/media",CACHE_DIR="/data/cache",SEGMENT_DURATION="4",PORT="8080"
-EOF
-
-# Fix CRLF from Windows/WSL git checkout
-RUN sed -i 's/\r$//' /etc/supervisord.conf
-
-# Create entrypoint script to substitute env vars and start supervisord
-RUN cat > /entrypoint.sh <<'EOF'
-#!/bin/sh
-# Substitute environment variables in nginx config
-envsubst '${NGINX_PORT}' < /usr/local/nginx/conf/nginx.conf.template > /usr/local/nginx/conf/nginx.conf
-# Start supervisord
-exec /usr/bin/supervisord -c /etc/supervisord.conf
-EOF
-RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+# Process management + entrypoint. These are COPY'd from real files (not
+# generated with `RUN cat <<'EOF'` heredocs) so the build works on the legacy
+# Docker builder too — heredocs require BuildKit and silently produce 0-byte
+# files otherwise, which makes the container die with "exec format error".
+# .gitattributes pins these to LF so a Windows checkout can't reintroduce CRLF.
+COPY supervisord.conf /etc/supervisord.conf
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Environment variables
 ENV MEDIA_DIR=/data/media \

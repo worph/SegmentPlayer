@@ -31,3 +31,4 @@ CLAUDE.md
 benchmarks/tomato.md
 .build-tmp
 .claude
+docker-compose.override.yml

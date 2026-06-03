@@ -280,6 +280,17 @@ function playDirect(filePath, fileName, token) {
 
     SP.elements.video.onerror = function() {
         if (token !== SP.state.loadToken) return;
+        // In client tier, a fatal decode error from a malformed transmux segment
+        // is recoverable in-browser by rebuilding the MediaSource — let the
+        // client player try that first (its onFatal drops to the server
+        // transcoder only after repeated client recovery fails). Keeps the NAS
+        // idle for a glitch that a quick client rebuild fixes.
+        if (SP.state.activePlaybackMode === "client" && SP.state.clientPlayer
+                && typeof SP.state.clientPlayer.handleMediaError === "function"
+                && !SP.state.clientPlayer._recovering) {
+            SP.state.clientPlayer.handleMediaError();
+            return;
+        }
         // Auto-fallback: prefer remux for H.264+AAC/MP3, else server transcode.
         var probe = SP.state.probeData;
         var vcodec = probe && probe.video && probe.video.codec;
