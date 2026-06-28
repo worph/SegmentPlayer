@@ -504,6 +504,17 @@
     padding: 0.6rem 1rem;
 }
 
+/* Hide the cursor after inactivity in fullscreen (controls already fade via
+ * .is-idle). The .player-click-shield (inset:0, cursor:pointer) and the <video>
+ * both sit over the whole frame, so the container's `cursor:none` alone is
+ * overridden — cover them explicitly. .is-fullscreen is toggled in player-ui.js
+ * and matches both standard and -webkit- fullscreen. */
+.video-container.is-fullscreen.is-idle,
+.video-container.is-fullscreen.is-idle .player-click-shield,
+.video-container.is-fullscreen.is-idle video {
+    cursor: none;
+}
+
 /* Tighter on mobile */
 @media (max-width: 900px) {
     .player-controls {
