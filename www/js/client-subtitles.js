@@ -86,10 +86,11 @@ async function decompressPacketData(data) {
     return data;
 }
 
-// Build a WebVTT string from an array of subtitle packets.
-// Reusable by both the full-file extractor and piggyback collection.
-async function buildVTTFromPackets(packets, timeBase, codec) {
-    if (!packets || packets.length === 0) return "WEBVTT\n\n";
+// Build an array of cue objects ({start, end, text} in seconds) from subtitle
+// packets. This is the shared core: the persistent-track collector adds these
+// directly as VTTCues, and the full-file extractor stringifies them to WebVTT.
+async function buildCuesFromPackets(packets, timeBase, codec) {
+    if (!packets || packets.length === 0) return [];
 
     // Sort by PTS so packets collected out-of-order (e.g. after seeks) are correct
     var sorted = packets.slice().sort(function(a, b) {
@@ -126,7 +127,7 @@ async function buildVTTFromPackets(packets, timeBase, codec) {
         }
     }
 
-    var vtt = "WEBVTT\n\n";
+    var cues = [];
     var decoder = new TextDecoder("utf-8");
 
     for (var i = 0; i < deduped.length; i++) {
@@ -143,10 +144,23 @@ async function buildVTTFromPackets(packets, timeBase, codec) {
 
         if (cleanText.trim() === "") continue;
 
-        vtt += formatVTTTimestamp(startTime) + " --> " + formatVTTTimestamp(endTime) + "\n";
-        vtt += cleanText + "\n\n";
+        cues.push({ start: startTime, end: endTime, text: cleanText });
     }
 
+    return cues;
+}
+
+// Build a WebVTT string from subtitle packets — used by the full-file
+// extractor (ClientSubtitleExtractor). The live client-mode collector no longer
+// goes through a VTT string at all; it adds cues to a persistent TextTrack.
+async function buildVTTFromPackets(packets, timeBase, codec) {
+    var cues = await buildCuesFromPackets(packets, timeBase, codec);
+    var vtt = "WEBVTT\n\n";
+    for (var i = 0; i < cues.length; i++) {
+        vtt += formatVTTTimestamp(cues[i].start) + " --> "
+            + formatVTTTimestamp(cues[i].end) + "\n";
+        vtt += cues[i].text + "\n\n";
+    }
     return vtt;
 }
 
@@ -225,34 +239,91 @@ function pad3(n) {
     return "" + n;
 }
 
-// Create a Blob URL for a VTT string and attach it to the video element.
+// PersistentSubtitleTrack — manages a SINGLE programmatic TextTrack for
+// client-mode subtitles and reconciles cues into it incrementally.
 //
-// Removing a <track> element does NOT remove its TextTrack from
-// videoElement.textTracks in Chromium — entries accumulate for the video's
-// lifetime. The client-mode subtitle collector calls this every 5 packet
-// batches, so we must (a) disable every existing TextTrack before adding the
-// new one, and (b) enable the *new* track by reference rather than assuming
-// it lands at textTracks[0]. Otherwise stale tracks stay in "showing" mode
-// and the user sees overlapping/duplicated cues.
-function attachVTTToVideo(videoElement, vttString, label) {
-    videoElement.querySelectorAll("track").forEach(function(t) { t.remove(); });
-    for (var i = 0; i < videoElement.textTracks.length; i++) {
-        videoElement.textTracks[i].mode = "disabled";
+// Why not a <track src="blob:..."> rebuilt per refresh (the old design)?
+// Because the client collector refreshes cues many times during playback, and
+// a <track> element only becomes visible AFTER its resource finishes an async
+// `load`. Rebuilding the track on every refresh disabled the previously-showing
+// track synchronously but only re-enabled the new one on `load` — opening a
+// window with NO showing track on every refresh. When a single `load` was
+// missed/delayed (common when blob <track>s are rapidly replaced) the track
+// stayed off until the *next* refresh, which is gated on demuxer activity and
+// can be 10-20s away while the read-ahead buffer is full. Result: subtitles
+// blinked out for 10-20s several times per movie.
+//
+// `addTextTrack()` returns a TextTrack with NO resource to load — adding a
+// VTTCue makes it render immediately, and the track is never removed, so there
+// is no async-load gap. It's also not a <track> element, so the <track>-element
+// cleanup other tiers run won't touch it.
+function PersistentSubtitleTrack(videoElement) {
+    this.video = videoElement;
+    this.track = null;            // the managed TextTrack
+    this._keys = Object.create(null); // cue keys already added (dedup across refreshes)
+}
+
+PersistentSubtitleTrack.prototype._ensure = function() {
+    if (!this.track) {
+        this.track = this.video.addTextTrack("subtitles", "Subtitles");
+        this._keys = Object.create(null);
+    }
+    return this.track;
+};
+
+// Make our managed track the only "showing" one — disable any stale TextTracks
+// (e.g. <track> elements left by a server tier or a previous session).
+PersistentSubtitleTrack.prototype._solo = function() {
+    var tracks = this.video.textTracks;
+    for (var i = 0; i < tracks.length; i++) {
+        if (tracks[i] !== this.track) tracks[i].mode = "disabled";
+    }
+};
+
+PersistentSubtitleTrack.prototype._clearCues = function() {
+    if (this.track && this.track.cues) {
+        // Snapshot first — cues is a live list that shrinks as we remove.
+        var arr = [];
+        for (var i = 0; i < this.track.cues.length; i++) arr.push(this.track.cues[i]);
+        for (var j = 0; j < arr.length; j++) {
+            try { this.track.removeCue(arr[j]); } catch (e) {}
+        }
+    }
+    this._keys = Object.create(null);
+};
+
+// Reconcile the managed track toward `cues` (array of {start, end, text}).
+// `replace` clears existing cues first (used when switching subtitle track);
+// otherwise only previously-unseen cues are appended. Returns live cue count.
+PersistentSubtitleTrack.prototype.sync = function(cues, replace) {
+    this._ensure();
+    if (replace) this._clearCues();
+
+    for (var i = 0; i < cues.length; i++) {
+        var c = cues[i];
+        var key = c.start.toFixed(3) + "|" + c.end.toFixed(3) + "|" + c.text;
+        if (this._keys[key]) continue;
+        var end = c.end > c.start ? c.end : c.start + 0.001; // VTTCue rejects end<=start
+        try {
+            this.track.addCue(new VTTCue(c.start, end, c.text));
+            this._keys[key] = true;
+        } catch (e) { /* malformed cue — skip, don't kill the batch */ }
     }
 
-    var blob = new Blob([vttString], { type: "text/vtt" });
-    var url = URL.createObjectURL(blob);
+    this._solo();
+    this.track.mode = "showing";
+    return this.track.cues ? this.track.cues.length : 0;
+};
 
-    var track = document.createElement("track");
-    track.kind = "subtitles";
-    track.src = url;
-    track.label = label || "Subtitles";
-    track.default = true;
-    videoElement.appendChild(track);
+// Subtitles toggled off — hide cues but keep the track (and dedup keys) so a
+// re-show is instant and doesn't re-add everything.
+PersistentSubtitleTrack.prototype.hide = function() {
+    if (this.track) this.track.mode = "disabled";
+};
 
-    track.addEventListener("load", function() {
-        if (track.track) track.track.mode = "showing";
-    });
-
-    return track;
-}
+// File change / teardown: drop stale <track> elements and clear our cues.
+PersistentSubtitleTrack.prototype.reset = function() {
+    this.video.querySelectorAll("track").forEach(function(t) { t.remove(); });
+    this._clearCues();
+    if (this.track) this.track.mode = "disabled";
+};

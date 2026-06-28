@@ -772,10 +772,10 @@ ClientPlayer.prototype.cleanup = function() {
     this.subtitles.reset();
 
     // Drop any subtitle <track> elements + disable lingering TextTracks on
-    // the <video>. Without this, an old subtitle persists across file changes
-    // and tier-switches (client → transcode fallback) until something else
-    // re-attaches a track. attachVTTToVideo does this on the next attach,
-    // but cleanup() may run with no follow-up attach.
+    // the <video>. subtitles.reset() above already clears our managed track,
+    // but this also sweeps stale <track> elements left by a server tier so an
+    // old subtitle doesn't persist across file changes / tier-switches
+    // (client → transcode fallback).
     this.video.querySelectorAll("track").forEach(function(t) { t.remove(); });
     for (var ti = 0; ti < this.video.textTracks.length; ti++) {
         this.video.textTracks[ti].mode = "disabled";
@@ -817,9 +817,11 @@ ClientPlayer.prototype.cleanup = function() {
 //
 // During normal playback the pump loop forwards every demuxed packet batch
 // here via `collect(packets)`. We accumulate subtitle packets per stream and,
-// when the user has an active subtitle selected, rebuild a VTT every 5 batches
-// and re-attach it to the <video> via attachVTTToVideo(). This avoids any
-// server round-trip for embedded subs in client mode.
+// when the user has an active subtitle selected, rebuild cues every 5 batches
+// and reconcile them into a single persistent TextTrack (PersistentSubtitleTrack)
+// — cues are added incrementally and the track is never removed, so subtitles
+// never blink out between refreshes. This avoids any server round-trip for
+// embedded subs in client mode.
 // ===========================================================================
 function ClientSubtitleCollector(player) {
     this.player = player;
@@ -828,6 +830,10 @@ function ClientSubtitleCollector(player) {
     this._activeTrack = -1;    // probe-level subtitle index (0,1,2...) or -1 = off
     this._activeAbsIdx = -1;   // matching demuxer absolute stream index
     this._updateCounter = 0;
+    this._rendering = false;   // serialize async cue rebuilds (see _refreshActive)
+    // Single persistent TextTrack — cues are added incrementally so subtitles
+    // never blink out between refreshes (see PersistentSubtitleTrack).
+    this._track = new PersistentSubtitleTrack(player.video);
 }
 
 ClientSubtitleCollector.prototype.reset = function() {
@@ -836,6 +842,8 @@ ClientSubtitleCollector.prototype.reset = function() {
     this._activeTrack = -1;
     this._activeAbsIdx = -1;
     this._updateCounter = 0;
+    this._rendering = false;
+    if (this._track) this._track.reset();
 };
 
 ClientSubtitleCollector.prototype.setStreamIndices = function(indices) {
@@ -849,6 +857,7 @@ ClientSubtitleCollector.prototype.getActiveTrack = function() {
 ClientSubtitleCollector.prototype.clearActive = function() {
     this._activeTrack = -1;
     this._activeAbsIdx = -1;
+    if (this._track) this._track.hide();
 };
 
 // Append subtitle packets from one demuxer batch. If any of the new packets
@@ -912,31 +921,43 @@ ClientSubtitleCollector.prototype.show = async function(subTrackIndex) {
     var pkts = this._packets[absIndex] || [];
     SP.log.debug("ClientSubtitleCollector", "Showing track", subTrackIndex,
         "with", pkts.length, "packets collected so far");
-    await this._renderVTT(absIndex, subInfo, pkts);
+    // replace=true: this is a fresh selection, so swap out any cues from a
+    // previously-shown track rather than merging into them.
+    await this._renderCues(absIndex, subInfo, pkts, true);
 };
 
 ClientSubtitleCollector.prototype._refreshActive = async function() {
     if (this._activeTrack < 0 || this._activeAbsIdx < 0) return;
+    // Skip if a rebuild is already in flight — buildCuesFromPackets is async
+    // (zlib inflate) and overlapping rebuilds could clear cues mid-add.
+    if (this._rendering) return;
     var subInfo = this.player.probeData.subtitles[this._activeTrack];
     if (!subInfo) return;
     var pkts = this._packets[this._activeAbsIdx];
     if (!pkts || pkts.length === 0) return;
-    await this._renderVTT(this._activeAbsIdx, subInfo, pkts);
+    await this._renderCues(this._activeAbsIdx, subInfo, pkts, false);
 };
 
-ClientSubtitleCollector.prototype._renderVTT = async function(absIdx, subInfo, pkts) {
+ClientSubtitleCollector.prototype._renderCues = async function(absIdx, subInfo, pkts, replace) {
     var stream = this.player.demuxer.streams[absIdx];
     var timeBase = 1;
     if (stream && stream.time_base_num && stream.time_base_den) {
         timeBase = stream.time_base_num / stream.time_base_den;
     }
-    var vtt = await buildVTTFromPackets(pkts, timeBase, subInfo.codec);
-    // Cue count is a cheap proxy for "are subtitles keeping up": if the user
-    // reports sentences being skipped, compare cue growth here against the
-    // demuxer read progress in the surrounding log lines.
-    var cueCount = (vtt.match(/-->/g) || []).length;
-    SP.log.debug("ClientSubtitle", "VTT rebuilt track=" + this._activeTrack
-        + " pkts=" + pkts.length + " cues=" + cueCount + " codec=" + subInfo.codec);
-    var label = subInfo.title || subInfo.language || "Track " + (this._activeTrack + 1);
-    attachVTTToVideo(this.player.video, vtt, label);
+    this._rendering = true;
+    try {
+        var cues = await buildCuesFromPackets(pkts, timeBase, subInfo.codec);
+        // Guard against a track switch / file change that landed while we were
+        // awaiting: only commit if this render still targets the active track.
+        if (absIdx !== this._activeAbsIdx) return;
+        var live = this._track.sync(cues, replace);
+        // `built` is what this batch produced; `live` is the cue total on the
+        // track. If the user reports missing lines, compare these against the
+        // demuxer read progress in the surrounding log lines.
+        SP.log.debug("ClientSubtitle", "cues synced track=" + this._activeTrack
+            + " pkts=" + pkts.length + " built=" + cues.length + " live=" + live
+            + " codec=" + subInfo.codec);
+    } finally {
+        this._rendering = false;
+    }
 };
