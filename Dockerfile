@@ -1,6 +1,19 @@
 # SegmentPlayer - On-the-fly HLS streaming with live segment transcoding
 # Uses nginx-vod-module base + static FFmpeg 7.x for faster AV1 decode
 
+# Static, multi-arch FFmpeg 7.x (with libdav1d) pulled from the mwader image.
+# Why a COPY --from instead of a download:
+#   - The base below is Alpine (musl). Fully-static binaries are required;
+#     glibc-dynamic builds (e.g. BtbN) request /lib64/ld-linux and fail with
+#     "not found" on musl.
+#   - johnvansickle.com (the old source) is static but a single unreliable
+#     host with no arm64 — it served a 435-byte error page that broke `tar`
+#     in CI. mwader/static-ffmpeg is fully static, multi-arch (amd64+arm64),
+#     and lives on Docker Hub, so buildx pulls the right arch automatically
+#     and there is no build-time network fetch to flake out.
+# Pin the tag for reproducibility; bump to advance the FFmpeg/libdav1d version.
+FROM mwader/static-ffmpeg:7.1 AS ffmpeg
+
 FROM alfg/nginx-vod-module:latest
 
 LABEL org.opencontainers.image.title="SegmentPlayer"
@@ -8,20 +21,16 @@ LABEL org.opencontainers.image.description="On-the-fly HLS streaming with live s
 LABEL org.opencontainers.image.source="https://github.com/Worph/SegmentPlayer"
 LABEL org.opencontainers.image.vendor="Worph"
 
-# Install dependencies and download static FFmpeg 7.x with modern libdav1d
-# Static build from johnvansickle.com includes libdav1d 1.4.x
+# Runtime deps (FFmpeg binaries come from the stage above, statically linked).
 RUN apk add --no-cache \
         python3 \
         curl \
         supervisor \
-        xz \
-        gettext \
-    && curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz \
-    && tar xf /tmp/ffmpeg.tar.xz -C /tmp \
-    && mv /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg \
-    && mv /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffprobe \
-    && rm -rf /tmp/ffmpeg* \
-    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+        gettext
+
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
+RUN chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
     && /usr/local/bin/ffmpeg -version | head -3 \
     && echo "=== Checking libdav1d ===" \
     && /usr/local/bin/ffmpeg -decoders 2>&1 | grep -i dav1d
