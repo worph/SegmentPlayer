@@ -35,6 +35,39 @@ CPU — it just streams bytes.
 
 The user can also force it via the **Mode** dropdown (`localStorage.sp_playback_mode`).
 
+### Safari / WebKit support (and why it's excluded today)
+
+The Safari exclusion is a **consequence of our always-Opus design**, not a fundamental browser wall. There are two distinct WebKit gaps, and only one of them actually blocks this tier (state as of mid-2026):
+
+1. **WebCodecs `AudioDecoder` — no longer a problem.** Safari was video-only for
+   WebCodecs through 18.x (`AudioDecoder`/`AudioEncoder` were `undefined`).
+   **Safari 26 (shipped fall 2025) added both `AudioDecoder` and
+   `AudioEncoder`.** This was never our real blocker anyway, since the polyfill
+   falls back to the libav WASM decoders (see below).
+2. **Opus-in-MP4 via MSE — the real blocker, no fix announced.** Our muxer always
+   emits `audio/mp4; codecs="opus"`, and `MediaSource.isTypeSupported(...)` for
+   that **still returns false on Safari**. Apple added Opus-in-**Ogg** in Safari
+   18.4 (early 2025) but pointedly *not* Opus-in-MP4, and there is no roadmap
+   signal that MP4-Opus in MSE is coming. Don't wait on Apple for this.
+
+**Credible path to Safari without Apple changing anything:** re-encode audio to
+**AAC** instead of Opus when the target is Safari/WebKit. Safari has supported
+`audio/mp4; codecs="mp4a.40.2"` (AAC-in-MP4) via MSE for years, and now has
+WebCodecs `AudioEncoder` too. Cost: an extra encode and slightly worse audio
+efficiency than Opus. Doing this would require teaching the muxer about a second
+output audio codec and relaxing the `clientTierSupportsOpusOutput()` gate in
+`chooseTier()` (see the **Key invariant** note below — this is exactly the
+"second audio codec" that note warns must be done deliberately).
+
+**iPhone caveat:** even with AAC output, regular `MediaSource` is *not* exposed on
+iPhone Safari — you must target **`ManagedMediaSource`** (added in Safari 17).
+iPad has had MSE longer. So an iOS port needs to detect and use
+`ManagedMediaSource`, not assume `window.MediaSource`.
+
+Sources: [WebKit Features in Safari 26.0](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/),
+[WWDC25 / Safari 26 beta](https://webkit.org/blog/16993/news-from-wwdc25-web-technology-coming-this-fall-in-safari-26-beta/),
+[WebKit bug 198583 (FLAC/Opus-in-MP4 MSE quirks)](https://bugs.webkit.org/show_bug.cgi?id=198583).
+
 > **Key invariant:** the client tier **always** re-encodes audio to Opus,
 > regardless of the source codec (yes, even Opus→Opus). That is why the muxer's
 > audio half is unconditionally `opus` and why Opus-in-MP4 support is a hard
