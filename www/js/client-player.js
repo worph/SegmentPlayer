@@ -829,8 +829,10 @@ function ClientSubtitleCollector(player) {
     this._streamIndices = [];  // absolute indices of subtitle streams
     this._activeTrack = -1;    // probe-level subtitle index (0,1,2...) or -1 = off
     this._activeAbsIdx = -1;   // matching demuxer absolute stream index
-    this._updateCounter = 0;
     this._rendering = false;   // serialize async cue rebuilds (see _refreshActive)
+    this._dirty = false;       // active-sub packets collected but not yet committed to cues
+    this._refreshTimer = null; // pending coalesced refresh (see _scheduleRefresh)
+    this._lastRefreshTs = 0;   // wall-clock of the last committed refresh
     // Single persistent TextTrack — cues are added incrementally so subtitles
     // never blink out between refreshes (see PersistentSubtitleTrack).
     this._track = new PersistentSubtitleTrack(player.video);
@@ -841,8 +843,10 @@ ClientSubtitleCollector.prototype.reset = function() {
     this._streamIndices = [];
     this._activeTrack = -1;
     this._activeAbsIdx = -1;
-    this._updateCounter = 0;
     this._rendering = false;
+    this._dirty = false;
+    if (this._refreshTimer) { clearTimeout(this._refreshTimer); this._refreshTimer = null; }
+    this._lastRefreshTs = 0;
     if (this._track) this._track.reset();
 };
 
@@ -857,12 +861,23 @@ ClientSubtitleCollector.prototype.getActiveTrack = function() {
 ClientSubtitleCollector.prototype.clearActive = function() {
     this._activeTrack = -1;
     this._activeAbsIdx = -1;
+    this._dirty = false;
+    if (this._refreshTimer) { clearTimeout(this._refreshTimer); this._refreshTimer = null; }
     if (this._track) this._track.hide();
 };
 
 // Append subtitle packets from one demuxer batch. If any of the new packets
-// belong to the *active* subtitle stream, refresh the VTT every 5 batches —
-// the throttle keeps long files from rebuilding VTT on every read.
+// belong to the *active* subtitle stream, schedule a (coalesced) cue refresh.
+//
+// The cadence MUST be driven by packet arrival, not by a batch count: in MKV
+// subtitle packets arrive in bursts (one 4 MB read can pull a dozen sub
+// packets) separated by long dialogue-free stretches, and once the read-ahead
+// buffer is full the pump sleeps and stops reading entirely. A "refresh every
+// N batches" throttle (the old design) decouples committing cues from playback
+// — a burst loads many cues' worth of packets but only ticks the counter once,
+// so they sit uncommitted while the playhead marches past them and subtitles
+// vanish until enough *later* batches finally trip the counter. _scheduleRefresh
+// instead commits any pending packets within CLIENT_SUBTITLE_REFRESH_MS.
 ClientSubtitleCollector.prototype.collect = function(packets) {
     var dominated = false;
     for (var i = 0; i < this._streamIndices.length; i++) {
@@ -876,10 +891,32 @@ ClientSubtitleCollector.prototype.collect = function(packets) {
             if (subIdx === this._activeAbsIdx) dominated = true;
         }
     }
-    if (dominated && ++this._updateCounter >= 5) {
-        this._updateCounter = 0;
-        this._refreshActive();
+    if (dominated) {
+        this._dirty = true;
+        this._scheduleRefresh();
     }
+};
+
+// Commit pending subtitle packets to the track, coalescing bursts to at most
+// one rebuild per CLIENT_SUBTITLE_REFRESH_MS. A trailing timer guarantees the
+// last packets of a burst are committed even if no further batches arrive
+// (e.g. the pump then sleeps on a full buffer). The post-build _dirty re-check
+// catches packets collected while an async rebuild was in flight.
+ClientSubtitleCollector.prototype._scheduleRefresh = function() {
+    if (this._activeTrack < 0 || this._activeAbsIdx < 0) return;
+    if (this._refreshTimer || this._rendering) return; // already queued / in flight
+    var minGap = SP.config.CLIENT_SUBTITLE_REFRESH_MS || 1000;
+    var wait = Math.max(0, minGap - (Date.now() - this._lastRefreshTs));
+    var self = this;
+    this._refreshTimer = setTimeout(function() {
+        self._refreshTimer = null;
+        self._lastRefreshTs = Date.now();
+        self._dirty = false;
+        self._refreshActive().then(function() {
+            // More packets landed during the (async) rebuild — go again.
+            if (self._dirty) self._scheduleRefresh();
+        }, function() {});
+    }, wait);
 };
 
 // Show the subtitle track at the given probe-level index. Resolves the
@@ -916,7 +953,8 @@ ClientSubtitleCollector.prototype.show = async function(subTrackIndex) {
 
     this._activeTrack = subTrackIndex;
     this._activeAbsIdx = absIndex;
-    this._updateCounter = 0;
+    this._dirty = false;
+    this._lastRefreshTs = Date.now();
 
     var pkts = this._packets[absIndex] || [];
     SP.log.debug("ClientSubtitleCollector", "Showing track", subTrackIndex,

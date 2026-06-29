@@ -40,6 +40,7 @@ var SP = {
         CLIENT_RECOVER_WINDOW_MS: 30000,    // sliding window for recovery-rate escalation
         CLIENT_RECOVER_MAX: 4,              // recoveries allowed in window before falling back to transcode
         CLIENT_MAX_416_RETRIES: 6,          // consecutive in-range 416s tolerated before accepting real EOF
+        CLIENT_SUBTITLE_REFRESH_MS: 1000,   // max lag between collecting a sub packet and committing its cue
         videoExtensions: [".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".m2ts"],
         subtitleExtensions: [".vtt", ".srt", ".ass", ".ssa"],
         PRESETS: ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']
