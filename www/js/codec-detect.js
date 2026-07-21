@@ -141,6 +141,19 @@ function canWebCodecsDecodeAudio(codec) {
     return WEBCODECS_AUDIO_CODECS.indexOf(codec.toLowerCase()) !== -1;
 }
 
+// Whether the CLIENT TIER can decode an audio codec — used for tier selection.
+// Unlike canWebCodecsDecodeAudio(), this does NOT require a native AudioDecoder:
+// Chrome gates AudioDecoder/AudioEncoder behind a secure context, so on any
+// plain-http origin (a LAN client hitting http://<nas-ip> — the common case)
+// the native codecs are absent even though the browser is perfectly capable.
+// The client tier falls back to the libav.js polyfill (our custom sp-audio build
+// decodes this whole set), and audio-reencode.js pairs each codec with its own
+// data-object flavour so the polyfill path is safe. Requiring native here would
+// force every non-secure LAN client onto the server transcoder for no reason.
+function canDecodeAudioForClient(codec) {
+    return WEBCODECS_AUDIO_CODECS.indexOf(codec.toLowerCase()) !== -1;
+}
+
 // The client tier always re-encodes audio to Opus in fMP4. Verify the
 // browser can play that combination before routing files through this path —
 // Safari has no Opus-in-MP4 MSE support and must fall through to the HLS or
@@ -194,7 +207,7 @@ function chooseTier(probeData) {
         var videoMime = buildMSEMimeType("video", probeData.video);
         if (canMSEPlay(videoMime)) {
             var hasPlayableAudio = probeData.audio.length === 0 || probeData.audio.some(function(a) {
-                return canWebCodecsDecodeAudio(a.codec);
+                return canDecodeAudioForClient(a.codec);
             });
 
             if (hasPlayableAudio) {

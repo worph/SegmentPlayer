@@ -23,6 +23,7 @@ function ClientPlayer(videoElement) {
     this._seekGeneration = 0;
     this._pumpPromise = null;
     this._primerBatch = null;        // first post-seek packet batch (peeked to derive muxer base)
+    this._audioDisabled = false;     // sticky: audio tier gave up → rebuild + play video-only
 
     // Self-healing state (see _startWatchdog / _recover). The pump never dies
     // permanently anymore: any silent stall (error cap, premature EOF, restart
@@ -50,7 +51,7 @@ ClientPlayer.prototype._buildMimeType = function() {
     var v = mapVideoCodecToMSE(pd.video.codec, pd.video.profile,
         pd.video.bit_depth, pd.video.width, pd.video.height);
     if (!v) throw new Error("Cannot map video codec: " + pd.video.codec);
-    if (pd.audio && pd.audio.length > 0) {
+    if (pd.audio && pd.audio.length > 0 && !this._audioDisabled) {
         return 'video/mp4; codecs="' + v + ',opus"';
     }
     return 'video/mp4; codecs="' + v + '"';
@@ -146,8 +147,9 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
     this.subtitles.reset();
     this.subtitles.setStreamIndices(subIndices);
 
-    // 4. Resolve active audio stream and init the re-encoder
-    if (probeData.audio && probeData.audio.length > 0) {
+    // 4. Resolve active audio stream and init the re-encoder. Skipped when a
+    //    prior audio failure disabled the tier (sticky) — see _dropAudio.
+    if (probeData.audio && probeData.audio.length > 0 && !this._audioDisabled) {
         await this.demuxer.fixAudioParams(probeData);
         this._audioAbsIdx = this.demuxer.getAudioStreamIndex(this.currentAudioTrack);
         if (this._audioAbsIdx < 0) {
@@ -158,6 +160,11 @@ ClientPlayer.prototype.load = async function(filepath, probeData, audioTrackIdx)
         var extradata = await this.demuxer.getAudioExtradata(this._audioAbsIdx);
         var audioStream = this.demuxer.streams[this._audioAbsIdx];
         this.audioReencoder = new AudioReencoder();
+        // If the audio tier declares itself unrecoverable mid-stream (codec
+        // stuck unconfigured / repeated submit or encode failures), rebuild the
+        // pipeline video-only rather than feed a dead codec forever.
+        var self2 = this;
+        this.audioReencoder.onFailure = function(err) { self2._dropAudio(err); };
         await this.audioReencoder.init(
             audioInfo.codec,
             audioInfo.sample_rate || 48000,
@@ -533,6 +540,35 @@ ClientPlayer.prototype._hardReload = async function(resumeTime) {
         try { this.video.currentTime = resumeTime; } catch (e) {}
     }
     try { this.video.play().catch(function() {}); } catch (e) {}
+};
+
+// The audio tier gave up (codec stuck unconfigured / repeated submit or encode
+// failures). Audio can't simply be *ignored*: the SourceBuffer's MIME declares
+// an Opus track, and MSE's buffered range is the intersection of all tracks in
+// it — an audio track with zero samples means nothing is ever playable
+// (readyState 1, currentTime pinned at 0) no matter how good the video is. So
+// rebuild the whole pipeline video-only: _audioDisabled is sticky (load() never
+// clears it), so the rebuild skips the re-encoder and _buildMimeType drops the
+// ",opus" half. Uses _hardReload directly, NOT _recover — an audio drop is not a
+// stall recovery and must not consume the recovery budget.
+ClientPlayer.prototype._dropAudio = function(err) {
+    if (this._audioDisabled || !this.video) return;
+    this._audioDisabled = true;
+    SP.log.error("ClientPlayer", "Audio unavailable — falling back to video-only:",
+        (err && err.message) || err);
+    setStatus("Audio unavailable — video only", "#ffd43b");
+
+    var self = this;
+    var resumeTime = this.video.currentTime;
+    // Reuse the recovery guard so the watchdog leaves the rebuild alone; clear it
+    // (and re-seed progress tracking) once the video-only pipeline is back up.
+    this._recovering = true;
+    var done = function() {
+        self._lastObservedTime = self.video ? self.video.currentTime : 0;
+        self._lastProgressTs = Date.now();
+        self._recovering = false;
+    };
+    this._hardReload(resumeTime).then(done, done);
 };
 
 ClientPlayer.prototype._giveUp = function(reason) {

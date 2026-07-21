@@ -15,11 +15,36 @@
  * instances against the same WASM. Native stays the fast-path (hardware-
  * accelerated where available); polyfill is strictly a fallback.
  *
+ * NEVER MIX FLAVOURS. The polyfill codecs only accept polyfill data objects —
+ * their decode()/encode() call `chunk._libavGetData()`, which a native
+ * EncodedAudioChunk / AudioData does not have. This matters far beyond the
+ * exotic-codec fallback: Chrome gates AudioDecoder/AudioEncoder behind a
+ * *secure context* but exposes AudioData/EncodedAudioChunk unconditionally, so
+ * on any plain-http origin (LAN IP, host.docker.internal, an http deploy) we
+ * end up with polyfill codecs and native data objects. Feeding a native chunk
+ * to the polyfill decoder throws inside its async queue, which *closes* the
+ * decoder, after which every decode() throws InvalidStateError "Unconfigured"
+ * — one per packet, forever. So each codec below is paired with the data
+ * classes of its own flavour (_EncodedAudioChunkClass / _AudioDataClass) and
+ * the globals are never used for construction.
+ *
  * Output timestamps are rescaled from WebCodecs microseconds to the Opus
  * native 1/48000 timebase that the muxer is initialized with.
  */
 
 var OPUS_TB_DEN = 48000; // output timebase denominator (Hz)
+
+// Failure containment. A WebCodecs codec that hits an error transitions to
+// "closed" (the libav.js polyfill reports *any* non-configured state as
+// "Unconfigured"), and then every single decode()/encode() call throws — at
+// ~43 AAC packets/s that is a throw + a console line per packet, forever, which
+// on its own pegs the main thread hard enough to hang the tab. So: recreate the
+// codec pair a bounded number of times, rate-limit the warn, and give up (the
+// owner drops audio) rather than spin.
+var AUDIO_RECONFIG_LIMIT = 3;      // codec-pair recreations before giving up
+var AUDIO_SUBMIT_FAIL_LIMIT = 10;  // consecutive submit throws before giving up
+var AUDIO_ENCODE_FAIL_LIMIT = 20;  // consecutive encode throws before giving up
+var AUDIO_WARN_GAP_MS = 2000;      // min gap between the failure warns
 
 // Lazy one-time bootstrap for the polyfill. Loads the vendor JS, then calls
 // LibAVWebCodecs.load({LibAV}) pointing it at our existing LibAV wrapper so
@@ -28,6 +53,15 @@ var OPUS_TB_DEN = 48000; // output timebase denominator (Hz)
 // Bump this when the vendored polyfill is patched so previously-cached copies
 // aren't reused. Matches the ?v= suffix convention used in index.html.
 var POLYFILL_VERSION = "sp2";
+
+// The native WebCodecs classes, or null where the browser doesn't expose them.
+// Captured once, at load, and always used by name rather than by reading the
+// globals later: a browser may expose only *some* of these (see the flavour
+// note above), and nothing here ever patches a global.
+var NATIVE_AudioDecoder = (typeof AudioDecoder !== "undefined") ? AudioDecoder : null;
+var NATIVE_AudioEncoder = (typeof AudioEncoder !== "undefined") ? AudioEncoder : null;
+var NATIVE_EncodedAudioChunk = (typeof EncodedAudioChunk !== "undefined") ? EncodedAudioChunk : null;
+var NATIVE_AudioData = (typeof AudioData !== "undefined") ? AudioData : null;
 
 var _polyfillReady = null;
 function ensurePolyfillReady() {
@@ -62,11 +96,16 @@ function AudioReencoder() {
     this.inputTimeBaseDen = 1000000;
     this.outputSampleRate = 48000;
     this.outputChannels = 2;
-    // Decoder/chunk class pair selected at configure-time. Defaults to globals
-    // (native WebCodecs); swapped to LibAVWebCodecs.* when native rejects.
-    this._AudioDecoderClass = (typeof AudioDecoder !== "undefined") ? AudioDecoder : null;
-    this._EncodedAudioChunkClass = (typeof EncodedAudioChunk !== "undefined") ? EncodedAudioChunk : null;
-    this._usingPolyfill = false;
+    // Codec + data classes, resolved in init(). Two independent flavour
+    // decisions — the decoder may be polyfill while the encoder is native — and
+    // each codec is paired with the data class it can actually consume.
+    this._AudioDecoderClass = NATIVE_AudioDecoder;
+    this._EncodedAudioChunkClass = NATIVE_EncodedAudioChunk;   // decoder input
+    this._AudioEncoderClass = NATIVE_AudioEncoder;
+    this._AudioDataClass = NATIVE_AudioData;                   // encoder input
+    this._usingPolyfill = false;      // decoder is the polyfill's
+    this._encoderIsPolyfill = false;  // encoder is the polyfill's
+    this._codecError = null;    // last error reported by a codec error callback
     // Bresenham accumulator for frame-count resampling — bounded by srcRate, so
     // long-run output count converges to the exact srcFrames × out/in ratio.
     this._sampleAccum = 0;
@@ -75,6 +114,18 @@ function AudioReencoder() {
     // sample count so the encoder sees a self-consistent (sample-count, ts) pair.
     this._anchorTsUs = null;
     this._totalOutSamples = 0;
+    // Failure containment (see the limits at the top of the file).
+    this._reconfigs = 0;        // codec-pair recreations so far
+    this._submitFails = 0;      // consecutive submitPackets() throws
+    this._encodeFails = 0;      // consecutive encoder.encode() throws
+    this._lastWarnTs = 0;       // rate-limiter for the failure warns
+    this._failed = false;       // audio is dead; onFailure already fired
+    // Set by the owner (ClientPlayer) to be told that audio is unrecoverable so
+    // it can rebuild the pipeline video-only. Without this the muxed
+    // SourceBuffer keeps an audio track with zero samples, and MSE — whose
+    // buffered range is the *intersection* of all tracks — never becomes
+    // playable: readyState sticks at 1 and currentTime never leaves 0.
+    this.onFailure = null;
 }
 
 // Map ffprobe codec names to WebCodecs codec strings for AudioDecoder
@@ -131,12 +182,12 @@ AudioReencoder.prototype._selectDecoderImpl = async function() {
     var cfg = this._buildDecoderConfig();
 
     // Native path.
-    if (typeof AudioDecoder !== "undefined") {
+    if (NATIVE_AudioDecoder) {
         try {
-            var nativeSupport = await AudioDecoder.isConfigSupported(cfg);
+            var nativeSupport = await NATIVE_AudioDecoder.isConfigSupported(cfg);
             if (nativeSupport && nativeSupport.supported) {
-                this._AudioDecoderClass = AudioDecoder;
-                this._EncodedAudioChunkClass = EncodedAudioChunk;
+                this._AudioDecoderClass = NATIVE_AudioDecoder;
+                this._EncodedAudioChunkClass = NATIVE_EncodedAudioChunk;
                 this._usingPolyfill = false;
                 return;
             }
@@ -166,7 +217,13 @@ AudioReencoder.prototype._createDecoder = function() {
     var self = this;
     this.decoder = new this._AudioDecoderClass({
         output: function(frame) { self._onDecodedFrame(frame); },
-        error: function(e) { SP.log.error("AudioReencoder", "Decode error:", e); }
+        error: function(e) {
+            // A WebCodecs error callback means the codec has closed itself —
+            // it will never accept another packet. Remember it so the next
+            // submit re-creates the pair instead of throwing per packet.
+            SP.log.error("AudioReencoder", "Decode error:", e);
+            self._codecError = e;
+        }
     });
     this.decoder.configure(this._buildDecoderConfig());
 };
@@ -174,9 +231,12 @@ AudioReencoder.prototype._createDecoder = function() {
 AudioReencoder.prototype._createEncoder = function() {
     var self = this;
     // Encoder stays native — AudioEncoder for Opus is reliably available.
-    this.encoder = new AudioEncoder({
+    this.encoder = new this._AudioEncoderClass({
         output: function(chunk, metadata) { self._onEncodedChunk(chunk, metadata); },
-        error: function(e) { SP.log.error("AudioReencoder", "Encode error:", e); }
+        error: function(e) {
+            SP.log.error("AudioReencoder", "Encode error:", e);
+            self._codecError = e;
+        }
     });
     this.encoder.configure({
         codec: "opus",
@@ -184,6 +244,57 @@ AudioReencoder.prototype._createEncoder = function() {
         numberOfChannels: this.outputChannels,
         bitrate: 128000
     });
+};
+
+// Give up on audio for good. The owner (ClientPlayer) rebuilds the pipeline
+// video-only so the user still gets a picture instead of a wedged player.
+AudioReencoder.prototype._fail = function(err) {
+    if (this._failed) return;
+    this._failed = true;
+    this.ready = false;
+    SP.log.error("AudioReencoder", "Audio pipeline unrecoverable — dropping audio:", err);
+    var cb = this.onFailure;
+    if (typeof cb === "function") {
+        try { cb(err); } catch (e) { SP.log.error("AudioReencoder", "onFailure threw:", e); }
+    }
+};
+
+// True when both codecs are live and can take packets. If either has fallen out
+// of "configured" (an error callback closed it), recreate the pair — configure()
+// runs again — a bounded number of times before failing the audio tier.
+AudioReencoder.prototype._ensureConfigured = function() {
+    if (this._failed || !this.ready) return false;
+    var decOk = this.decoder && this.decoder.state === "configured";
+    var encOk = this.encoder && this.encoder.state === "configured";
+    if (decOk && encOk) return true;
+
+    if (this._reconfigs >= AUDIO_RECONFIG_LIMIT) {
+        this._fail(this._codecError || new Error("audio codec stuck in state dec="
+            + (this.decoder && this.decoder.state) + " enc="
+            + (this.encoder && this.encoder.state)));
+        return false;
+    }
+    this._reconfigs++;
+    SP.log.warn("AudioReencoder", "Codec not configured (dec="
+        + (this.decoder && this.decoder.state) + " enc="
+        + (this.encoder && this.encoder.state) + ") — re-configuring, attempt "
+        + this._reconfigs + "/" + AUDIO_RECONFIG_LIMIT);
+    try {
+        try { this.decoder.close(); } catch (e) {}
+        try { this.encoder.close(); } catch (e) {}
+        this._outputQueue = [];
+        this._sampleAccum = 0;
+        this._anchorTsUs = null;
+        this._totalOutSamples = 0;
+        this._codecError = null;
+        this._encodeFails = 0;
+        this._createDecoder();
+        this._createEncoder();
+    } catch (e) {
+        this._fail(e);
+        return false;
+    }
+    return this.decoder.state === "configured" && this.encoder.state === "configured";
 };
 
 AudioReencoder.prototype.init = async function(inputCodec, sampleRate, channels, extradata, timeBase) {
@@ -196,18 +307,24 @@ AudioReencoder.prototype.init = async function(inputCodec, sampleRate, channels,
         this.inputTimeBaseDen = timeBase.den;
     }
 
-    // If native AudioDecoder/AudioEncoder are missing entirely (Firefox until
-    // ~2024), load the polyfill globally to provide both. On modern browsers
-    // this is a no-op and native WebCodecs is used.
-    if (typeof AudioDecoder === "undefined" || typeof AudioEncoder === "undefined") {
-        var pf = await ensurePolyfillReady();
-        if (typeof AudioDecoder === "undefined") AudioDecoder = pf.AudioDecoder;
-        if (typeof EncodedAudioChunk === "undefined") EncodedAudioChunk = pf.EncodedAudioChunk;
-        if (typeof AudioEncoder === "undefined") AudioEncoder = pf.AudioEncoder;
-        if (typeof AudioData === "undefined") AudioData = pf.AudioData;
+    // Encoder: native AudioEncoder where the browser has one (it always speaks
+    // Opus), else the polyfill's (libopus, compiled into our sp-audio libav
+    // build). A missing native AudioEncoder is the norm on any non-secure-context
+    // origin, not just on browsers without WebCodecs. Whichever we pick, the
+    // AudioData class we hand it must be of the same flavour.
+    if (NATIVE_AudioEncoder) {
+        this._AudioEncoderClass = NATIVE_AudioEncoder;
+        this._AudioDataClass = NATIVE_AudioData;
+        this._encoderIsPolyfill = false;
+    } else {
+        var pfEnc = await ensurePolyfillReady();
+        this._AudioEncoderClass = pfEnc.AudioEncoder;
+        this._AudioDataClass = pfEnc.AudioData;
+        this._encoderIsPolyfill = true;
     }
 
     // Select decoder implementation (native fast-path or polyfill fallback).
+    // Sets _AudioDecoderClass + the matching _EncodedAudioChunkClass.
     await this._selectDecoderImpl();
 
     // Downmix to stereo for compatibility
@@ -220,7 +337,8 @@ AudioReencoder.prototype.init = async function(inputCodec, sampleRate, channels,
     this.ready = true;
     SP.log.debug("AudioReencoder", "Initialized:", inputCodec, "->", "Opus",
         this.outputChannels + "ch", this.outputSampleRate + "Hz",
-        this._usingPolyfill ? "(via polyfill)" : "(native)");
+        "decoder=" + (this._usingPolyfill ? "polyfill" : "native"),
+        "encoder=" + (this._encoderIsPolyfill ? "polyfill" : "native"));
 };
 
 // Resample and/or downmix a decoded AudioData to the encoder's expected
@@ -229,16 +347,20 @@ AudioReencoder.prototype.init = async function(inputCodec, sampleRate, channels,
 // AudioEncoder requires frames to match encoder.configure() exactly — it
 // does NOT auto-convert. Common mismatch: source is 44.1 kHz or multichannel.
 //
-// Polyfill note: when decode runs through libav.js, the resulting AudioData
-// is a polyfill class. Native AudioEncoder may reject non-native AudioData
-// via internal type checks, so we always route polyfill frames through this
-// repackage path (which constructs a fresh native AudioData from the samples).
+// Flavour note: the decoded AudioData is of the *decoder's* flavour, and the
+// encoder only accepts its own (a native AudioEncoder type-checks; the polyfill
+// one calls frame._libavGetData()). So whenever the two flavours differ we must
+// repackage — this path rebuilds the samples into a fresh _AudioDataClass frame,
+// which is by construction what the encoder can consume. Passing the frame
+// straight through is only safe when the format matches AND both codecs are the
+// same flavour.
 AudioReencoder.prototype._convertFrame = async function(frame) {
     var srcRate = frame.sampleRate;
     var srcCh = frame.numberOfChannels;
     var srcFrames = frame.numberOfFrames;
     var sameFormat = srcRate === this.outputSampleRate && srcCh === this.outputChannels;
-    if (sameFormat && !this._usingPolyfill) {
+    var sameFlavour = (this._usingPolyfill === this._encoderIsPolyfill);
+    if (sameFormat && sameFlavour) {
         return frame;
     }
 
@@ -292,7 +414,7 @@ AudioReencoder.prototype._convertFrame = async function(frame) {
         this._totalOutSamples * 1e6 / this.outputSampleRate);
     this._totalOutSamples += renderedFrames;
 
-    return new AudioData({
+    return new this._AudioDataClass({
         format: "f32",
         sampleRate: this.outputSampleRate,
         numberOfFrames: renderedFrames,
@@ -307,12 +429,28 @@ AudioReencoder.prototype._onDecodedFrame = async function(frame) {
         var converted = await this._convertFrame(frame);
         try {
             this.encoder.encode(converted);
+            this._encodeFails = 0;
         } finally {
             converted.close();
         }
     } catch (e) {
-        // Encoder may have been closed during teardown — silently drop.
         try { frame.close(); } catch (_) {}
+        // Teardown races legitimately land here (the encoder was closed while a
+        // decoded frame was in flight), so don't shout on the first one — but do
+        // NOT swallow this unconditionally either: a *persistent* encode failure
+        // means zero Opus chunks reach the muxer, and since MSE's buffered range
+        // is the intersection of all tracks in the SourceBuffer, an audio track
+        // with no samples silently wedges playback at readyState 1 / currentTime
+        // 0. This catch swallowing it whole is what made that bug invisible.
+        if (this._failed || !this.ready) return;
+        this._encodeFails = (this._encodeFails || 0) + 1;
+        var now = Date.now();
+        if (now - this._lastWarnTs > AUDIO_WARN_GAP_MS) {
+            this._lastWarnTs = now;
+            SP.log.warn("AudioReencoder", "Encode failed ("
+                + this._encodeFails + " consecutive):", e);
+        }
+        if (this._encodeFails >= AUDIO_ENCODE_FAIL_LIMIT) this._fail(e);
     }
 };
 
@@ -355,6 +493,8 @@ AudioReencoder.prototype._onEncodedChunk = function(chunk, metadata) {
 // convert to microseconds here before handing to WebCodecs.
 AudioReencoder.prototype.submitPackets = function(packets) {
     if (!this.ready || !packets || packets.length === 0) return;
+    // A closed/unconfigured codec throws on every decode() — never spin on it.
+    if (!this._ensureConfigured()) return;
     // ticks * tickToUs = microseconds
     var tickToUs = 1e6 * this.inputTimeBaseNum / this.inputTimeBaseDen;
     for (var i = 0; i < packets.length; i++) {
@@ -372,8 +512,21 @@ AudioReencoder.prototype.submitPackets = function(packets) {
                 data: pkt.data
             });
             this.decoder.decode(chunk);
+            this._submitFails = 0;
         } catch (e) {
-            SP.log.warn("AudioReencoder", "Failed to submit packet:", e);
+            this._submitFails++;
+            // Rate-limited: the unbounded version of this log line was itself
+            // enough to hang the tab (one throw + one console line per packet).
+            var now = Date.now();
+            if (now - this._lastWarnTs > AUDIO_WARN_GAP_MS) {
+                this._lastWarnTs = now;
+                SP.log.warn("AudioReencoder", "Failed to submit packet ("
+                    + this._submitFails + " consecutive):", e);
+            }
+            if (this._submitFails >= AUDIO_SUBMIT_FAIL_LIMIT) {
+                this._fail(e);
+                return;
+            }
         }
     }
 };
@@ -415,6 +568,9 @@ AudioReencoder.prototype.reset = async function() {
     this._sampleAccum = 0;
     this._anchorTsUs = null;
     this._totalOutSamples = 0;
+    this._codecError = null;
+    this._submitFails = 0;
+    this._encodeFails = 0;
     this._createDecoder();
     this._createEncoder();
 };

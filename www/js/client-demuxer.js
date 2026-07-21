@@ -38,6 +38,72 @@ ClientDemuxer.prototype.init = async function() {
     // native AudioDecoder rejects a codec (e.g. EAC3 on some Chromium builds).
     await loadVendor("libav", "vendor/libav-sp-audio.js");
 
+    // Opening the container reads the file head through the block-reader device
+    // — i.e. across the same no-bandwidth-guarantee Range byte source every
+    // other read uses. A cold or slow first read (classically a Usenet stream
+    // still materialising, but any transient short read qualifies) can make
+    // libav's format probe see truncated data and fail avformat_open_input with
+    // AVERROR_INVALIDDATA ("Invalid data found when processing input") even
+    // though the bytes are a perfectly valid container. avformat_open_input_js
+    // then returns a null context, we find zero streams, and the caller
+    // (probeWithLibav) latches the player to "No decodable video stream" — with
+    // no retry, unlike every other read in this pipeline which retries forever.
+    // So retry the open itself on a fresh libav instance with capped backoff.
+    var OPEN_ATTEMPTS = 6;
+    var OPEN_DELAYS_MS = [200, 500, 1000, 2000, 4000];
+    var lastErr = null;
+    for (var attempt = 0; attempt < OPEN_ATTEMPTS; attempt++) {
+        try {
+            await this._openInput();
+        } catch (e) {
+            lastErr = e;
+        }
+        if (this.fmtCtx && this.streams.length > 0) { lastErr = null; break; }
+        // No usable context (open failed or found no streams). Drop this
+        // attempt's libav instance and, unless we're out of tries, wait a beat
+        // for the byte source to warm before opening a fresh one.
+        if (!lastErr) lastErr = new Error("avformat_open_input produced no streams");
+        await this._teardownLibav();
+        if (attempt < OPEN_ATTEMPTS - 1) {
+            SP.log.warn("Demuxer", "Open failed (attempt " + (attempt + 1) + " of "
+                + OPEN_ATTEMPTS + "), retrying:", (lastErr && (lastErr.message || lastErr)) || lastErr);
+            await new Promise(function(resolve) {
+                setTimeout(resolve, OPEN_DELAYS_MS[Math.min(attempt, OPEN_DELAYS_MS.length - 1)]);
+            });
+        }
+    }
+    if (!this.fmtCtx || this.streams.length === 0) {
+        throw lastErr || new Error("Demuxer failed to open input");
+    }
+
+    // Find video and audio stream indices
+    for (var i = 0; i < this.streams.length; i++) {
+        var s = this.streams[i];
+        if (s.codec_type === this.libav.AVMEDIA_TYPE_VIDEO && this.videoStreamIndex === -1) {
+            this.videoStreamIndex = s.index;
+        } else if (s.codec_type === this.libav.AVMEDIA_TYPE_AUDIO && this.audioStreamIndex === -1) {
+            this.audioStreamIndex = s.index;
+        }
+    }
+
+    // Allocate packet
+    this.pkt = await this.libav.av_packet_alloc();
+
+    // Get duration
+    if (this.streams.length > 0 && this.streams[0].duration > 0) {
+        this.duration = this.streams[0].duration;
+    }
+
+    SP.log.debug("Demuxer", "Initialized:", this.streams.length, "streams",
+        "video:", this.videoStreamIndex, "audio:", this.audioStreamIndex);
+};
+
+// One open attempt: stand up a fresh libav instance + block-reader device and
+// open the container, populating this.libav / this.fmtCtx / this.streams. On a
+// transient probe failure avformat_open_input_js returns a null context, so
+// this.fmtCtx stays 0 and this.streams stays empty; init() decides whether to
+// accept the result or teardown and retry.
+ClientDemuxer.prototype._openInput = async function() {
     // Create libav instance (runs in Web Worker for non-blocking I/O)
     this.libav = await LibAV.LibAV();
 
@@ -113,11 +179,37 @@ ClientDemuxer.prototype.init = async function() {
     // "unspecified number of channels" errors on audio tracks.
     var fmtCtx = await this.libav.avformat_open_input_js("input", null, null);
     this.fmtCtx = fmtCtx;
+    // A null context means the format probe failed (see init()'s retry note).
+    // Bail before touching options / find_stream_info — those would deref a
+    // null ctx in the worker. init() tears down and retries.
+    if (!fmtCtx) return;
     // Set probesize large enough for the demuxer to read audio frames and
     // determine channel layout (AAC with channelConfiguration=0 needs this)
     var probeSize = Math.min(this.fileSize, 50000000); // up to 50MB
     await this.libav.av_opt_set(fmtCtx, "probesize", String(probeSize), 0);
     await this.libav.av_opt_set(fmtCtx, "analyzeduration", "10000000", 0);
+    // Don't seek to EOF just to nail down duration. When a container's declared
+    // duration is missing, find_stream_info's estimate_timings_from_pts SEEKS TO
+    // NEAR-EOF and reads packets to derive the end timestamp. On a still-
+    // materialising NZB stream the file fills head→tail sequentially, so that
+    // tail read blocks on bytes that land last — a needless multi-second stall
+    // for a value we don't need to START linear playback (MKV clusters carry
+    // their own timestamps; the position bar can fill in duration lazily). This
+    // suppresses THAT particular EOF seek.
+    //
+    // NOTE — this is a PARTIAL of the intended "non-seekable start" fix. The
+    // ideal is to present the byte source to libav as non-seekable (pb->seekable
+    // = 0) so it never seeks to EOF at open at all. That is NOT achievable with
+    // this vendored libav.js 6.8.8.0 build: it exposes no AVIOContext accessor
+    // (so pb->seekable can't be flipped), and its only non-seekable device
+    // (mkreaderdev) is a pure sequential pipe that would break random-access
+    // seeking + the position-based read-ahead below. The DOMINANT open-time EOF
+    // read for MKV is matroska read_header following its SeekHead to tail-located
+    // Tags/Cues INSIDE avformat_open_input_js (already returned above, before we
+    // can set any option) — not suppressible here. The real remedy for that tail
+    // stall is server-side: prefetch the tail segments so the bytes are present
+    // when libav asks. Keep this line regardless; it's cheap, safe insurance.
+    await this.libav.av_opt_set(fmtCtx, "skip_estimate_duration_from_pts", "1", 0);
     var streamsRaw = await this.libav.avformat_find_stream_info(fmtCtx);
     // Re-read streams after find_stream_info
     var nbStreams = await this.libav.AVFormatContext_nb_streams(fmtCtx);
@@ -133,27 +225,23 @@ ClientDemuxer.prototype.init = async function() {
         par.codecpar = codecparPtr;
         this.streams.push(par);
     }
+};
 
-    // Find video and audio stream indices
-    for (var i = 0; i < this.streams.length; i++) {
-        var s = this.streams[i];
-        if (s.codec_type === this.libav.AVMEDIA_TYPE_VIDEO && this.videoStreamIndex === -1) {
-            this.videoStreamIndex = s.index;
-        } else if (s.codec_type === this.libav.AVMEDIA_TYPE_AUDIO && this.audioStreamIndex === -1) {
-            this.audioStreamIndex = s.index;
-        }
+// Tear down the current libav instance between open attempts (or on give-up),
+// resetting demuxer state for a fresh _openInput(). Safe to call repeatedly and
+// when the open never completed (this.pkt / this.fmtCtx still zero).
+ClientDemuxer.prototype._teardownLibav = async function() {
+    if (this.libav) {
+        try {
+            if (this.pkt) { await this.libav.av_packet_free(this.pkt); this.pkt = 0; }
+            if (this.fmtCtx) { await this.libav.avformat_close_input_js(this.fmtCtx); }
+        } catch (e) { /* best-effort — the instance is about to be terminated */ }
+        try { this.libav.terminate(); } catch (e) {}
+        this.libav = null;
     }
-
-    // Allocate packet
-    this.pkt = await this.libav.av_packet_alloc();
-
-    // Get duration
-    if (this.streams.length > 0 && this.streams[0].duration > 0) {
-        this.duration = this.streams[0].duration;
-    }
-
-    SP.log.debug("Demuxer", "Initialized:", this.streams.length, "streams",
-        "video:", this.videoStreamIndex, "audio:", this.audioStreamIndex);
+    this.fmtCtx = 0;
+    this.streams = [];
+    this._readCache = null;
 };
 
 // Fetch one byte range with retry-forever + capped exponential backoff.
@@ -200,12 +288,12 @@ ClientDemuxer.prototype._fetchRangeWithRetry = async function(position, fetchEnd
                 }
                 throw new Error("HTTP 416 (in-range, transient #" + range416 + ")");
             }
-            range416 = 0;
             if (!response.ok) {
                 throw new Error("HTTP " + response.status);
             }
 
             var buffer = new Uint8Array(await response.arrayBuffer());
+            range416 = 0;
             if (stalled && typeof self.onStallEnd === "function") self.onStallEnd();
             return { buffer: buffer, aborted: false, eof: false };
         } catch (err) {
